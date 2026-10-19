@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 220">
+<rect width="520" height="220" fill="#eef3f0"/>
+<rect x="30" y="26" width="300" height="130" rx="8" fill="#3d5a53"/>
+<rect x="44" y="40" width="272" height="102" rx="4" fill="#52796f"/>
+<text x="70" y="86" font-family="Verdana" font-size="34" fill="#f7f3ea" font-weight="bold">A B C</text>
+<text x="70" y="122" font-family="Verdana" font-size="17" fill="#d9e6df">apple · book · cat</text>
+<rect x="356" y="26" width="134" height="100" rx="8" fill="#dcebe4" stroke="#b9cec4" stroke-width="3"/>
+<circle cx="452" cy="56" r="17" fill="#d9a441"/>
+<line x1="423" y1="26" x2="423" y2="126" stroke="#b9cec4" stroke-width="3"/><line x1="356" y1="76" x2="490" y2="76" stroke="#b9cec4" stroke-width="3"/>
+<rect x="70" y="168" width="180" height="14" rx="6" fill="#8a5a3b"/>
+<rect x="84" y="182" width="12" height="26" fill="#8a5a3b"/><rect x="224" y="182" width="12" height="26" fill="#8a5a3b"/>
+<rect x="286" y="160" width="26" height="34" rx="3" fill="#c96f4a"/><rect x="318" y="166" width="22" height="28" rx="3" fill="#d9a441"/>
+<rect x="392" y="150" width="64" height="44" rx="5" fill="#52796f"/><circle cx="424" cy="140" r="15" fill="#e8b04b"/>
+<rect x="0" y="208" width="520" height="12" fill="#d8e2dc"/></svg>
