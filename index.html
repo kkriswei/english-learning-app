@@ -78,6 +78,18 @@
       .phon{color:var(--ink-faint);font-size:14px;}
       .baihua{margin-top:6px;color:var(--accent-deep);font-size:15px;font-weight:600;letter-spacing:.02em;}
       .baihua-sm{color:var(--accent-deep);font-size:12.5px;font-weight:600;white-space:nowrap;}
+      .baihua-row{margin-top:6px;width:100%;box-sizing:border-box;}
+      .baihua-row .baihua{margin-top:0;}
+      .bh-custom{margin-left:6px;font-size:11px;font-weight:700;color:var(--accent-deep);background:var(--accent-soft);border-radius:20px;padding:1px 7px;vertical-align:2px;}
+      .bh-edit{margin-left:6px;font-size:12.5px;font-weight:600;color:var(--ink-faint);text-decoration:underline;text-underline-offset:3px;padding:2px 4px;vertical-align:1px;}
+      .bh-edit:active{color:var(--accent-deep);}
+      .baihua-editor{margin-top:9px;text-align:left;background:var(--surface-2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;width:100%;box-sizing:border-box;}
+      .bh-input{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:var(--surface);color:var(--ink);font-size:15px;}
+      .bh-actions{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;}
+      .bh-reset{font-size:12.5px;color:var(--ink-faint);text-decoration:underline;text-underline-offset:3px;margin-left:auto;padding:2px 0;}
+      .bh-note{font-size:12px;color:var(--ink-faint);margin:7px 0 0;line-height:1.5;}
+      .flash.editing{height:auto;min-height:280px;}
+      .flash.editing .flash-face{position:relative;}
       .tip-line{margin-top:10px;background:var(--accent-soft);border-radius:10px;padding:8px 12px;font-size:14px;line-height:1.55;color:var(--ink);text-align:left;}
       .dlg-ctl{position:sticky;top:8px;z-index:5;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:10px 12px;margin-bottom:12px;box-shadow:0 4px 18px rgba(0,0,0,.08);}
       .dlg-ctl .ctl-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
@@ -3919,7 +3931,7 @@ const state = {
   xp: 0, completed: new Set(), stepsDone: {},
   checkins: new Set(), lastStudyDate: null,
   dayLog: {}, dailyGoal: 20, startIdx: 0, onboarded: true,
-  pracLines: new Set(), wordGrades: {}, wordReview: {}, corr: [], pron: [], pronBest: {},
+  pracLines: new Set(), wordGrades: {}, wordReview: {}, baihuaEdits: {}, corr: [], pron: [], pronBest: {},
   grammarSeen: new Set(), grammarQuiz: new Set(),
   stats: { pronAttempts: 0, pron90: 0, roleRounds: 0, corrTotal: 0, roleScoreSum: 0, roleScoreN: 0 },
   studySecs: 0, badgesSeen: [],
@@ -3935,6 +3947,7 @@ function saveState(){
       checkins: [...state.checkins], lastStudyDate: state.lastStudyDate,
       dayLog: state.dayLog, dailyGoal: state.dailyGoal, startIdx: state.startIdx,
       onboarded: true, pracLines: [...state.pracLines], wordGrades: state.wordGrades, wordReview: state.wordReview,
+      baihuaEdits: state.baihuaEdits,
       corr: state.corr.slice(0, 150), pron: state.pron.slice(0, 200), pronBest: state.pronBest,
       grammarSeen: [...state.grammarSeen], grammarQuiz: [...state.grammarQuiz],
       stats: state.stats, studySecs: state.studySecs, badgesSeen: state.badgesSeen,
@@ -3969,6 +3982,7 @@ function loadState(){
   state.pracLines = new Set(d.pracLines || []);
   state.wordGrades = d.wordGrades || {};
   state.wordReview = d.wordReview || {};
+  state.baihuaEdits = d.baihuaEdits || {};
   state.corr = d.corr || [];
   state.pron = d.pron || [];
   state.pronBest = d.pronBest || {};
@@ -4111,6 +4125,59 @@ function baihuaOf(ipa){
   var s = String(ipa).replace(/[/\[\]()ː]/g, "").trim();
   if(!s) return "";
   return s.split(/\s+/).map(baihuaChunk).join(" ");
+}
+/* ================= 白话音可编辑：自己改的谐音存在本机（localStorage），优先于自动生成 ================= */
+function baihuaFor(id, ipa){
+  var c = (id && state.baihuaEdits) ? state.baihuaEdits[id] : "";
+  return c || baihuaOf(ipa);
+}
+function baihuaRowHTML(id, ipa){
+  var t = baihuaFor(id, ipa);
+  var custom = !!(id && state.baihuaEdits && state.baihuaEdits[id]);
+  return '<div class="baihua-row" data-bhrow>' +
+    '<span class="baihua">白话音：' + esc(t || "（还没标，点右边自己写一个）") + '</span>' +
+    (custom ? '<span class="bh-custom">我改的</span>' : '') +
+    '<button class="bh-edit" data-bhedit type="button">✎ 改</button>' +
+    '<div class="baihua-editor" data-bheditor hidden>' +
+      '<input class="bh-input" data-bhinput type="text" value="' + esc(t) + '" placeholder="写你觉得顺口的读音，如：外（四声）特" autocomplete="off">' +
+      '<div class="bh-actions"><button class="btn small" data-bhsave type="button">保存</button>' +
+      '<button class="btn ghost small" data-bhcancel type="button">取消</button>' +
+      (custom ? '<button class="bh-reset" data-bhreset type="button">恢复自动生成</button>' : '') + '</div>' +
+      '<p class="bh-note">你改的白话音只保存在这台手机上，换词、关掉重开都不会丢。</p>' +
+    '</div></div>';
+}
+function wireBaihua(host, id, ipa, refresh){
+  if(!host || !id) return;
+  var row = host.querySelector("[data-bhrow]");
+  if(!row) return;
+  var ed = row.querySelector("[data-bheditor]");
+  var input = row.querySelector("[data-bhinput]");
+  var card = host.querySelector("[data-flash]");
+  var done = function(){ if(typeof refresh === "function") refresh(); };
+  row.querySelector("[data-bhedit]").addEventListener("click", function(){
+    ed.hidden = false;
+    input.value = baihuaFor(id, ipa);
+    if(card) card.classList.add("editing");
+    try{ input.focus(); }catch(e){}
+  });
+  row.querySelector("[data-bhcancel]").addEventListener("click", function(){
+    ed.hidden = true;
+    if(card) card.classList.remove("editing");
+  });
+  row.querySelector("[data-bhsave]").addEventListener("click", function(){
+    var t = input.value.trim();
+    if(t) state.baihuaEdits[id] = t; else delete state.baihuaEdits[id];
+    saveState();
+    toast(t ? "白话音已保存" : "已清空，恢复自动生成");
+    done();
+  });
+  var rst = row.querySelector("[data-bhreset]");
+  if(rst) rst.addEventListener("click", function(){
+    delete state.baihuaEdits[id];
+    saveState();
+    toast("已恢复自动生成的白话音");
+    done();
+  });
 }
 var BH_VOWELS = ["aɪ","aʊ","eɪ","ɔɪ","əʊ","oʊ","iː","ɑː","ɔː","ɜː","uː","æ","e","ɪ","i","ɒ","ɔ","ʊ","u","ʌ","ə","ɑ","a","ɜ"];
 var BH_CONS = ["tʃ","dʒ","p","b","t","d","k","ɡ","g","f","v","θ","ð","s","z","ʃ","ʒ","h","m","n","ŋ","l","r","w","j"];
@@ -4958,10 +5025,10 @@ function goPron(lessonId, lineIdx){
 }
 
 /* ================= 单词版块 ================= */
-function flashHTML(v){
+function flashHTML(v, id){
   return '<div class="flash-zone"><div class="flash" data-flash>' +
     '<div class="flash-face"><div class="w en">' + esc(v[0]) + '</div><div class="phon">' + esc(v[1]) + '</div>' +
-    (baihuaOf(v[1]) ? '<div class="baihua">白话音：' + esc(baihuaOf(v[1])) + '</div>' : '') +
+    (id ? baihuaRowHTML(id, v[1]) : (baihuaOf(v[1]) ? '<div class="baihua">白话音：' + esc(baihuaOf(v[1])) + '</div>' : '')) +
     '<div class="read-row" style="justify-content:center;margin-top:12px;"><button class="btn soft small" data-speakword>▶ 听发音</button>' +
     '<button class="btn ghost small" data-speakwordslow>慢速</button></div>' +
     '<div class="tap-hint">点卡片翻面，看中文意思</div></div>' +
@@ -4972,9 +5039,10 @@ function flashHTML(v){
     '<div class="tap-hint">点卡片翻回去</div></div>' +
     '</div></div>';
 }
-function wireFlash(host, v){
+function wireFlash(host, v, id, refresh){
   const f = host.querySelector("[data-flash]");
-  if(f) f.addEventListener("click", e => { if(e.target.closest("button")) return; f.classList.toggle("flipped"); });
+  if(f) f.addEventListener("click", e => { if(e.target.closest("button, input, [data-bhrow]")) return; f.classList.toggle("flipped"); });
+  wireBaihua(host, id, v[1], refresh);
   const sw = host.querySelector("[data-speakword]");
   if(sw) sw.addEventListener("click", () => speak(v[0], 1));
   const sws = host.querySelector("[data-speakwordslow]");
@@ -5048,14 +5116,14 @@ function drawVocabMain(ls){
   const gid = ls.id + "-w" + vs.idx;
   const g = state.wordGrades[gid];
   host.innerHTML =
-    '<div id="vFlash">' + flashHTML(v) + '</div>' +
+    '<div id="vFlash">' + flashHTML(v, gid) + '</div>' +
     '<div class="flash-nav">' +
       '<button class="btn ghost small" id="vPrev"' + (vs.idx === 0 ? " disabled" : "") + '>← 上一个</button>' +
       '<span class="flash-count">第 ' + (vs.idx + 1) + ' / ' + total + ' 个 · 本课已标记 ' + graded + ' 个' +
       (g !== undefined ? ' · 这个词你标了「' + ["不认识","有点印象","认识"][g] + '」' : '') + '</span>' +
       '<button class="btn ghost small" id="vNext">' + (vs.idx === total - 1 ? "回到第一个 ↺" : "下一个 →") + '</button>' +
     '</div>' + gradeRowHTML();
-  wireFlash(host.querySelector("#vFlash"), v);
+  wireFlash(host.querySelector("#vFlash"), v, gid, () => { drawVocabMain(ls); drawVocabList(ls); });
   $("#vPrev").addEventListener("click", () => { if(vs.idx > 0){ vs.idx--; drawVocabMain(ls); drawVocabList(ls); } });
   $("#vNext").addEventListener("click", () => { vs.idx = (vs.idx + 1) % total; drawVocabMain(ls); drawVocabList(ls); });
   host.querySelectorAll("[data-grade]").forEach(b => b.addEventListener("click", () => {
@@ -5079,7 +5147,7 @@ function drawVocabList(ls){
     return '<div class="word-row"><button class="mini-play" data-wspeak="' + esc(v[0]) + '" aria-label="听发音">' + ICON_PLAY + '</button>' +
       '<button class="mini-play txt" data-wslow="' + esc(v[0]) + '" aria-label="慢速发音">慢</button>' +
       '<span class="w en">' + esc(v[0]) + '</span><span class="phon">' + esc(v[1]) + '</span>' +
-      (baihuaOf(v[1]) ? '<span class="baihua-sm">' + esc(baihuaOf(v[1])) + '</span>' : '') + st +
+      (baihuaFor(ls.id + "-w" + i, v[1]) ? '<span class="baihua-sm">' + esc(baihuaFor(ls.id + "-w" + i, v[1])) + '</span>' : '') + st +
       '<span class="cn">' + esc(v[2]) + '</span></div>';
   }).join("");
   host.querySelectorAll("[data-wspeak]").forEach(b => b.addEventListener("click", () => speak(b.dataset.wspeak, 1)));
@@ -5116,11 +5184,11 @@ function drawReview(){
   }
   const item = rv.pool[rv.idx];
   host.innerHTML =
-    '<div id="rvFlash">' + flashHTML(item.v) + '</div>' +
+    '<div id="rvFlash">' + flashHTML(item.v, item.id) + '</div>' +
     '<div class="flash-nav"><span class="flash-count">复习第 ' + (rv.idx + 1) + ' / ' + rv.pool.length + ' 个 · 来自《' + esc(item.lesson.t) + '》</span>' +
     '<button class="btn ghost small" id="rvSkip">跳过 →</button></div>' + gradeRowHTML() +
     '<p class="mic-note">标「认识」后这个词退出复习队列；标「不认识 / 有点印象」的下轮还会出现。</p>';
-  wireFlash(host.querySelector("#rvFlash"), item.v);
+  wireFlash(host.querySelector("#rvFlash"), item.v, item.id, drawReview);
   $("#rvSkip").addEventListener("click", () => { rv.idx++; drawReview(); });
   host.querySelectorAll("[data-grade]").forEach(b => b.addEventListener("click", () => {
     gradeWord(item.id, +b.dataset.grade);
@@ -5167,11 +5235,11 @@ function drawRvCard(){
   const id = RW.queue[RW.idx];
   const w = wordById(id), v = w.v;
   const entry = state.wordReview[id] || { stage: 0 };
-  const bh = baihuaOf(v[1]);
+  const bh = baihuaFor(id, v[1]);
   let prompt, answer;
   if(rvMode === "en2cn"){
     prompt = '<div class="rv-prompt en">' + esc(v[0]) + '</div><div class="phon">' + esc(v[1]) + '</div>' +
-      (bh ? '<div class="baihua">白话音：' + esc(bh) + '</div>' : '') +
+      baihuaRowHTML(id, v[1]) +
       '<div class="read-row" style="justify-content:center;margin-top:10px;"><button class="btn soft small" data-rvplay>▶ 听发音</button>' +
       '<button class="btn ghost small" data-rvplayslow>慢速</button></div>' +
       '<p class="mic-note">先在心里说出中文意思，再看答案。</p>';
@@ -5181,7 +5249,7 @@ function drawRvCard(){
     prompt = '<div class="rv-prompt">' + esc(v[2]) + '</div>' +
       '<p class="mic-note">先在心里拼出英文单词（发音也想一想），再看答案。</p>';
     answer = '<div class="rv-prompt en" style="margin-top:0;">' + esc(v[0]) + '</div><div class="phon">' + esc(v[1]) + '</div>' +
-      (bh ? '<div class="baihua">白话音：' + esc(bh) + '</div>' : '') +
+      baihuaRowHTML(id, v[1]) +
       '<div class="read-row" style="justify-content:center;margin-top:10px;"><button class="btn soft small" data-rvplay>▶ 听发音</button>' +
       '<button class="btn ghost small" data-rvplayslow>慢速</button></div>' +
       '<div class="ex en">' + esc(v[3]) + '</div><div class="excn">' + esc(v[4]) + '</div>' +
@@ -5205,6 +5273,7 @@ function drawRvCard(){
   wire("[data-rvskip]", () => { RW.idx++; RW.revealed = false; drawRvCard(); });
   wire("[data-rvpass]", () => { reviewGrade(id, true); RW.idx++; RW.revealed = false; if(RW.idx >= RW.queue.length){ RW = null; renderReview(); toast("这一组复习完了"); } else drawRvCard(); });
   wire("[data-rvfail]", () => { reviewGrade(id, false); RW.idx++; RW.revealed = false; if(RW.idx >= RW.queue.length){ RW = null; renderReview(); toast("这一组复习完了"); } else drawRvCard(); });
+  wireBaihua(host, id, v[1], drawRvCard);
 }
 function drawWbResults(q){
   const host = $("#wbResults");
@@ -5220,7 +5289,7 @@ function drawWbResults(q){
     '<div class="word-row"><button class="mini-play" data-wspeak="' + esc(x.v[0]) + '" aria-label="听发音">' + ICON_PLAY + '</button>' +
     '<button class="mini-play txt" data-wslow="' + esc(x.v[0]) + '" aria-label="慢速发音">慢</button>' +
     '<span class="w en">' + esc(x.v[0]) + '</span><span class="phon">' + esc(x.v[1]) + '</span>' +
-    (baihuaOf(x.v[1]) ? '<span class="baihua-sm">' + esc(baihuaOf(x.v[1])) + '</span>' : '') +
+    (baihuaFor(x.id, x.v[1]) ? '<span class="baihua-sm">' + esc(baihuaFor(x.id, x.v[1])) + '</span>' : '') +
     '<span class="cn">' + esc(x.v[2]) + '</span>' +
     '<button class="btn soft small" data-wgo="' + x.lesson.id + '" data-wi="' + x.lesson.v.indexOf(x.v) + '">去学</button></div>'
   ).join("");
