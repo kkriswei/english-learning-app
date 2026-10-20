@@ -450,6 +450,10 @@
       .rec-status.on{display:inline;}
       .mine-audio{display:none;width:100%;margin-top:10px;}
       .mine-audio.show{display:block;}
+      .mine-label{display:none;align-items:center;gap:8px;margin-top:12px;font-size:13px;font-weight:600;color:var(--ink-soft);}
+      .mine-label.show{display:flex;}
+      .deduct{font-size:13px;color:var(--ink-soft);background:var(--surface-2);border-radius:10px;padding:10px 13px;margin-top:10px;line-height:1.75;}
+      .deduct b{color:var(--accent-deep);}
       .shadow-mark{margin-left:auto;font-size:13px;font-weight:600;color:var(--ink-faint);}
       .shadow-mark.got{color:var(--ok);}
       select.filter{
@@ -866,7 +870,7 @@
 
         <h2 class="sec">四个版块，随时单独练</h2>
         <div class="goto-list">
-          <button class="goto-cell" data-goto="vocab"><b>Vocabulary 单词</b><span>3000 个词，从易到难 · 已学 <span id="sumWords">0</span></span></button>
+          <button class="goto-cell" data-goto="vocab"><b>Vocabulary 单词</b><span>8000 个词，从易到难 · 已学 <span id="sumWords">0</span></span></button>
           <button class="goto-cell" data-goto="grammar"><b>Grammar 语法</b><span>60 个语法点：场景 + 诀窍 + 真人带读 + 对比区分</span></button>
           <button class="goto-cell" data-goto="dialogue"><b>Dialogue 对话</b><span>60 个场景 · 已练 <span id="sumLines">0</span> 句</span></button>
           <button class="goto-cell" data-goto="pron"><b>Pronunciation 发音</b><span>跟读打分 · 已练 <span id="sumPron">0</span> 句</span></button>
@@ -3921,7 +3925,7 @@ ALL_LESSONS.forEach(l => l.dl.forEach((d, i) => ALL_LINES.push({ lid: l.id + "-"
 const TIERS = {
   30:  { label: "30 分钟", words: 10, grammar: 1, dialogue: 6,  pron: 5 },
   60:  { label: "1 小时",  words: 20, grammar: 2, dialogue: 12, pron: 10 },
-  120: { label: "2 小时",  words: 40, grammar: 4, dialogue: 24, pron: 16 }
+  120: { label: "2 小时",  words: 80, grammar: 4, dialogue: 24, pron: 16 }
 };
 
 /* ================= 状态与持久化 ================= */
@@ -4615,20 +4619,41 @@ function expandToken(w){
   if(CONTRACTIONS[n]) return CONTRACTIONS[n].split(" ");
   return n ? [n] : [];
 }
-/* 返回 {tokens:[{disp, status:'ok'|'sub'|'miss', said}], extras:[], okCount, total, score, wrong:[{w,type}]} */
+/* ---------- 评分等价判定：数字归一 / 字母名 / 常见同音词 ---------- */
+const NUM_WORDS = { "0":"zero","1":"one","2":"two","3":"three","4":"four","5":"five","6":"six","7":"seven","8":"eight","9":"nine","10":"ten","11":"eleven","12":"twelve","13":"thirteen","14":"fourteen","15":"fifteen","16":"sixteen","17":"seventeen","18":"eighteen","19":"nineteen","20":"twenty","30":"thirty","40":"forty","50":"fifty","60":"sixty","70":"seventy","80":"eighty","90":"ninety","100":"hundred" };
+function numNorm(w){ return NUM_WORDS[w] || w; }
+const LETTER_NAMES = { a:["ay"], b:["be"], c:["see","sea"], d:["dee"], f:["ef"], g:["gee"], h:["aitch"], i:["eye"], j:["jay"], k:["kay"], l:["el"], m:["em"], n:["en"], o:["oh","owe"], p:["pee"], q:["cue","queue"], r:["are"], s:["ess"], t:["tea","tee"], u:["you","yew"], v:["vee"], w:["doubleyou"], x:["ex"], y:["why"], z:["zee","zed"] };
+const HOMOPHONE_GROUPS = [["for","four"],["to","too","two"],["there","their","they're"],["your","you're"],["its","it's"],["hear","here"],["know","no"],["right","write"],["sea","see"],["sun","son"],["week","weak"],["meet","meat"],["buy","by","bye"],["our","hour"],["wear","where"],["new","knew"],["one","won"],["through","threw"],["would","wood"],["then","than"],["hi","high"],["in","inn"]];
+const HOMOPHONE_OF = {};
+HOMOPHONE_GROUPS.forEach(g => g.forEach(w => { HOMOPHONE_OF[w] = g; }));
+/* 目标词与识别词是否算读对：归一后相同、字母名读法、常见同音词都算对 */
+function wordsMatch(tw, sw){
+  tw = numNorm(tw); sw = numNorm(sw);
+  if(tw === sw) return true;
+  if(tw.length === 1 && LETTER_NAMES[tw] && LETTER_NAMES[tw].indexOf(sw) >= 0) return true;
+  const g = HOMOPHONE_OF[tw];
+  return !!(g && g.indexOf(sw) >= 0);
+}
+/* 返回 {tokens:[{disp, status:'ok'|'sub'|'miss', said}], extras:[], okCount, total, score, wrong:[{w,type}], points:[{type,w,said,points}]} */
 function diffSentence(target, saidRaw){
   const dispTokens = target.replace(/[.!?。！？]+$/, "").split(/\s+/).filter(Boolean);
   const tFlat = []; // {w, ti}
   dispTokens.forEach((t, ti) => expandToken(t).forEach(w => tFlat.push({ w, ti })));
-  const sWords = (saidRaw || "").toLowerCase().replace(/[’‘]/g, "'").replace(/[^a-z0-9' ]/g, " ").split(/\s+/).filter(Boolean)
+  const sWordsRaw = (saidRaw || "").toLowerCase().replace(/[’‘]/g, "'").replace(/[^a-z0-9' ]/g, " ").split(/\s+/).filter(Boolean)
     .flatMap(w => CONTRACTIONS[w] ? CONTRACTIONS[w].split(" ") : [w]);
+  /* 识别侧预处理：相邻的 "double" + "you" 合并成 "doubleyou"（字母 W 的读法） */
+  const sWords = [];
+  for(let k = 0; k < sWordsRaw.length; k++){
+    if(sWordsRaw[k] === "double" && sWordsRaw[k + 1] === "you"){ sWords.push("doubleyou"); k++; }
+    else sWords.push(sWordsRaw[k]);
+  }
   const n = tFlat.length, m = sWords.length;
   const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
   for(let i = 0; i <= n; i++) dp[i][0] = i;
   for(let j = 0; j <= m; j++) dp[0][j] = j;
   for(let i = 1; i <= n; i++) for(let j = 1; j <= m; j++){
     dp[i][j] = Math.min(
-      dp[i - 1][j - 1] + (tFlat[i - 1].w === sWords[j - 1] ? 0 : 1),
+      dp[i - 1][j - 1] + (wordsMatch(tFlat[i - 1].w, sWords[j - 1]) ? 0 : 1),
       dp[i - 1][j] + 1,
       dp[i][j - 1] + 1
     );
@@ -4636,9 +4661,9 @@ function diffSentence(target, saidRaw){
   const ops = [];
   let i = n, j = m;
   while(i > 0 || j > 0){
-    if(i > 0 && j > 0 && dp[i][j] === dp[i - 1][j - 1] + (tFlat[i - 1].w === sWords[j - 1] ? 0 : 1)){
-      ops.push(tFlat[i - 1].w === sWords[j - 1]
-        ? { type: "ok", ti: tFlat[i - 1].ti, w: tFlat[i - 1].w }
+    if(i > 0 && j > 0 && dp[i][j] === dp[i - 1][j - 1] + (wordsMatch(tFlat[i - 1].w, sWords[j - 1]) ? 0 : 1)){
+      ops.push(wordsMatch(tFlat[i - 1].w, sWords[j - 1])
+        ? { type: "ok", ti: tFlat[i - 1].ti, w: tFlat[i - 1].w, said: sWords[j - 1] }
         : { type: "sub", ti: tFlat[i - 1].ti, w: tFlat[i - 1].w, said: sWords[j - 1] });
       i--; j--;
     } else if(i > 0 && dp[i][j] === dp[i - 1][j] + 1){
@@ -4652,7 +4677,7 @@ function diffSentence(target, saidRaw){
   const extras = [], wrong = [];
   let okCount = 0;
   ops.forEach(op => {
-    if(op.type === "ok"){ okCount++; return; }
+    if(op.type === "ok"){ okCount++; if(op.said && op.said !== op.w){ const pt0 = perToken[op.ti]; if(pt0 && !pt0.said) pt0.said = op.said; } return; }
     if(op.type === "ins"){ extras.push(op.said); wrong.push({ w: op.said, type: "extra" }); return; }
     const pt = perToken[op.ti];
     if(op.type === "miss"){ if(pt.status === "ok") pt.status = "miss"; wrong.push({ w: op.w, type: "miss" }); }
@@ -4661,7 +4686,26 @@ function diffSentence(target, saidRaw){
   const total = Math.max(1, tFlat.length);
   let score = Math.round(100 * okCount / total) - extras.length * 4;
   score = Math.max(0, Math.min(100, score));
-  return { tokens: perToken, extras, okCount, total: tFlat.length, score, wrong };
+  /* 扣分明细：每个多读词固定扣 4 分；漏读/读错平分余下扣分（整数均分，余数从前往后 +1）；
+     最后对账校正，保证 points 之和恰好等于 100 - score */
+  const points = [];
+  wrong.forEach(x => {
+    if(x.type === "extra") points.push({ type: "extra", w: x.w, points: 4 });
+    else if(x.type === "miss") points.push({ type: "miss", w: x.w, points: 0 });
+    else points.push({ type: "wrong", w: x.w, said: x.said, points: 0 });
+  });
+  const restPts = (100 - score) - 4 * extras.length;
+  const shares = points.filter(p => p.type !== "extra");
+  if(shares.length){
+    const base = Math.floor(restPts / shares.length);
+    let rem = restPts - base * shares.length;
+    shares.forEach(p => { p.points = base + (rem > 0 ? 1 : 0); if(rem > 0) rem--; });
+  }
+  if(points.length){
+    const sumPts = points.reduce((a, p) => a + p.points, 0);
+    if(sumPts !== 100 - score) points[0].points += (100 - score) - sumPts;
+  }
+  return { tokens: perToken, extras, okCount, total: tFlat.length, score, wrong, points };
 }
 function diffHTML(res){
   return res.tokens.map(t => {
@@ -4673,6 +4717,15 @@ function diffHTML(res){
 function extraHTML(res){
   if(!res.extras.length) return "";
   return '<div class="extra-line">多说了：' + res.extras.map(w => "<s>" + esc(w) + "</s>").join(" ") + '（原句里没有这些词）</div>';
+}
+function pointsHTML(res){
+  if(res.score >= 100) return '<div class="deduct"><b>扣分明细：</b>满分，没有扣分</div>';
+  const lines = (res.points || []).map(p => {
+    if(p.type === "miss") return '<div>漏读 "' + esc(p.w) + '" −' + p.points + ' 分</div>';
+    if(p.type === "wrong") return '<div>"' + esc(p.w) + '" 读成了 "' + esc(p.said || "") + '" −' + p.points + ' 分</div>';
+    return '<div>多读了 "' + esc(p.w) + '" −' + p.points + ' 分</div>';
+  }).join("");
+  return '<div class="deduct"><b>扣分明细</b>' + lines + '<div>共扣 ' + (100 - res.score) + ' 分</div></div>';
 }
 /* ---------- 发音点评 / 易错音 ---------- */
 const STRESS_TIPS = {
@@ -4751,40 +4804,143 @@ function grammarHints(res){
 }
 /* ---------- 语音识别 ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
-function listenOnce(onDone){
+/* 全局麦克风会话管理：同一时间只允许一个识别/录音会话，避免 iOS 上抢麦克风报 audio-capture */
+let curRec = null;                 /* 当前 SpeechRecognition 实例 */
+let mrRecorder = null, mrChunks = [], mrStream = null;
+let micGen = 0;                    /* 会话代次：stopCapture / releaseMic 后递增，迟到的 getUserMedia 回调靠它丢弃 */
+let gradeSeq = 0;                  /* 判分会话序号：防止已被取代的旧会话回调污染新会话 */
+function releaseMic(){
+  micGen++;
+  if(curRec){
+    const r = curRec; curRec = null;
+    try { r.onstart = r.onresult = r.onerror = r.onend = null; } catch(e){}
+    try { r.abort(); } catch(e){}
+    try { r.stop(); } catch(e){}
+  }
+  if(mrRecorder){
+    const mr = mrRecorder; mrRecorder = null;
+    try { mr.onstop = null; } catch(e){}
+    try { mr.stop(); } catch(e){}
+  }
+  if(mrStream){ mrStream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); mrStream = null; }
+  mrChunks = [];
+}
+/* 单次识别：回调 onDone(候选转写数组 | null, 错误码 | null)；错误码只作内部判断，绝不直接展示给用户 */
+function listenOnce(onDone, opts){
+  opts = opts || {};
   if(!SR){ onDone(null, "unsupported"); return; }
+  releaseMic();                    /* 启动新会话前先彻底释放旧会话 */
+  try { speechSynthesis.cancel(); } catch(e){}
+  stopRec();                       /* 停掉任何正在播放的声音 */
   let rec;
   try { rec = new SR(); } catch(e){ onDone(null, "unsupported"); return; }
+  curRec = rec;
   rec.lang = "en-US";
   rec.interimResults = false;
-  rec.maxAlternatives = 1;
+  rec.maxAlternatives = 5;
   let finished = false;
-  const finish = (text, err) => { if(finished) return; finished = true; try { rec.stop(); } catch(e){} onDone(text, err); };
-  rec.onresult = e => finish(e.results[0][0].transcript, null);
-  rec.onerror = e => finish(null, e.error || "error");
+  const finish = (alts, err) => {
+    if(finished) return; finished = true;
+    if(curRec === rec) curRec = null;
+    try { rec.stop(); } catch(e){}
+    onDone(alts, err);
+  };
+  rec.onstart = () => { if(opts.onStart) opts.onStart(); };
+  rec.onresult = e => {
+    const alts = [];
+    try {
+      const r0 = e.results[0];
+      for(let k = 0; k < r0.length; k++){ const t = r0[k] && r0[k].transcript; if(t) alts.push(t); }
+    } catch(err2){}
+    finish(alts.length ? alts : null, alts.length ? null : "end");
+  };
+  rec.onerror = e => finish(null, (e && e.error) || "error");
   rec.onend = () => finish(null, "end");
   try { rec.start(); } catch(e){ finish(null, "start"); }
 }
-/* 并行录音（用于回放对比；失败则静默跳过） */
-let mrRecorder = null, mrChunks = [], mrStream = null;
+/* 录音（用于回放对比；失败则静默跳过）。带代次守卫：会话已释放后迟到的流立即停掉丢弃 */
 function startCapture(){
   if(!navigator.mediaDevices || !window.MediaRecorder) return;
+  const gen = micGen;
   navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+    if(gen !== micGen){ stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); return; }
     mrStream = stream; mrChunks = [];
     mrRecorder = new MediaRecorder(stream);
     mrRecorder.ondataavailable = e => { if(e.data.size) mrChunks.push(e.data); };
     mrRecorder.start();
-  }).catch(() => { mrRecorder = null; });
+  }).catch(() => { if(gen === micGen) mrRecorder = null; });
 }
 function stopCapture(cb){
+  micGen++;
   if(mrRecorder && mrRecorder.state === "recording"){
-    mrRecorder.onstop = () => {
-      if(mrStream) mrStream.getTracks().forEach(t => t.stop());
-      mrRecorder = null;
-      cb(mrChunks.length ? URL.createObjectURL(new Blob(mrChunks, { type: mrChunks[0].type || "audio/webm" })) : null);
+    const rec = mrRecorder, stream = mrStream;
+    mrRecorder = null; mrStream = null;
+    rec.onstop = () => {
+      if(stream) stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} });
+      const url = mrChunks.length ? URL.createObjectURL(new Blob(mrChunks, { type: mrChunks[0].type || "audio/webm" })) : null;
+      mrChunks = [];
+      cb(url);
     };
-    mrRecorder.stop();
-  } else cb(null);
+    try { rec.stop(); } catch(e){ cb(null); }
+  } else {
+    if(mrStream){ mrStream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); mrStream = null; }
+    cb(null);
+  }
+}
+/* 对全部候选转写逐个评分，返回得分最高的 { text, res } */
+function scoreAlts(target, alts){
+  let best = null;
+  (alts || []).forEach(t => {
+    const res = diffSentence(target, t);
+    if(!best || res.score > best.res.score) best = { text: t, res };
+  });
+  return best;
+}
+/* 识别错误 → 给用户看的中文提示（原始错误码绝不出现在界面上） */
+function srErrText(err){
+  if(err === "not-allowed" || err === "service-not-allowed")
+    return "没有麦克风权限：弹出提示时请点『允许』；如果之前拒绝过，去 iPhone 设置 → Safari → 麦克风改成允许，再刷新页面";
+  if(err === "no-speech" || err === "end")
+    return "没听清你说什么，靠近麦克风、周围安静一点再试一次";
+  return "识别没成功，再试一次；一直不行就先用🎙把自己读的录下来回放着听";
+}
+const SR_RETRYABLE = ["audio-capture", "network", "aborted", "end", "error", "start"];
+/* 完整判分会话：识别先启动，录音在 onstart 后约 200ms 才跟上（不与识别同时抢麦克风）；
+   临时错误时完整清理后自动重试一次（重试只开识别、不并行录音）。
+   回调 cb({ text, res, url, retried, err })，err 仅内部使用 */
+function listenGrade(target, cb){
+  const seq = ++gradeSeq;
+  let settled = false;
+  const done = out => { if(settled) return; settled = true; cb(out); };
+  let firstUrl = null;
+  const attempt = (withRec, isRetry) => {
+    if(seq !== gradeSeq || settled) return;
+    let capTimer = null;
+    listenOnce((alts, err) => {
+      if(seq !== gradeSeq) return;
+      if(capTimer){ clearTimeout(capTimer); capTimer = null; }
+      const proceed = () => {
+        if(seq !== gradeSeq || settled) return;
+        if(alts && alts.length){
+          const best = scoreAlts(target, alts);
+          if(best){ done({ text: best.text, res: best.res, url: firstUrl, retried: isRetry, err: null }); return; }
+        }
+        const e2 = err || "end";
+        if(!isRetry && SR_RETRYABLE.indexOf(e2) >= 0){
+          releaseMic();
+          setTimeout(() => { if(seq === gradeSeq && !settled) attempt(false, true); }, 500);
+          return;
+        }
+        done({ text: null, res: null, url: firstUrl, retried: isRetry, err: e2 });
+      };
+      if(withRec) stopCapture(url => { if(url) firstUrl = url; proceed(); });
+      else proceed();
+    }, { onStart: () => {
+      if(withRec && seq === gradeSeq && !settled)
+        capTimer = setTimeout(() => { if(seq === gradeSeq && !settled) startCapture(); }, 200);
+    }});
+  };
+  attempt(true, false);
 }
 
 
@@ -5535,16 +5691,14 @@ function drawRole(zone, ls){
       const micBtn = zone.querySelector("#rpMic");
       st.classList.add("on");
       micBtn.disabled = true;
-      startCapture();
-      listenOnce((text, err) => {
-        stopCapture(() => {});
+      listenGrade(cur.d[1], out => {
         st.classList.remove("on");
-        if(!text){
+        if(!out.res){
           micBtn.disabled = false;
-          toast(err === "unsupported" ? "这个浏览器不支持语音识别，请切换到打字模式" : "没听清，再试一次，或者切换到打字模式");
+          toast(out.err === "unsupported" ? "这个浏览器不支持语音识别，请切换到打字模式" : srErrText(out.err));
           return;
         }
-        rpAnswer(zone, ls, text);
+        rpAnswer(zone, ls, out.text, out.url);
       });
     });
   } else {
@@ -5556,7 +5710,7 @@ function drawRole(zone, ls){
     zone.querySelector("#rpSkip").addEventListener("click", () => rpAnswer(zone, ls, ""));
   }
 }
-function rpAnswer(zone, ls, saidRaw){
+function rpAnswer(zone, ls, saidRaw, myUrl){
   const myLines = rpUserLines(ls);
   const cur = myLines[rp.idx];
   const target = cur.d[1];
@@ -5589,8 +5743,9 @@ function rpAnswer(zone, ls, saidRaw){
       '<div class="cc-label" style="margin-top:12px;">你说的</div>' +
       '<div class="corr-said en">' + (saidRaw ? esc(saidRaw) : "（没说出来）") + '</div>' +
       '<div class="cc-label" style="margin-top:10px;">标准句（红色 = 说错的词，上面小字是你说的；金色虚线 = 漏掉的词）</div>' +
-      '<div class="corr-right en">' + diffHTML(res) + '</div>' + extraHTML(res) +
+      '<div class="corr-right en">' + diffHTML(res) + '</div>' + extraHTML(res) + pointsHTML(res) +
       '<div style="font-size:13.5px;color:var(--ink-soft);margin-top:6px;">翻译：' + esc(cur.d[2]) + '</div>' +
+      (myUrl ? '<div class="cc-label" style="margin-top:10px;">我的录音</div><audio class="mine-audio show" controls src="' + myUrl + '"></audio>' : '') +
       (hints.length ? '<ul class="hint-list">' + hints.map(h => "<li>" + h + "</li>").join("") + '</ul>' : "") +
       (ls.g && ls.g[4] ? '<div class="tip-box"><b>本课易错点：</b>' + esc(ls.g[4]) + '</div>' : "") +
       '<div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">' +
@@ -5685,9 +5840,18 @@ function pronCard(ls, i){
       '<button class="icon-btn" data-act="rec" title="录音回放对比">' + ICON_MIC + '</button>' +
       '<span class="rec-status">● 录音中…再点一次麦克风结束</span>' +
     '</div>' +
+    '<div class="mine-label"><span>我的录音</span><button class="btn soft small" data-act="orig">原音</button></div>' +
     '<audio class="mine-audio" controls></audio>' +
     '<div data-result></div>';
   const audio = card.querySelector(".mine-audio");
+  const mineLabel = card.querySelector(".mine-label");
+  function showMine(url){
+    if(!url) return;
+    audio.src = url;
+    audio.classList.add("show");
+    mineLabel.classList.add("show");
+  }
+  card.querySelector('[data-act="orig"]').addEventListener("click", () => speak(d[1], 0.95, d[0]));
   const status = card.querySelector(".rec-status");
   const result = card.querySelector("[data-result]");
   const checkBtn = card.querySelector('[data-act="check"]');
@@ -5707,8 +5871,7 @@ function pronCard(ls, i){
       if(myStream) myStream.getTracks().forEach(t => t.stop());
       status.classList.remove("on");
       if(myChunks.length){
-        audio.src = URL.createObjectURL(new Blob(myChunks, { type: myChunks[0].type || "audio/webm" }));
-        audio.classList.add("show");
+        showMine(URL.createObjectURL(new Blob(myChunks, { type: myChunks[0].type || "audio/webm" })));
       }
     };
     myRecorder.start();
@@ -5724,20 +5887,17 @@ function pronCard(ls, i){
     checkBtn.textContent = "正在听你说…";
     status.textContent = "● 正在听…读完停一下";
     status.classList.add("on");
-    startCapture();
-    listenOnce((text, err) => {
-      stopCapture(url => {
-        if(url){ audio.src = url; audio.classList.add("show"); }
-      });
+    listenGrade(d[1], out => {
       status.classList.remove("on");
       status.textContent = "● 录音中…再点一次麦克风结束";
       checkBtn.disabled = false;
       checkBtn.textContent = "再练一次";
-      if(!text){
-        result.innerHTML = '<div class="comment-line">' + (err === "no-speech" || err === "end" ? "没听清你说什么，再靠近麦克风试一次。" : "识别没成功（" + esc(err || "") + "），再试一次；一直不行就用录音回放自评。") + '</div>';
+      if(out.url) showMine(out.url);
+      if(!out.res){
+        result.innerHTML = '<div class="comment-line">' + esc(srErrText(out.err)) + '</div>';
         return;
       }
-      const res = diffSentence(d[1], text);
+      const text = out.text, res = out.res;
       pracLine(lid);
       state.stats.pronAttempts++;
       if(res.score >= 90) state.stats.pron90++;
@@ -5748,7 +5908,8 @@ function pronCard(ls, i){
       result.innerHTML =
         '<div class="pron-head" style="margin-top:12px;"><div class="score-big ' + (res.score >= 85 ? "good" : res.score >= 60 ? "mid" : "low") + '">' + res.score + '</div>' +
         '<div class="ph-txt"><div style="font-weight:700;">发音得分 / 100</div><div style="font-size:12.5px;color:var(--ink-faint);">识别到你读的是：<span class="en">' + esc(text) + '</span></div></div></div>' +
-        '<div class="corr-right en" style="margin-top:10px;">' + diffHTML(res) + '</div>' + extraHTML(res) +
+        '<div class="corr-right en" style="margin-top:10px;">' + diffHTML(res) + '</div>' + extraHTML(res) + pointsHTML(res) +
+        (out.retried ? '<div class="mic-note">这次没录上回放音频，想听自己的声音可以用🎙单独录一遍</div>' : '') +
         '<div class="comment-line"><b>点评：</b>' + esc(pronComment(res, d[1])) + '</div>' +
         '<div class="mic-note">红色词上面小字是识别到的你的读法；金色虚线是漏读的词。这一句已算进今日发音进度。</div>';
       renderHUD(); saveState();
@@ -5808,8 +5969,10 @@ function renderPronExtras(){
     if(!SR){ out.textContent = "这个浏览器不支持语音识别，没法自测；点上面的词听示范，跟着大声读几遍。"; return; }
     const word = shuffle(tips[ti].words.slice())[0];
     out.innerHTML = '请读这个词：<b class="en" style="font-size:16px;">' + word + '</b>（正在听…）';
-    listenOnce((text) => {
-      if(!text){ out.textContent = "没听清，再点一次「跟读自测」试试。"; return; }
+    listenOnce((alts) => {
+      if(!alts || !alts.length){ out.textContent = "没听清，再点一次「跟读自测」试试。"; return; }
+      const bestW = scoreAlts(word, alts);
+      const text = bestW ? bestW.text : alts[0];
       const said = normWord(text.split(/\s+/)[0] || "");
       out.innerHTML = said === word
         ? '✓ 读对了！识别到的是 <b class="en">' + esc(text) + '</b>。'
