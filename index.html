@@ -448,6 +448,12 @@
       .shadow-actions .lbl{font-size:12.5px;color:var(--ink-faint);}
       .rec-status{font-size:13px;color:var(--bad);font-weight:600;display:none;}
       .rec-status.on{display:inline;}
+      .mic-meter{display:none;margin-top:8px;max-width:430px;}
+      .mic-meter.on{display:block;}
+      .mic-meter .mm-bar{height:8px;border-radius:99px;background:#e9e2cf;overflow:hidden;}
+      .mic-meter .mm-bar i{display:block;height:100%;width:0%;background:linear-gradient(90deg,#c9a86a,#a87f24);border-radius:99px;transition:width .12s linear;}
+      .mic-meter .mm-label{font-size:11.5px;color:var(--ink-faint);margin-top:3px;}
+      .mic-warn{margin-top:10px;font-size:13px;line-height:1.6;color:var(--bad);font-weight:600;}
       .mine-audio{display:none;width:100%;margin-top:10px;}
       .mine-audio.show{display:block;}
       .mine-label{display:none;align-items:center;gap:8px;margin-top:12px;font-size:13px;font-weight:600;color:var(--ink-soft);}
@@ -5256,7 +5262,7 @@ function startCapture(){
   const gen = micGen;
   navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
     if(gen !== micGen){ stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); return; }
-    mrStream = stream; mrChunks = [];
+    mrStream = stream; mrChunks = []; mrLastBlob = null;
     mrRecorder = new MediaRecorder(stream);
     mrRecorder.ondataavailable = e => { if(e.data.size) mrChunks.push(e.data); };
     mrRecorder.start();
@@ -5264,12 +5270,14 @@ function startCapture(){
 }
 function stopCapture(cb){
   micGen++;
+  mrLastBlob = null;   /* 本次停录若没录到东西，峰值检测不得误用上一段录音 */
   if(mrRecorder && mrRecorder.state === "recording"){
     const rec = mrRecorder, stream = mrStream;
     mrRecorder = null; mrStream = null;
     rec.onstop = () => {
       if(stream) stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} });
-      const url = mrChunks.length ? URL.createObjectURL(new Blob(mrChunks, { type: mrChunks[0].type || "audio/webm" })) : null;
+      mrLastBlob = mrChunks.length ? new Blob(mrChunks, { type: mrChunks[0].type || "audio/webm" }) : null;
+      const url = mrLastBlob ? URL.createObjectURL(mrLastBlob) : null;
       mrChunks = [];
       cb(url);
     };
@@ -5278,6 +5286,110 @@ function stopCapture(cb){
     if(mrStream){ mrStream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); mrStream = null; }
     cb(null);
   }
+}
+/* ---------- 麦克风诊断：实时音量条 + 录音峰值检测 ----------
+   真机反馈：发音跟读识别报「没听清」、7 秒录音回放没声音，用户明明贴得很近。
+   识别与录音两条链路同时收不到声，是设备层问题（浏览器选错了麦克风、系统输入被静音），
+   笼统说「靠近麦克风再试」是误导。对策：
+   (1) 判分聆听期间把现有 capture 流的电平画成音量条，让用户亲眼确认麦克风有没有在收声，
+       并小字显示当前麦克风名称；只接现有流，绝不为此新开抢麦的流，没有 capture 流就不显示。
+   (2) 录音结束解码算峰值，整段低于阈值＝录音里没有声音，结果区改给「选对麦克风」的明确提示。 */
+const MIC_HINT = "录音里没有声音——浏览器可能选了别的麦克风，去地址栏的麦克风图标或系统『声音 → 输入』里，选对你正在用的麦克风再试";
+const MIC_SILENT_PEAK = 0.02;   /* 峰值阈值：整段录音峰值低于满量程 2%（约 -34 dBFS）视为录音里没有声音 */
+let mrLastBlob = null;          /* 最近一段录音的 Blob（stopCapture 同步存下，供峰值检测） */
+function peakOfSamples(ch){
+  let p = 0;
+  for(let i = 0; i < ch.length; i++){ const v = ch[i]; const a = v < 0 ? -v : v; if(a > p) p = a; }
+  return p;
+}
+function peakOfAudioBuffer(buf){
+  if(!buf || !buf.numberOfChannels) return null;
+  let p = 0;
+  for(let c = 0; c < buf.numberOfChannels; c++){
+    try { const v = peakOfSamples(buf.getChannelData(c)); if(v > p) p = v; } catch(e){}
+  }
+  return p;
+}
+function recSilentOf(peak){ return peak !== null && peak !== undefined && peak < MIC_SILENT_PEAK; }
+/* 解码一段录音并回调其峰值（0..1）；解不出来回调 null＝未知，不改变任何既有行为。
+   冒烟可注入 window.__REC_PEAK(blob, cb) 替代真实解码（与 __SR_TIMING 同一种注入口径）；生产不设该变量。 */
+function measureBlobPeak(blob, cb){
+  let called = false;
+  const done = v => { if(called) return; called = true; cb(typeof v === "number" && isFinite(v) ? v : null); };
+  if(!blob || !blob.size){ done(null); return; }
+  if(typeof window !== "undefined" && typeof window.__REC_PEAK === "function"){ try { window.__REC_PEAK(blob, done); } catch(e){ done(null); } return; }
+  const OC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if(!OC && !AC){ done(null); return; }
+  let ctx;
+  try { ctx = OC ? new OC(1, 1, 44100) : new AC(); } catch(e){ done(null); return; }
+  const onBuf = buf => done(peakOfAudioBuffer(buf));
+  const decode = ab => {
+    try {
+      const pr = ctx.decodeAudioData(ab, onBuf, () => done(null));
+      if(pr && pr.then) pr.then(onBuf).catch(() => done(null));
+    } catch(e){ done(null); }
+  };
+  if(blob.arrayBuffer) blob.arrayBuffer().then(decode).catch(() => done(null));
+  else if(typeof ArrayBuffer !== "undefined" && blob instanceof ArrayBuffer) decode(blob);
+  else done(null);
+}
+/* ---- 实时音量条：只接现有 capture 流（mrStream） ---- */
+let meterHost = null, meterTimer = null, meterCtx = null, meterAnalyser = null, meterSrc = null, meterStreamRef = null;
+function micTrackLabel(){
+  try {
+    const s = mrStream; if(!s) return "";
+    const t = (s.getAudioTracks && s.getAudioTracks()[0]) || (s.getTracks && s.getTracks()[0]);
+    return (t && t.label) || "";
+  } catch(e){ return ""; }
+}
+function meterStart(el){
+  meterStop();
+  if(!el) return;
+  meterHost = el;
+  el.innerHTML = '<div class="mm-bar"><i></i></div><div class="mm-label"></div>';
+  meterTimer = setInterval(meterTick, 100);
+  meterTick();
+}
+function meterTick(){
+  const host = meterHost;
+  if(!host){ meterStop(); return; }
+  if(!mrStream){ host.classList.remove("on"); return; }   /* 没有 capture 流的会话不显示 */
+  host.classList.add("on");
+  const lab = host.querySelector(".mm-label");
+  if(lab){
+    const name = micTrackLabel();
+    const txt = name ? "麦克风：" + name : "麦克风录音中（说话时这条会动）";
+    if(lab.textContent !== txt) lab.textContent = txt;
+  }
+  try {
+    if(meterStreamRef !== mrStream){
+      meterStreamRef = mrStream;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if(AC){
+        if(!meterCtx) meterCtx = new AC();
+        if(meterCtx.state === "suspended") meterCtx.resume();
+        if(meterSrc){ try { meterSrc.disconnect(); } catch(e){} meterSrc = null; }
+        meterAnalyser = meterCtx.createAnalyser();
+        meterAnalyser.fftSize = 512;
+        meterSrc = meterCtx.createMediaStreamSource(mrStream);
+        meterSrc.connect(meterAnalyser);
+      }
+    }
+    if(meterAnalyser){
+      const data = new Float32Array(meterAnalyser.fftSize);
+      meterAnalyser.getFloatTimeDomainData(data);
+      const bar = host.querySelector(".mm-bar i");
+      if(bar) bar.style.width = Math.min(100, Math.round(peakOfSamples(data) * 180)) + "%";
+    }
+  } catch(e){}
+}
+function meterStop(){
+  if(meterTimer){ clearInterval(meterTimer); meterTimer = null; }
+  if(meterHost){ meterHost.classList.remove("on"); meterHost.innerHTML = ""; meterHost = null; }
+  if(meterSrc){ try { meterSrc.disconnect(); } catch(e){} meterSrc = null; }
+  meterAnalyser = null; meterStreamRef = null;
+  if(meterCtx){ const c = meterCtx; meterCtx = null; try { c.close(); } catch(e){} }
 }
 /* 对全部候选转写逐个评分，返回得分最高的 { text, res } */
 function scoreAlts(target, alts){
@@ -5313,6 +5425,7 @@ function listenGradeAccum(target, cb, opts){
   const T = srTiming(), A = srAccTiming();
   const seq = ++gradeSeq;
   let settled = false;
+  meterStart(opts && opts.meterEl);
   let segments = [];            /* 已确认的段：{ alts: [...] } */
   let lastSegText = "";
   let anyStart = false, anyResult = false, anyError = false;
@@ -5338,7 +5451,11 @@ function listenGradeAccum(target, cb, opts){
     clearTimers();
     if(gradeDoneHook === hook) gradeDoneHook = null;
     killRec();
-    stopCapture(u => { out.url = u || null; out.retried = retried; cb(out); });
+    meterStop();
+    stopCapture(u => {
+      out.url = u || null; out.retried = retried;
+      measureBlobPeak(mrLastBlob, pk => { out.recPeak = pk; out.recSilent = recSilentOf(pk); cb(out); });
+    });
   };
   function settleScore(){
     if(settled || seq !== gradeSeq) return;
@@ -5474,8 +5591,10 @@ function listenGrade(target, cb, opts){
   const maxMs = opts.maxMs || (opts.word ? srTiming().wordMs : srTiming().sentMs);
   const seq = ++gradeSeq;
   let settled = false;
-  const done = out => { if(settled) return; settled = true; cb(out); };
+  let lastPeak = null;
+  const done = out => { if(settled) return; settled = true; out.recPeak = lastPeak; out.recSilent = recSilentOf(lastPeak); meterStop(); cb(out); };
   let firstUrl = null;
+  meterStart(opts.meterEl);
   const attempt = (withRec, isRetry) => {
     if(seq !== gradeSeq || settled) return;
     let capTimer = null;
@@ -5496,7 +5615,7 @@ function listenGrade(target, cb, opts){
         }
         done({ text: null, res: null, url: firstUrl, retried: isRetry, err: e2 });
       };
-      if(withRec) stopCapture(url => { if(url) firstUrl = url; proceed(); });
+      if(withRec) stopCapture(url => { if(url) firstUrl = url; measureBlobPeak(mrLastBlob, pk => { lastPeak = pk; proceed(); }); });
       else proceed();
     }, { maxMs: maxMs, onStart: () => {
       if(withRec && seq === gradeSeq && !settled)
@@ -5506,7 +5625,7 @@ function listenGrade(target, cb, opts){
   attempt(true, false);
 }
 /* 取消进行中的判分会话：序号递增让迟到的回调全部作废，再彻底释放麦克风（「聆听中再点一次＝取消」用） */
-function cancelGrade(){ gradeSeq++; gradeDoneHook = null; releaseMic(); }
+function cancelGrade(){ gradeSeq++; gradeDoneHook = null; meterStop(); releaseMic(); }
 
 
 const FREE_RULES = [
@@ -5741,11 +5860,36 @@ function prWordFirstDay(id){
   if(!r || typeof r.due !== "number") return null;
   return prDayKeyOfNum(r.due - PR_CUM[Math.min(r.stage || 0, 2)]);
 }
+/* 渲染防御：字段缺失一律降级为空串/跳过，绝不把 undefined/null 写进界面 */
+function prTxt(v){ return v === undefined || v === null ? "" : String(v); }
 function prItemWord(w, grade){
-  return '<button class="pr-item" data-prkind="word" data-prref="' + w.id + '"><span class="pr-tag w">单词</span><span class="pr-main"><b class="en">' + esc(w.v[0]) + '</b> <span class="pr-cn">' + esc(w.v[2]) + '</span></span><span class="pr-side">' + (grade === 0 ? "不认识" : grade === 1 ? "有点印象" : "重学") + '</span></button>';
+  const en = prTxt(w && w.v && w.v[0]), cn = prTxt(w && w.v && w.v[2]);
+  if(!en && !cn) return "";
+  return '<button class="pr-item" data-prkind="word" data-prref="' + esc(prTxt(w.id)) + '"><span class="pr-tag w">单词</span><span class="pr-main"><b class="en">' + esc(en) + '</b> <span class="pr-cn">' + esc(cn) + '</span></span><span class="pr-side">' + (grade === 0 ? "不认识" : grade === 1 ? "有点印象" : "重学") + '</span></button>';
 }
 function prItemLine(kind, lid, en, cn, side){
-  return '<button class="pr-item" data-prkind="' + kind + '" data-prref="' + lid + '"><span class="pr-tag ' + (kind === "corr" ? "c" : "p") + '">' + (kind === "corr" ? "错句" : "发音") + '</span><span class="pr-main"><span class="en">' + esc(en) + '</span> <span class="pr-cn">' + esc(cn || "") + '</span></span>' + (side ? '<span class="pr-side">' + esc(side) + '</span>' : "") + '</button>';
+  en = prTxt(en); cn = prTxt(cn); side = prTxt(side);
+  if(!en && !cn) return "";
+  return '<button class="pr-item" data-prkind="' + kind + '" data-prref="' + esc(prTxt(lid)) + '"><span class="pr-tag ' + (kind === "corr" ? "c" : "p") + '">' + (kind === "corr" ? "错句" : "发音") + '</span><span class="pr-main"><span class="en">' + esc(en) + '</span> <span class="pr-cn">' + esc(cn) + '</span></span>' + (side ? '<span class="pr-side">' + esc(side) + '</span>' : "") + '</button>';
+}
+/* 错句本条目的真实结构（rpAnswer 写入）：{ lesson: 课名, mine: 她说的, right: 标准句, explain: 讲解（末尾带「（翻译：…）」）, ts }，
+   没有 lid/en/cn——旧渲染按 pron 的字段读，esc(undefined) 就成了界面上的 "undefined"。
+   按真实字段渲染：标题＝right 标准句，中文＝从 explain 末尾提取的翻译；
+   条目指向的台词靠 right 原文反查 ALL_LINES（优先同课）；查不到时 ref 记 c#<序号>，点击按课名打开对话课。 */
+function prCorrLine(r){
+  if(!r || !r.right) return null;
+  let hit = null;
+  for(const x of ALL_LINES){
+    if(x.d && x.d[1] === r.right){ if(x.lesson && x.lesson.t === r.lesson) return x; if(!hit) hit = x; }
+  }
+  return hit;
+}
+function prCorrItem(r, idx){
+  const en = prTxt(r && r.right);
+  if(!en) return "";
+  const x = prCorrLine(r);
+  const m = /（翻译：([^）]*)）\s*$/.exec(prTxt(r && r.explain));
+  return prItemLine("corr", x ? x.lid : "c#" + idx, en, m ? m[1] : "", "");
 }
 function prSection(id, open, title, sub, inner, badge){
   return '<div class="xsec" data-sec="' + id + '" data-open="' + (open ? "1" : "0") + '"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">' + title + (sub ? '<small>' + sub + '</small>' : "") + '</span>' + (badge ? '<span class="xsec-count">' + badge + '</span>' : "") + '<span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">' + inner + '</div></div></div>';
@@ -5753,7 +5897,8 @@ function prSection(id, open, title, sub, inner, badge){
 function renderPastReview(){
   const host = $("#pastReview");
   if(!host) return;
-  const corrLids = new Set(state.corr.map(r => r.lid));
+  const corrLids = new Set();
+  state.corr.forEach(r => { const x = prCorrLine(r); if(x) corrLids.add(x.lid); });
   const weakWords = Object.keys(state.wordGrades)
     .filter(id => state.wordGrades[id] === 0 || state.wordGrades[id] === 1)
     .map(id => wordById(id)).filter(Boolean)
@@ -5761,12 +5906,13 @@ function renderPastReview(){
   const lowPron = Object.keys(state.pronBest)
     .filter(lid => typeof state.pronBest[lid] === "number" && state.pronBest[lid] < 70 && !corrLids.has(lid))
     .map(lid => ALL_LINES.find(x => x.lid === lid)).filter(Boolean);
-  const corrItems = state.corr.slice();
+  const corrKeyHtml = state.corr.map((r, i) => prCorrItem(r, i)).filter(Boolean);
   const byDate = {};
   const addD = (k, kind, html) => { if(!k) return; if(!byDate[k]) byDate[k] = { word: [], pron: [], corr: [] }; byDate[k][kind].push(html); };
   Object.keys(state.wordReview).forEach(id => {
     const w = wordById(id); if(!w) return;
-    addD(prWordFirstDay(id), "word", prItemWord(w, null));
+    const wh = prItemWord(w, null);
+    if(wh) addD(prWordFirstDay(id), "word", wh);
   });
   const seenP = new Set(), seenC = new Set();
   state.pron.forEach(r => {
@@ -5775,14 +5921,17 @@ function renderPastReview(){
     if(seenP.has(key)) return; seenP.add(key);
     addD(dk, "pron", prItemLine("pron", r.lid, r.en, r.cn, r.score != null ? r.score + " 分" : ""));
   });
-  state.corr.forEach(r => {
+  state.corr.forEach((r, ci) => {
     if(!r || !r.ts) return;
-    const dk = dayKey(new Date(r.ts)), key = dk + "|" + r.lid;
+    const html = prCorrItem(r, ci);
+    if(!html) return;
+    const x = prCorrLine(r);
+    const dk = dayKey(new Date(r.ts)), key = dk + "|" + (x ? x.lid : "c" + ci);
     if(seenC.has(key)) return; seenC.add(key);
-    addD(dk, "corr", prItemLine("corr", r.lid, r.en, r.cn, ""));
+    addD(dk, "corr", html);
   });
   const dates = Object.keys(byDate).sort().reverse();
-  const hasKey = weakWords.length > 0 || lowPron.length > 0 || corrItems.length > 0;
+  const hasKey = weakWords.length > 0 || lowPron.length > 0 || corrKeyHtml.length > 0;
   if(!hasKey && !dates.length){
     host.innerHTML = '<div class="xsec" data-sec="pr-empty" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">复习以前学过的</span><span class="xsec-count">暂无记录</span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner"><p class="sec-sub" style="margin:0;">学过的东西会按日期出现在这里</p></div></div></div>';
     return;
@@ -5792,8 +5941,8 @@ function renderPastReview(){
     let inner = "";
     if(weakWords.length) inner += '<div class="pr-group">单词 · 还没掌握（' + weakWords.length + ')</div>' + weakWords.map(w => prItemWord(w, state.wordGrades[w.id])).join("");
     if(lowPron.length) inner += '<div class="pr-group">跟读 · 分数偏低（' + lowPron.length + ')</div>' + lowPron.map(x => prItemLine("pron", x.lid, x.d[1], x.d[2], state.pronBest[x.lid] + " 分")).join("");
-    if(corrItems.length) inner += '<div class="pr-group">错句本（' + corrItems.length + ')</div>' + corrItems.map(r => prItemLine("corr", r.lid, r.en, r.cn, "")).join("");
-    h += prSection("pr-key", true, "重点复习", "没掌握好的都在这里，先补这些", inner, "共 " + (weakWords.length + lowPron.length + corrItems.length) + " 条");
+    if(corrKeyHtml.length) inner += '<div class="pr-group">错句本（' + corrKeyHtml.length + ')</div>' + corrKeyHtml.join("");
+    h += prSection("pr-key", true, "重点复习", "没掌握好的都在这里，先补这些", inner, "共 " + (weakWords.length + lowPron.length + corrKeyHtml.length) + " 条");
   }
   dates.forEach(dk => {
     const g = byDate[dk], parts = [];
@@ -5817,7 +5966,13 @@ document.addEventListener("click", e => {
     goVocab(w.lesson, idx);
   } else {
     const x = ALL_LINES.find(y => y.lid === ref);
-    if(x) goPron(x.lesson.id, x.i);
+    if(x){ goPron(x.lesson.id, x.i); return; }
+    if(kind === "corr"){
+      const m = /^c#(\d+)$/.exec(ref || "");
+      const r = m ? state.corr[+m[1]] : null;
+      const ls = r ? ALL_LESSONS.find(l => l.t === r.lesson) : null;
+      if(ls) goDialogue(ls.id);
+    }
   }
 });
 $("#btnCheckin").addEventListener("click", () => {
@@ -5963,12 +6118,13 @@ function startWordScore(host, v, uid){
     if(began) return; began = true;
     if(panel._wsTok !== wsTok) return;   /* 已被取消/取代：迟到的原音回调不再启动识别 */
     if(!panel.isConnected) return;
-    panel.innerHTML = '<div class="ws-state"><span class="ws-listening">🎤</span> 听着呢，照着读：<b class="en" style="font-size:19px;">' + esc(v[0]) + '</b><br><span style="font-size:13px;">读完停一下，马上出分</span></div>';
+    panel.innerHTML = '<div class="ws-state"><span class="ws-listening">🎤</span> 听着呢，照着读：<b class="en" style="font-size:19px;">' + esc(v[0]) + '</b><br><span style="font-size:13px;">读完停一下，马上出分</span></div>' + '<div class="mic-meter"></div>';
     listenGrade(v[0], out => {
       panel.dataset.wsbusy = "";
       if(!panel.isConnected) return;
       if(!out || !out.res){
-        panel.innerHTML = '<div class="ws-state">' + esc(srErrText(out && out.err)) + '</div>' +
+        const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
+        panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>' +
           '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">再试一次</button></div>';
       } else {
         const sc = out.res.score;
@@ -5977,6 +6133,7 @@ function startWordScore(host, v, uid){
           '<div class="ws-heard">你读的是：<b class="en">' + esc(out.text || "") + '</b></div>' +
           '<div class="ws-fb">' + esc(feedbackForWord(out.res, v[0])) + '</div>' +
           (out.url ? '<audio controls src="' + out.url + '"></audio>' : '') +
+          (out.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
           '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">🎤 再读一次</button>' +
           '<button class="btn ghost small" data-wsorig type="button">▶ 再听原音</button></div>';
       }
@@ -5984,7 +6141,7 @@ function startWordScore(host, v, uid){
       if(rt) rt.addEventListener("click", () => startWordScore(host, v, uid));
       const og = panel.querySelector("[data-wsorig]");
       if(og) og.addEventListener("click", () => speak(v[0], 1));
-    }, { word: true });
+    }, { word: true, meterEl: panel.querySelector(".mic-meter") });
   };
   let ok = false;
   try { ok = playRec(v[0], 1, null, begin, begin); } catch(e){ ok = false; }
@@ -6741,7 +6898,8 @@ function drawRole(zone, ls){
       (rp.mode === "voice"
         ? '<button class="btn blue" id="rpMic">点这里，开口说英文</button><span class="rec-status" id="rpRecStatus">● 正在听…慢慢说，停顿不会断</span>' +
           '<div style="margin-top:10px;"><button class="btn" id="rpDone" style="display:none;">我说完了</button></div>' +
-          '<div class="mic-note">说完点「我说完了」马上纠错；不点的话，停 4 秒也会自动出分。听不清时也可以切换到「打字」。</div>'
+          '<div class="mic-note">说完点「我说完了」马上纠错；不点的话，停 4 秒也会自动出分。听不清时也可以切换到「打字」。</div>' +
+          '<div class="mic-meter"></div>'
         : '<textarea class="say-input" id="rpInput" placeholder="把你想到的英文写在这里…"></textarea>' +
           '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn blue" id="rpSubmit">提交纠错</button>' +
           '<button class="btn ghost" id="rpSkip">这句不会，跳过</button></div>') +
@@ -6775,11 +6933,21 @@ function drawRole(zone, ls){
         st.classList.remove("on");
         micBtn.textContent = "点这里，开口说英文";
         if(!out.res){
-          toast(out.err === "unsupported" ? "这个浏览器不支持语音识别，请切换到打字模式" : srErrText(out.err));
+          if(out.recSilent && (out.err === "no-speech" || out.err === "end")){
+            const rz = zone.querySelector("#rpResult");
+            if(rz) rz.innerHTML = '<div class="card corr-card"><div class="mic-warn" style="margin-top:0;">' + MIC_HINT + '</div></div>';
+            else toast(MIC_HINT);
+          } else {
+            toast(out.err === "unsupported" ? "这个浏览器不支持语音识别，请切换到打字模式" : srErrText(out.err));
+          }
           return;
         }
         rpAnswer(zone, ls, out.text, out.url);
-      });
+        if(out.recSilent){
+          const rz2 = zone.querySelector("#rpResult");
+          if(rz2) rz2.insertAdjacentHTML("beforeend", '<div class="mic-warn">' + MIC_HINT + '</div>');
+        }
+      }, { meterEl: zone.querySelector(".mic-meter") });
     });
   } else {
     zone.querySelector("#rpSubmit").addEventListener("click", () => {
@@ -6975,6 +7143,7 @@ function pronCard(ls, i){
       '<button class="icon-btn" data-act="rec" title="录音回放对比">' + ICON_MIC + '</button>' +
       '<span class="rec-status">● 录音中…再点一次麦克风结束</span>' +
     '</div>' +
+    '<div class="mic-meter"></div>' +
     '<div class="mine-label"><span>我的录音</span><button class="btn soft small" data-act="orig">原音</button></div>' +
     '<audio class="mine-audio" controls></audio>' +
     '<div data-result></div>';
@@ -7038,7 +7207,8 @@ function pronCard(ls, i){
       checkBtn.textContent = "再练一次";
       if(out.url) showMine(out.url);
       if(!out.res){
-        result.innerHTML = '<div class="comment-line">' + esc(srErrText(out.err)) + '</div>';
+        const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
+        result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>';
         return;
       }
       const text = out.text, res = out.res;
@@ -7054,6 +7224,7 @@ function pronCard(ls, i){
         '<div class="ph-txt"><div style="font-weight:700;">发音得分 / 100</div><div style="font-size:12.5px;color:var(--ink-faint);">识别到你读的是：<span class="en">' + esc(text) + '</span></div></div></div>' +
         '<div class="corr-right en" style="margin-top:10px;">' + diffHTML(res) + '</div>' + extraHTML(res) + pointsHTML(res) +
         (!out.url ? '<div class="mic-note">这次没录上回放音频，想听自己的声音可以用🎙单独录一遍</div>' : '') +
+        (out.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
         '<div class="comment-line"><b>点评：</b>' + esc(pronComment(res, d[1])) + '</div>' +
         '<div class="mic-note">红色词上面小字是识别到的你的读法；金色虚线是漏读的词。这一句已算进今日发音进度。</div>' +
         '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn soft small" data-reread type="button">↻ 重读这句</button>' +
@@ -7064,7 +7235,7 @@ function pronCard(ls, i){
       if(pmb) pmb.addEventListener("click", () => { showMine(out.url); try { const pp3 = audio.play(); if(pp3 && pp3.catch) pp3.catch(() => {}); } catch(e){} });
       renderHUD(); saveState();
       renderPronExtras();
-    });
+    }, { meterEl: card.querySelector(".mic-meter") });
   });
   return card;
 }
