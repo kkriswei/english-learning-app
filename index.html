@@ -880,6 +880,17 @@
       .deck-bar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:10px;}
       .deck-chip{background:var(--ink);color:#f4efe1;border-radius:99px;padding:5px 13px;font-size:13px;font-weight:700;}
       .deck-chip.free{background:var(--surface-2);color:var(--ink-soft);border:1px dashed var(--gold);}
+      /* ---- 单词页：按分类浏览 ---- */
+      .cat-group{font-size:12px;font-weight:700;letter-spacing:.14em;color:var(--accent-deep);margin:16px 2px 8px;}
+      .cat-group:first-child{margin-top:2px;}
+      .cat-row{display:flex;width:100%;align-items:center;gap:10px;text-align:left;background:#fffdf7;border:1px solid #e7dfc9;border-radius:12px;padding:11px 13px;margin:6px 0;cursor:pointer;font:inherit;color:var(--ink);}
+      .cat-row:active{transform:scale(.99);}
+      .cat-row .cat-t{flex:1 1 auto;font-size:15px;min-width:0;}
+      .cat-row .cat-meta{flex:none;font-size:12.5px;color:var(--ink-soft);white-space:nowrap;}
+      .cat-row .cat-arrow{flex:none;color:var(--accent);font-size:13px;transition:transform .25s ease;}
+      .cat-row.on{border-color:var(--gold);background:var(--accent-soft);}
+      .cat-row.on .cat-arrow{transform:rotate(180deg);}
+      .cat-words{margin:2px 0 12px;}
       /* ---- 单词跟读打分 ---- */
       .wscore{margin-top:14px;border:1.5px solid #e8dcbc;background:linear-gradient(170deg,#fffdf6,var(--surface));border-radius:16px;padding:16px;text-align:center;animation:fadeUp .35s ease both;}
       .wscore .ws-big{font-family:Georgia,serif;font-size:42px;font-weight:700;line-height:1.05;}
@@ -1189,10 +1200,10 @@ figure.wfig{margin:0 0 8px;}
           </div>
         </div>
 
+        <div id="pastReview"></div>
+
         <div id="planList"></div>
         <div id="planDone"></div>
-
-        <div id="pastReview"></div>
       </section>
 
       <!-- VIEW: vocabulary -->
@@ -1201,6 +1212,9 @@ figure.wfig{margin:0 0 8px;}
         <div class="xsec" data-sec="v-today" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">今日单词<small>就是今天这一档要学的词，和「今日」页同一份清单</small></span><span class="xsec-count" id="cntVocabToday"></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
           <div id="vocabMain"></div>
           <div id="vocabTodayGroups"></div>
+        </div></div></div>
+        <div class="xsec" data-sec="v-cats" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">按分类浏览<small>主课每一课、扩展词库每一组都在这里，点开一组直接看词表</small></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
+          <div id="vocabCats"></div>
         </div></div></div>
         <div class="xsec" data-sec="v-all" data-open="0"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">全部内容 · 单词库<small>自由浏览整个词库，不打乱今日清单</small></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
           <div class="picker-row" id="vocabPicker"></div>
@@ -6277,6 +6291,7 @@ document.querySelectorAll("#tierSeg button").forEach(b => b.addEventListener("cl
 
 /* ================= 课程选择器 ================= */
 const sel = { vocab: ALL_LESSONS[0].id, grammar: ALL_LESSONS[0].id, dialogue: ALL_LESSONS[0].id, pron: ALL_LESSONS[0].id };
+let vocabCatOpen = null; /* 按分类浏览：当前就地展开的组 id（仅内存，与 sel.vocab 同步） */
 function pickerHTML(current){
   return '<select class="filter">' + STAGES.map((st, si) =>
     '<optgroup label="阶段' + "一二三四五六"[si] + " · " + esc(st.name) + '">' +
@@ -6618,8 +6633,9 @@ function renderVocab(){
     og.innerHTML = EXTRA_LESSONS.map((l, i) => '<option value="' + l.id + '"' + (l.id === sel.vocab ? " selected" : "") + '>扩 ' + (i + 1) + '. ' + esc(l.v[0][0]) + ' … ' + esc(l.v[l.v.length - 1][0]) + '</option>').join("");
     pkSel.appendChild(og);
   }
-  wirePicker(pk, "vocab", renderVocab);
+  wirePicker(pk, "vocab", () => { vocabCatOpen = sel.vocab; renderVocab(); });
   drawVocabList(LESSON_MAP[sel.vocab]);
+  drawVocabCats();
   if(!rv || !rv.pool.length || rv.idx >= rv.pool.length) rv = { pool: buildPool(), idx: 0 };
   drawReview();
   drawWbResults($("#wbSearch").value.trim());
@@ -6714,8 +6730,9 @@ function drawTodayGroups(){
     const t = $("#vocabMain"); if(t) t.scrollIntoView({ behavior: "smooth", block: "start" });
   }));
 }
-function drawVocabList(ls){
-  const host = $("#vocabList");
+function drawVocabList(ls){ drawVocabListInto($("#vocabList"), ls); }
+function drawVocabListInto(host, ls){
+  if(!host) return;
   if(!ls){ host.innerHTML = ""; return; }
   host.innerHTML =
     '<div class="deck-bar"><span class="deck-chip free">《' + esc(ls.t) + '》 · ' + ls.v.length + ' 词</span>' +
@@ -6728,6 +6745,44 @@ function drawVocabList(ls){
   const bv = host.querySelector("[data-browsevideo]");
   if(bv) bv.addEventListener("click", () => openWordVideo(ls.id));
   host.querySelectorAll("[data-browsego]").forEach(r => r.addEventListener("click", () => startLessonDeck(ls.id, +r.dataset.browsego)));
+}
+/* ================= 单词页：按分类浏览（全量索引，点开一组就地展开词表） ================= */
+function catLearned(ls){
+  let n = 0;
+  ls.v.forEach((v, i) => { if(state.wordGrades[ls.id + "-w" + i] !== undefined) n++; });
+  return n;
+}
+function catRowHTML(ls, label){
+  const on = vocabCatOpen === ls.id;
+  return '<button class="cat-row' + (on ? ' on' : '') + '" data-catgo="' + ls.id + '" type="button">' +
+    '<span class="cat-t">' + esc(label) + '</span>' +
+    '<span class="cat-meta">' + ls.v.length + ' 词 · 已学 ' + catLearned(ls) + '</span>' +
+    '<span class="cat-arrow">▾</span></button>' +
+    (on ? '<div class="cat-words" data-catwords="' + ls.id + '"></div>' : '');
+}
+function drawVocabCats(){
+  const host = $("#vocabCats");
+  if(!host) return;
+  let h = '';
+  STAGES.forEach((st, si) => {
+    h += '<div class="cat-group">阶段' + "一二三四五六"[si] + ' · ' + esc(st.name) + '</div>';
+    h += st.lessons.map((l, li) => catRowHTML(LESSON_MAP[l.id], (si * 10 + li + 1) + '. ' + l.t)).join('');
+  });
+  if(typeof EXTRA_LESSONS !== "undefined" && EXTRA_LESSONS.length){
+    h += '<div class="cat-group">扩展词库 · ' + EXTRA_WORDS.length + ' 词（从易到难，每组 8 个）</div>';
+    h += EXTRA_LESSONS.map((l, i) => catRowHTML(l, '扩 ' + (i + 1) + '. ' + l.v[0][0] + ' … ' + l.v[l.v.length - 1][0])).join('');
+  }
+  host.innerHTML = h;
+  host.querySelectorAll("[data-catgo]").forEach(b => b.addEventListener("click", () => {
+    const id = b.dataset.catgo;
+    if(vocabCatOpen === id) vocabCatOpen = null;
+    else { vocabCatOpen = id; sel.vocab = id; }
+    renderVocab();
+  }));
+  if(vocabCatOpen){
+    const box = host.querySelector('[data-catwords="' + vocabCatOpen + '"]');
+    if(box) drawVocabListInto(box, LESSON_MAP[vocabCatOpen]);
+  }
 }
 let rv = null;
 function buildPool(){
