@@ -1216,6 +1216,9 @@ figure.wfig{margin:0 0 8px;}
         <div class="xsec" data-sec="v-cats" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">按分类浏览<small>主课每一课、扩展词库每一组都在这里，点开一组直接看词表</small></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
           <div id="vocabCats"></div>
         </div></div></div>
+        <div class="xsec" data-sec="v-types" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">按类型浏览<small>动物、食物、身体、交通……按主题找词，点开一类直接看词表</small></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
+          <div id="vocabTypes"></div>
+        </div></div></div>
         <div class="xsec" data-sec="v-all" data-open="0"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">全部内容 · 单词库<small>自由浏览整个词库，不打乱今日清单</small></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
           <div class="picker-row" id="vocabPicker"></div>
           <div id="vocabList"></div>
@@ -6292,6 +6295,7 @@ document.querySelectorAll("#tierSeg button").forEach(b => b.addEventListener("cl
 /* ================= 课程选择器 ================= */
 const sel = { vocab: ALL_LESSONS[0].id, grammar: ALL_LESSONS[0].id, dialogue: ALL_LESSONS[0].id, pron: ALL_LESSONS[0].id };
 let vocabCatOpen = null; /* 按分类浏览：当前就地展开的组 id（仅内存，与 sel.vocab 同步） */
+let vocabTypeOpen = null; /* 按类型浏览：当前就地展开的类型 id（仅内存，与选课状态互不影响） */
 function pickerHTML(current){
   return '<select class="filter">' + STAGES.map((st, si) =>
     '<optgroup label="阶段' + "一二三四五六"[si] + " · " + esc(st.name) + '">' +
@@ -6636,6 +6640,7 @@ function renderVocab(){
   wirePicker(pk, "vocab", () => { vocabCatOpen = sel.vocab; renderVocab(); });
   drawVocabList(LESSON_MAP[sel.vocab]);
   drawVocabCats();
+  drawVocabTypes();
   if(!rv || !rv.pool.length || rv.idx >= rv.pool.length) rv = { pool: buildPool(), idx: 0 };
   drawReview();
   drawWbResults($("#wbSearch").value.trim());
@@ -6734,17 +6739,19 @@ function drawVocabList(ls){ drawVocabListInto($("#vocabList"), ls); }
 function drawVocabListInto(host, ls){
   if(!host) return;
   if(!ls){ host.innerHTML = ""; return; }
+  /* ls.items 存在时（按类型浏览）用条目自带的真实词 id / 归属课渲染，否则按课的 v 数组生成 */
+  const items = ls.items || ls.v.map((v, i) => ({ id: ls.id + "-w" + i, v, lid: ls.id, idx: i }));
   host.innerHTML =
-    '<div class="deck-bar"><span class="deck-chip free">《' + esc(ls.t) + '》 · ' + ls.v.length + ' 词</span>' +
-    '<button class="link-btn" data-browsedeck type="button">用卡片练这一课</button>' +
-    '<button class="link-btn" data-browsevideo type="button">▶ 这一课视频课</button></div>' +
-    ls.v.map((v, i) => planWordRow({ id: ls.id + "-w" + i, v }, ' data-browsego="' + i + '" style="cursor:pointer;"')).join("");
+    '<div class="deck-bar"><span class="deck-chip free">《' + esc(ls.t) + '》 · ' + items.length + ' 词</span>' +
+    (ls.items ? '' : '<button class="link-btn" data-browsedeck type="button">用卡片练这一课</button>' +
+    '<button class="link-btn" data-browsevideo type="button">▶ 这一课视频课</button>') + '</div>' +
+    items.map((x, i) => planWordRow(x, ' data-browsego="' + i + '" style="cursor:pointer;"')).join("");
   host.querySelectorAll("[data-wspeak]").forEach(b => b.addEventListener("click", e => { e.stopPropagation(); speak(b.dataset.wspeak, 1); }));
   const bd = host.querySelector("[data-browsedeck]");
   if(bd) bd.addEventListener("click", () => startLessonDeck(ls.id, 0));
   const bv = host.querySelector("[data-browsevideo]");
   if(bv) bv.addEventListener("click", () => openWordVideo(ls.id));
-  host.querySelectorAll("[data-browsego]").forEach(r => r.addEventListener("click", () => startLessonDeck(ls.id, +r.dataset.browsego)));
+  host.querySelectorAll("[data-browsego]").forEach(r => r.addEventListener("click", () => { const x = items[+r.dataset.browsego]; if(x) startLessonDeck(x.lid, x.idx); }));
 }
 /* ================= 单词页：按分类浏览（全量索引，点开一组就地展开词表） ================= */
 function catLearned(ls){
@@ -6782,6 +6789,53 @@ function drawVocabCats(){
   if(vocabCatOpen){
     const box = host.querySelector('[data-catwords="' + vocabCatOpen + '"]');
     if(box) drawVocabListInto(box, LESSON_MAP[vocabCatOpen]);
+  }
+}
+/* ================= 单词页：按类型浏览（主题类型索引：独立数据，不改动词条本身） =================
+   WORD_TYPE_CODES 与 ALL_WORDS 中首次出现的 8003 个不重复词（小写键、词库顺序）一一对应，
+   每字为类型序号：0-9 后接 a-k，共 21 类（见 WORD_TYPE_NAMES）。生成脚本 speedfix/classify_words.py。 */
+const WORD_TYPE_NAMES = ["动物", "食物饮料", "身体与健康", "家人与人", "衣服穿戴", "家居与日用品", "交通出行", "学校与学习", "职业与工作", "自然与天气", "植物", "颜色", "数字与时间", "运动与娱乐", "情绪与性格", "地点与场所", "科技与通讯", "钱与购物", "动作词", "描述词", "其他日常词"];
+const WORD_TYPE_CODES = "17001099kkkkk3kkcccccccc333333332222222200000111111177777777bbbbbb449999999911111111hhhhhhhh581kk2kj66666666222222255cjjkggggggggkhkkgfkdddddddd44444444ckkkedfkkdfkkjckd1kkkkcjjjejjjjjjjjjjj5555k1kggggggeeeeeeeddkkekk77777777666666699kkkk888888888888888888855558kkk2j1111111666666k83kekikkckjkgkkkjk9999999ggggggg222222777777hhhhhkkeekddddddddddd8kk8jkkkjkkjkkkkkkkkkkkkkgkikk7kkkkkkkkkkkkkkkjkkkkkkkhkkikkkijkejki55555555555555kk555k55k555555kk5kk5555kk5k55kk5kk555k55555kkk5kkkgg55kk55kk5k55kkkk444k4k44k44444k444444444k3k54444kk5k4k5kkkkkkkkk5kk5kak5552kkkkkkkk5kkkk555k55k5kkkkkkkkka9akkk13333333333333333338882888d8kk3333332222222222222222222222222222122kkk2kk2kfkk2222kkkk22kk222jkkkjkkkkkkkkkkjkkkkkkdkkj2k2k222k22k22kk2kkkk2kkkkkkk44kk4k2kk1111k1111111k110001kk1k111111111kk1kkkk1k1111111111k1k111a1ka11kkk0111kkkkkk11k1kkkkkkkkkkkkkk1kkk1kjjjjjjjj111kkh1kk11ffkk0000000000000ak1k11kkkakkkkkk999k99kk9kkkkkkk9k9fk9aaa9999990000000000000000000000000000000000kkkkkkk0j00000000000k000kk0000kkaaaaaaaaaaaaaakkk9k7jjjkkkkk9kkkkkkkkkkkkcckkkk9kkkkkkkkk66k66666kkkfk7f1ff0dfkkfffkfkkffffkkk6k6kk6kk6k6kkkk6638g56k6kjkk6kkkk6kkkkkkk3kkkkkkdkk6kg6kk9kkkkkfkkkkkkkkkkkkkkkk5kkkkkkkk5kkkkkkkkkkkkkkkkkkkfkkkkkkkkk7777k777777777k7kk777kk7777k5kkkk7kkk747kjk7888hhhkkkkkfk88888k88dkk8k8gkkkk8ddddh3khhhkhhkkkhhhhhkkkkhkhkhkhhhkkkhkkkhhkkkkkkkjj88888k88kkkkkkkk8kkcckkk8eeeejjjejeejjeejjjjjjjjjj9jjjjjjjjjjjjeeeeejjjjjjejjjekddkkkkjckkekkkkkkkkkkkkkkkkjkkeekeeeeeeekeeeejjjjejjjejjjjjjjkjjkkkkkkkkjjjjjjjjjjjkkkkkkk22kkkkkkkkkkkkkkjkekkkk4kkkkkkkkdkkkkkiikkkkkkkek7kkkkkkkkkk1dk0kk54kk65kkkkkkkkkkkkkkkkkjkkkkkkkkkkkkkkkk7kkkkkkgkkkkkkkkkgkkkkkkkkkkkkkkkkkkkkk5k2kkkkkkkkkkk8kkkkkkkkkkkkkkkkkjjjjjjjjkjjjjjjjjjjjkjjjjjjjjjjjjkjjkjjjjbbbbbbbbjjcccccccccccccccccccccccckkjccccckcccccccccccccccccccccccjjjkjkkkkkkjkjkkckjjjjjjejjjkkkjjkkkjjjjjkggkgggggkkkgkgkgkkkkkggkgggkkkggkkkkkkgkkkgkkkkkhkkkkgkkkkkk5gkkgggkjkkkkkkkkkkkkkkkkkkkkkkkkkk0kkkkkk4k9kggkgggcgjjkkgkkkkk8kkjjkkgggkkkgkkkkkkkkkkkkggggkk8gkkkkkkkkjkdkkkkkfkkkkkkfkjjkkkkkkkkkkkkkkkkk6kkkkkkkkkkkkkk7keeeeekkkkkkkcjfkjjfgjkkk63kkk8kkkkdkkkkkkkkkkkkkkkkkkhkkddkkhdddkkkkkkkdkddkkkkkkkkkkkkkkkkkkkkkd6kdkkkkkkkkjjkkkkikkkkjkkjkkkkkkkkkkkkkkjkjkkjkkjjkkjjekjk8kkkkjkkkikkk7kkkkkkejjkjkkkkjkkkkkkkjkjkk3kkkkkkkkkkkkkjkikkkjkkkkkkkikkjjkkikkkhjkkkjkkfjjkjgkjkekkjhkkkkkkjkkk27kkkk8kkjkijjkjkkkkjjkjkkkkkkkkkkkkk5kkk5akkkkkkkkkkk1kkdk44k4kk4kkkkkkkkkkkk4kkk5kkkkk5kkkkkkk4kkkkkk447kkkkkkkk7kkdkkkk7kkkkkkkkkkkkkkkkkkkkkkjkkj8kkk8kkkkkkkkddkkkkk0dkddkkkkkkkkkdkd2dkkdkk4dkk2kkkkdkkkkkdkdkkkdkkdkdkkk8kkkkkkkkddkkkkkkkkkkkkkkkdkkkk8kk444kkkkkkkkkkkkkkkkkkkkkddddkkdkkkkkkkkkkkdkkkkkkkkkkkkjjkckkkkkkkkccd2kkk8kkkc6877kkkkkkkk8kkkkkkkkkkkkkkkk888k8k8kkkhkkkkhkkkkkkkh77kk1f5kkkkhhkgkhhhhkkkkkkkkkk00kkkkk0kkkkkk00kkkkkkkkkgkkkkk7kkkkkkkkikkkk1kkkkkkkkkkkkikkkkkkkkkkkkdkkkkk11kkkkkk1a11kkjkjjjjjjjjkkkkkkkk2k2222jjjkkkkkkkkkkkkkkkkkkkk9k9kkkkkjkkkkkkkdjkkkkkkjkkjkkkkkkkk8kjkkkkckkkkkjjjkgkijijjjiiijiiiijjiiejiikhijjkikijjdjiei3kijijik8ijijiiiijkiiiikiiiieiiiikiikjkjije3kjjjkikk20kijjiiikijiiijkijkjjikkikkiiikkikkki98dkkkkkk5ikkkkgikiiijkkkgji9jkiijikijkkkjikiikjkkkkkkjkkkkjjkkkjiijkikiijikkkjiijikjiijiiiikjkjjjiiiikkjijkjijiikkkkikikkk8jkkk5gikk1jk0jkkikjjkkjkkjjkiikijikijkkijkijigijkkiijjkikikkkjkkkiieikjikjk2iijiikkiikiij1kjiikikikikiikkkkii2kkkiii922iiekkikii2j5ikiiijjiiiijkjkiikjjkkikkkjkkiiik1jjijck5jk1ehiikkjkkkiijkjjj33ijkjijjekiiiekkkiikiikjikjiikijhii8ddkjjjkikgjciikiiikkjikji7iiikkieeiijijjiijikikk7kiiiikiiikikjkjjijkjjjkfg8jkjkjkijkijkkkjjjgk8jjjkjckjj8j2jkkkiik1kik1kjiiikikjjiik3j1j2iiijijkkjhkkijk87jkkikjkkkjkkekiikjkajk5jkikkikk4kiikkkjjijkkjjjji5iii9kkjikbkjiikj7kjkikikkjkeejiiki3kjkk9ikikikkikkkkjkiikkijefkijjkijkkkiikkkkkkkkkja3jiiijkikj7jjkjjekiejkkkei5jij3jee1ikkkkkkkjjjkjjij2ikikjkijkk2jjkiikiikkkkjjjjjjkkjjjjjjj32ijjki0ijjki2kkkjjkkk0ijkiiikjjk7kikkjik7kjijkiijji2ijiikijjiijkikbf2k6k28ekj9j1ijk2ikkkkji7kkikijjkjjkjijkkk8jkiikjkjkkikjkjikkikk5kjakjikijkkjjkiij2jikkifikk1kkjkkk2dkk912ikkgekjkjkkkikjh0iijkkiakk9j7jkjj3jkkd3k7jjk9kikkjgkkjkgjckjkkj8kjjikekgkkkjfkkkkjijjhiikkkijjjkjkjeekikkkikkijik8jjijkkkkjkkjkjjkk0j6dikkk6ikdkjkjiiijjkkjjikkjjkjjkkjkbjjjkijik3kjk2gjjjkjgkkkjkk8ikk1kkjkjjkjkkakjjkikkjkijkikikkjkjikjkkkijjjkj1ji2jjj2kkkijkjjjkkjiikkjjkkjkjjikejjjjjjj9ijjijiiijikiiijiikk0kkijkkiig2d2kiki08kkkj2kkkikkkkjj3kkjjkikkkki0khk8jikiikkkdddjkijjjkkijekkfkkk2kkkkiikkikkkkkkkkijakkjj8kiijkkiikkiikkkjjijjk87k7kik0djdkkfkk1ikikkjikkkij0kkjjj8k0ikikikjjkkkikjkekjkkjkjjjkkkkjijkjiiijk0ikjjjjkkkkkkjikgikikkkjjikjieijikkikkikikhkjjiikkkjiikjjkfkkjkkiiijk7k0ijjikjikk0kikjikjkk1ikkijikidjdkkkjkkjgkkkjkkki0kjkkkjjjkk0hkjeikkkjkjjijkikijkikkkiikjkkkjjikikii2d8kihjkikiikiij1kkkiiikkkfkjkkikke3kk3jkjkkkkikjiikkijj2ikkiijjkiiijjkjkkkiikik0kki7kiikkiji55ikjikjkkdjjjjjkjkijkkk8ikiki77kikjjik0i2kikjkjkkiijkkk9kiiiikkjjk0kkkjiikjjhi7kkkjkjikjddkfifijjiijiekee0ijiadkkk8kikkjjjkkkj0keeeikkjhhikkikjjeejijkkkk7jigik0kiiiikiikikkik29j7jkjkijikiijkhkkkkkkkekejijkkekkk18k9ikkkjjkjkjkikijiiij8kii2ikkjjkikkijkkkiijkai562kkkkikkjkjjkjjkijjkkjjjikkkiik2jjijiji2fjiiiikkkkjkjjjjjkii4kiekikiikjiiijikkkjkji0ikiii4iiiiki0ikk9kjijjdjji45ij9jjjkeekkikkieikikjk01kkkjkciiij8kijkjkik4jkkikjkkhkii2kejikijiijk1ijjddfkkiiigiiiidiii0ikjiij5kkiikikkkkkkkji11fkjjgiji6h6ikk1ikikieiiik9kkkiieekjjijaigiijejikjkikikijjij8ekjjiijkjjkj4jk8ijji8kkjjjijjkjkjjijieikjkjkikikkkjjkjkkikkikkjijijhjjii22kikeeiij9kkkjiikkjiji0iijikkijjdd4ijikk7jikjikk2iikjkjhkkikkkiikkkkkjiib6jikekhjj1kh7kejkjjkgjikj3k2g5ikejkjikjkjckikk5kkjjeejkeikk7kgkijjkkkikfjkjkkkkjj22kjk7kki2kkkkj1cckjjjkkjejkkkijjkkjeejijikkkikkijkkkk0kijjkjijikikjcjcj2kkkjkjjkjdjjjjjjjjjjjjjjijjikjjjjikjjjkhkkikkjkj5jjkjai2k0kkkjiikg8k5jjkkkjijkj22jkkkjijjkj0kkjkj8ii6ikkijkjkkk6i1111k11k11111kkikijkjk1jik111kkkikjkkk2kkjkjkk2kjjkkk22ikkkk2k2kk3kkikkkkkk22kjkkkkjejjejjjjeejejejjjjjjjhjjeeejeejjjejejjjjjejjjejjejjjjjkkkkakkk9jkakjk9kkkkkkkka0akakjkkk5ijjig9kaakkkijk55kkkkkkkk0kk51kkkkjikki8k6k66k6kk5kkkdd66626f86kjikk7k8kjkkkkk8kkkkjkkk8kkkikkk77kk7kk0kk00000000000000k000k00k0kk00k00k00k0k00k00k0k0000kk00k00k000kk00kk0k0kk00kkk0000kk00k00kakk11aaa9aa1akakakkaakkk1j11k1k1kkkakk1k1k1kijijiiiiiiikiiiijjkikjiiikkjiikiikjiijjjhjkjikijkj3kjjejkjikjjk3jkdkjiik9jkij9iiiiikgkjkfkkjfek33j86idkgkkkd5jk2jjkikkkhkkkfjkjkk7ijk3jgik3ji2jjjikjijjkkjcijk3jik0kjkjkkkkkkkkkkkk3kikfjkj7jkejkjjhjki3jjjj2kkfjkj9j5ik8jjjkjjijikkjkkjk1kkkjkk3jjjjjj6kjk9jjkk7kjkjikkkkkkk5jj3kjjekjjkjjjjkkkkkiekkkk2j62kikkjkjkkkkjkkj6kjkjj52kjikdkkkkkkkjkj2jkkkkk6j5jjkkjjjkihjjkjjjjjekjkjkjkegek7g7jjjjkkjkjkkj4jjj2jkj4jjjjkji2jkkjik3jf6iiiiiiiiikiiiiiiikkkkkekkkkkkeejkkkeeekkkkkkekeeikkkkkjkikgkkkkkk99kkkkkkkkikikkkkkk8kkjhiiiiiiiiiiiiiiiiiiiiiigiiieii7iii2iiiiiiiiiiiiiiiiiiiidiii2idiiiiii7iiiiidiiii12iiiiiiiiieieiiiiiiiiiiiii2iii7iiiiiiiieiiiiiihiiiiii2iiiiiiggiiiiii7hiihiiiiiiiiiii1iiiiiiiiiiiiiiiiiiiiiiiiiiiiieiiiiiiiiiiiiiiiiiikjdjkjj1jj1jjkdjjj8kjkgkijjkkjkkjkjjdjdkhjkkjihikjiiiiiii2iiiiiiii2iiiiiiiiiiiiiieiiigi4iii1iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiedikjgggkkkkkkggjikki55kkikkkkkk515j6kicdkjikkj8kiik4jjjjcikkjkijkjkkj5jekejkjjfj7jijkj7i5j3jkkkjjekjaj4jjjkkjkkjkjik8kj2jkikji2kk1kk2kejikijjjiiekkkjik5kkkji31jjkikk3ckk1kjkkekjkijjjkkjjij6kdkkkkkijki2ki0jkkkikkdkjkkjkjj2kdi8kii8j2kkkjifjkjkjkkjjjkkck8kkjkgkkkjked8kkk2kkkkkfkjjiijkjkjkcikkjkkikkkkkki1ji7akijikj91jekjjka6ikkkkjjkkjiiiijjkgjk8hjkkjikjikikkjkjkk0kekkkkjikjjkjjkkk1kjkkkkajkijkkek8kkjk1kjjkjkjkjj5kjkjkkkjjj1jikakkkjkj5j2kjj7ikjkkkkk3kkjjjcfk5ik1gkijkjdkjj4kkkkkjjkhdjjjkkkk11kkikj0kikjkjjjjfhjkkjkjjkkkkjkikkkkkkdkikhekkjjikkdkkjjkjekjkiiikkjdkjkjkkij0kkkkkkkjjkjjjij6kike8kjjkgjkkkkdk2kjji50keikd4jkkkijkikkkkkki0ki6kkkjjkekjkk5g6kkjk8k0jkjikjjkk0jkjkjjkikjjkkkijikkijbjkkjkkjkdhkkjekjkkkjkjjkjjikkkjkjkkijjjjkkkjdjkkkkkkkjkjjjkkkjjjiikkjkjjkkijkkkkkjkijkkk9kikkik9jijkije2kjijkkikkbieik5jkkjkjkjjkkkkkkkkkjjjkjjijkiikikkkkj3kj2kikkjkijdjjikkkjijkk2k1kkikkikjjjjkjkikjkkikjjijkjkjjjkikjkkikjhkjkjkjkkgjikijkkkkkkkkj7kkkikiji2kjikdjijkkjj6kkkkjjkjjkji5dkkikjkk1kkkkk4kkkkkkkgkkkkkkkkkkkkkkkkkk8kkkkk1kkdkkkkkk66kkkkkkkkkkk5kkkkkkkk";
+let _typeGroups = null;
+function typeGroups(){
+  if(_typeGroups) return _typeGroups;
+  const seen = {}, uniq = [];
+  ALL_WORDS.forEach(w => { const k = w.v[0].toLowerCase(); if(!seen[k]){ seen[k] = 1; uniq.push(w); } });
+  const groups = WORD_TYPE_NAMES.map((n, i) => ({ id: "type" + i, t: n, items: [] }));
+  uniq.forEach((w, i) => {
+    const ti = "0123456789abcdefghijk".indexOf(WORD_TYPE_CODES[i]);
+    if(ti < 0) return;
+    groups[ti].items.push({ id: w.id, v: w.v, lid: w.lesson.id, idx: parseInt(w.id.slice(w.lesson.id.length + 2), 10) });
+  });
+  _typeGroups = groups;
+  return groups;
+}
+function typeLearned(gr){
+  let n = 0;
+  gr.items.forEach(x => { if(state.wordGrades[x.id] !== undefined) n++; });
+  return n;
+}
+function drawVocabTypes(){
+  const host = $("#vocabTypes");
+  if(!host) return;
+  const groups = typeGroups();
+  host.innerHTML = groups.map(gr => {
+    const on = vocabTypeOpen === gr.id;
+    return '<button class="cat-row' + (on ? ' on' : '') + '" data-typego="' + gr.id + '" type="button">' +
+      '<span class="cat-t">' + esc(gr.t) + '</span>' +
+      '<span class="cat-meta">' + gr.items.length + ' 词 · 已学 ' + typeLearned(gr) + '</span>' +
+      '<span class="cat-arrow">▾</span></button>' +
+      (on ? '<div class="cat-words" data-typewords="' + gr.id + '"></div>' : '');
+  }).join('');
+  host.querySelectorAll("[data-typego]").forEach(b => b.addEventListener("click", () => {
+    const id = b.dataset.typego;
+    vocabTypeOpen = (vocabTypeOpen === id) ? null : id;
+    drawVocabTypes();
+  }));
+  if(vocabTypeOpen){
+    const gr = groups.find(x => x.id === vocabTypeOpen);
+    const box = host.querySelector('[data-typewords="' + vocabTypeOpen + '"]');
+    if(box && gr) drawVocabListInto(box, gr);
   }
 }
 let rv = null;
