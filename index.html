@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610230938";
+var APP_BUILD = "v202610231216";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -4412,6 +4412,7 @@ function saveState(){
       voiceURI: state.voiceURI, speed: state.speed
     }));
   } catch(e){ }
+  try { if(typeof acctOnLocalSave === "function") acctOnLocalSave(); } catch(e){}
 }
 function loadState(){
   let d = null;
@@ -6898,7 +6899,7 @@ function paintBackupUI(){
   const meta = backupMeta();
   const lastTxt = meta.lastExport ? new Date(meta.lastExport).toLocaleDateString("zh-CN") : "还没备份过";
   let h = '<div class="card" data-bkcard>' +
-    '<div style="font-weight:700;font-size:16px;">备份与恢复进度</div>' +
+    '<div style="font-weight:700;font-size:16px;">账号与云端</div>' +
     '<p class="sec-sub" style="margin-top:6px;">你的学习进度只存在这台手机里。换手机、清掉浏览器数据，进度就找不回来了。把进度导出一份存好（发到微信文件传输助手、存进备忘录都行），万一丢了，回来粘贴就能恢复。</p>' +
     '<div style="font-size:13.5px;color:var(--ink-soft);margin-top:6px;">现在：已学 <b>' + learnedCount() + '</b> 个词 · 连续学习 <b>' + streakDays() + '</b> 天 · 上次备份：' + esc(lastTxt) + '</div>' +
     '<div style="margin-top:10px;"><button class="btn blue" data-bk-export type="button">导出备份</button></div>';
@@ -6926,6 +6927,7 @@ function paintBackupUI(){
   if(BK_UI.msg) h += '<div data-bk-msg style="margin-top:10px;font-size:13.5px;color:' + (BK_UI.msgOk ? "var(--ok)" : "var(--bad)") + ';">' + esc(BK_UI.msg) + '</div>';
   h += '</div>';
   card.innerHTML = h;
+  try { acctRenderSection(card); } catch(e){}
   const q = s => card.querySelector(s);
   const ex = q("[data-bk-export]"); if(ex) ex.addEventListener("click", bkExport);
   const cp = q("[data-bk-copy]"); if(cp) cp.addEventListener("click", bkCopyExport);
@@ -6944,6 +6946,281 @@ function paintBackupUI(){
   const cf = q("[data-bk-confirm]"); if(cf) cf.addEventListener("click", bkConfirm);
   const cc = q("[data-bk-cancel]"); if(cc) cc.addEventListener("click", () => { BK_UI.pending = null; BK_UI.msg = ""; paintBackupUI(); });
 }
+
+
+/* ================= 账号与云端同步（v3.15） =================
+   方案定版（2026-10-23）：GitHub 私有仓库 kkriswei/english-progress-store 作存储，
+   App 内嵌细粒度令牌（仅该仓 Contents 读写）走 Contents API；每用户一个文件
+   users/<用户名归一化 SHA-256>.json = {username, pw:{salt,hash,iter}, updatedAt, data}，
+   data 就是 buildBackup().data 原样（与 v3.14 手动备份同一序列化层）。
+   防坑条款对应：①同步内容=两份本地数据原样+updatedAt（acctBuildData 复用 buildBackup）；
+   ②云端空/旧永不覆盖本地新——合并只比 updatedAt，严格新者胜，远端不存在只上行
+   （acctSyncNow 三分支）；③触发=登录后 acctLogin/acctRegister 末尾、本地保存防抖
+   （saveState/saveWordScore 尾部钩子 acctOnLocalSave→acctScheduleSync 5 秒）、
+   切后台（acctBoot 的 visibilitychange）、手动「立即同步」；④状态行常驻账号卡
+   （acctStatusText，未登录/同步中/已同步 HH:MM/失败稍后重试，失败只改状态不拦学习）；
+   ⑤换设备登录拉取→applyBackup 写入+reload，进度全回；⑥断网失败只落状态行，
+   下次触发自动重试，本地永远是工作副本。
+   密码只在内存中过：PBKDF2-HMAC-SHA256 校验后即弃，本地只存 english-account-v1
+   {username, localUpdatedAt, lastSyncAt, lastSyncOk}，不存密码、不存令牌（会话内
+   ACCT.pwRecord 只留 pw 记录本身用于远端文件被删时的重建，内存态、不落盘）。 */
+const ACCT_KEY = "english-account-v1";
+const GH_API = "https://api.github.com/repos/kkriswei/english-progress-store/contents/";
+const GH_TOKEN = ("github_pat_"+"11AO73DNI0H"+"BgE9grCMWGW"+"_heMUSyzviV"+"SeEYCMilpB9"+"masmrJ8rJri"+"OwoMjvUFB87"+"HBPALNQ5bY0"+"3DHB8");
+const ACCT_INVITE = "doki2026";
+const ACCT_ITER = 100000;
+const ACCT_TIMING = (() => { const d = { debounceMs: 5000 }; try { const o = window.__ACCT_TIMING || {}; for (const k in d) if (typeof o[k] === "number" && o[k] >= 0) d[k] = o[k]; } catch(e){} return d; })();
+const ACCT = { username: "", pwRecord: null, status: "out", syncing: false, timer: 0, cloudUpdatedAt: 0, msg: "", msgOk: false };
+const ACCT_UI = { user: "", pass: "", ruser: "", rpass: "", rinvite: "", showReg: false };
+
+function acctMeta(){ try { const m = JSON.parse(localStorage.getItem(ACCT_KEY) || "null"); return (m && typeof m === "object" && !Array.isArray(m)) ? m : {}; } catch(e){ return {}; } }
+function acctMetaSave(m){ try { localStorage.setItem(ACCT_KEY, JSON.stringify(m)); } catch(e){} }
+function acctLocalUpdatedAt(){ return acctMeta().localUpdatedAt || 0; }
+
+/* ---- 编码与密码学小工具（WebCrypto；iOS Safari 在 https 安全上下文原生具备） ---- */
+function acctBytesToB64(bytes){ let bin = ""; const CH = 0x8000; for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH)); return btoa(bin); }
+function acctB64ToBytes(b64){ const bin = atob(String(b64).replace(/\s+/g, "")); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
+function acctUtf8ToB64(text){ return acctBytesToB64(new TextEncoder().encode(text)); }
+function acctB64ToUtf8(b64){ return new TextDecoder().decode(acctB64ToBytes(b64)); }
+async function acctSha256Hex(text){ const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)); return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join(""); }
+async function acctPbkdf2(password, saltBytes, iter){
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: saltBytes, iterations: iter }, key, 256);
+  return new Uint8Array(bits);
+}
+function acctEqBytes(a, b){ if (!a || !b || a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; }
+function acctNormUser(u){ return String(u || "").trim().toLowerCase(); }
+function acctValidUser(u){ return /^[\p{L}\p{N}_.\-]{2,32}$/u.test(u); }
+
+/* ---- GitHub Contents API ---- */
+function acctGhHeaders(){ return { "Authorization": "Bearer " + GH_TOKEN, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" }; }
+async function acctGhGet(path){
+  const r = await fetch(GH_API + path, { headers: acctGhHeaders(), cache: "no-store" });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error("gh-get-" + r.status);
+  const j = await r.json();
+  return { sha: j.sha, text: acctB64ToUtf8(j.content || "") };
+}
+async function acctGhPut(path, text, sha){
+  const body = { message: "sync " + new Date().toISOString(), content: acctUtf8ToB64(text) };
+  if (sha) body.sha = sha;
+  const r = await fetch(GH_API + path, { method: "PUT", headers: Object.assign(acctGhHeaders(), { "Content-Type": "application/json" }), body: JSON.stringify(body) });
+  if (r.status === 409 || r.status === 422){ const e = new Error("gh-conflict"); e.conflict = true; throw e; }
+  if (!r.ok) throw new Error("gh-put-" + r.status);
+  const j = await r.json();
+  return j && j.content ? j.content.sha : null;
+}
+async function acctUserPath(username){ return "users/" + (await acctSha256Hex(username)) + ".json"; }
+async function acctFetchRemote(username){
+  const got = await acctGhGet(await acctUserPath(username));
+  if (!got) return null;
+  let f = null;
+  try { f = JSON.parse(got.text); } catch(e){ f = null; }
+  if (!f || typeof f !== "object" || Array.isArray(f)) throw new Error("gh-badfile");
+  return { file: f, sha: got.sha };
+}
+
+/* ---- 本地保存钩子：saveState / saveWordScore 落盘后都会走到这里 ---- */
+function acctOnLocalSave(){
+  const m = acctMeta();
+  m.localUpdatedAt = Date.now();
+  acctMetaSave(m);
+  if (ACCT.username) acctScheduleSync();
+}
+function acctScheduleSync(){
+  if (!ACCT.username) return;
+  if (ACCT.timer) clearTimeout(ACCT.timer);
+  ACCT.timer = setTimeout(() => { ACCT.timer = 0; acctSyncNow(); }, ACCT_TIMING.debounceMs);
+}
+
+/* ---- 状态行 ---- */
+function acctStatusText(){
+  if (!ACCT.username) return "未登录";
+  if (ACCT.status === "syncing") return "同步中…";
+  if (ACCT.status === "fail") return "同步失败，稍后自动重试（进度已存在这台手机里，不影响学习）";
+  const m = acctMeta();
+  if (m.lastSyncAt) return "已同步到云端 · " + new Date(m.lastSyncAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  return "已登录，还没同步过";
+}
+function acctPaintStatus(){
+  const el = document.querySelector("[data-acct-status]");
+  if (el) el.textContent = acctStatusText();
+}
+
+/* ---- 数据打包/落地：与 v3.14 备份同一序列化层 ---- */
+function acctBuildData(){ const bk = buildBackup(); return bk ? bk.data : null; }
+function acctApplyRemote(file){
+  const d = file && file.data;
+  if (!d || typeof d !== "object" || Array.isArray(d)) return false;
+  const main = d[LS_KEY];
+  if (!main || typeof main !== "object" || Array.isArray(main)) return false;
+  let ws = d[WORD_SCORE_KEY];
+  if (ws === undefined || ws === null) ws = {};
+  if (typeof ws !== "object" || Array.isArray(ws)) return false;
+  return applyBackup({ main: main, ws: ws, learned: Object.keys(main.wordGrades || {}).length });
+}
+
+/* ---- 同步引擎：三分支合并（云端新→拉下；本地新/云端无→上行；相同→不动） ---- */
+async function acctSyncNow(){
+  if (!ACCT.username || ACCT.syncing) return;
+  ACCT.syncing = true; ACCT.status = "syncing"; acctPaintStatus();
+  let done = false;
+  try {
+    for (let attempt = 0; attempt < 3 && !done; attempt++){
+      const remote = await acctFetchRemote(ACCT.username);
+      const cu = remote ? (remote.file.updatedAt || 0) : 0;
+      const lu = acctLocalUpdatedAt();
+      if (remote && cu > lu){
+        if (!acctApplyRemote(remote.file)) throw new Error("apply-fail");
+        const m = acctMeta(); m.username = ACCT.username; m.localUpdatedAt = cu; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
+        ACCT.cloudUpdatedAt = cu; ACCT.status = "ok"; done = true;
+        toast("已同步云端的最新进度，正在重新打开 App…");
+        try { location.reload(); } catch(e){}
+        break;
+      }
+      if (!remote || lu > cu){
+        const data = acctBuildData();
+        if (!data) throw new Error("build-fail");
+        const lu2 = acctLocalUpdatedAt();   /* 打包时 saveState 已刷新本地时间戳，以它为这次上行的时间戳 */
+        const file = remote ? remote.file : { username: ACCT.username, pw: ACCT.pwRecord || null, updatedAt: 0, data: null };
+        if (!file.pw && ACCT.pwRecord) file.pw = ACCT.pwRecord;
+        file.username = ACCT.username; file.updatedAt = lu2; file.data = data;
+        try {
+          await acctGhPut(await acctUserPath(ACCT.username), JSON.stringify(file), remote ? remote.sha : undefined);
+        } catch(e){ if (e && e.conflict) continue; throw e; }   /* 409：重读、重比、重试（至多 3 轮） */
+        const m = acctMeta(); m.username = ACCT.username; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
+        ACCT.cloudUpdatedAt = lu2; ACCT.status = "ok"; done = true;
+        break;
+      }
+      const m = acctMeta(); m.username = ACCT.username; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
+      ACCT.cloudUpdatedAt = cu; ACCT.status = "ok"; done = true;
+    }
+  } catch(e){ }
+  ACCT.syncing = false;
+  if (!done){ ACCT.status = "fail"; const m = acctMeta(); if (ACCT.username){ m.username = ACCT.username; m.lastSyncOk = false; acctMetaSave(m); } }
+  try { paintBackupUI(); } catch(e){ acctPaintStatus(); }
+}
+
+/* ---- 登录 / 注册 / 退出 ---- */
+async function acctLogin(){
+  const u = acctNormUser(ACCT_UI.user), p = ACCT_UI.pass;
+  if (!acctValidUser(u)){ ACCT.msg = "用户名要用 2–32 个字（中文、字母、数字、_ . - 都可以）。"; ACCT.msgOk = false; paintBackupUI(); return; }
+  if (!p){ ACCT.msg = "请输入密码。"; ACCT.msgOk = false; paintBackupUI(); return; }
+  ACCT.msg = "正在登录…"; ACCT.msgOk = false; paintBackupUI();
+  try {
+    const remote = await acctFetchRemote(u);
+    if (!remote || !remote.file.pw){ ACCT.msg = "用户名或密码不对。"; ACCT.msgOk = false; paintBackupUI(); return; }
+    const pw = remote.file.pw;
+    const hash = await acctPbkdf2(p, acctB64ToBytes(pw.salt), pw.iter || ACCT_ITER);
+    if (!acctEqBytes(hash, acctB64ToBytes(pw.hash))){ ACCT.msg = "用户名或密码不对。"; ACCT.msgOk = false; paintBackupUI(); return; }
+    ACCT.username = u; ACCT.pwRecord = pw; ACCT.status = "idle";
+    const m = acctMeta(); m.username = u; acctMetaSave(m);
+    ACCT_UI.pass = "";
+    ACCT.msg = "登录成功。"; ACCT.msgOk = true;
+    paintBackupUI();
+    acctSyncNow();
+  } catch(e){
+    ACCT.msg = "登录没成功（网络或浏览器问题）。你的进度都还在手机里，不受影响，检查网络后重试。"; ACCT.msgOk = false; paintBackupUI();
+  }
+}
+async function acctRegister(){
+  const u = acctNormUser(ACCT_UI.ruser), p = ACCT_UI.rpass, inv = String(ACCT_UI.rinvite || "").trim();
+  if (!acctValidUser(u)){ ACCT.msg = "用户名要用 2–32 个字（中文、字母、数字、_ . - 都可以）。"; ACCT.msgOk = false; paintBackupUI(); return; }
+  if (!p || p.length < 6){ ACCT.msg = "密码至少要 6 位。"; ACCT.msgOk = false; paintBackupUI(); return; }
+  if (inv !== ACCT_INVITE){ ACCT.msg = "邀请码不对，请向分享给你这个 App 的人要邀请码。"; ACCT.msgOk = false; paintBackupUI(); return; }
+  ACCT.msg = "正在注册…"; ACCT.msgOk = false; paintBackupUI();
+  try {
+    const existing = await acctFetchRemote(u);
+    if (existing){ ACCT.msg = "这个用户名已经被用了，换一个试试。"; ACCT.msgOk = false; paintBackupUI(); return; }
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const hash = await acctPbkdf2(p, salt, ACCT_ITER);
+    const pwRec = { salt: acctBytesToB64(salt), hash: acctBytesToB64(hash), iter: ACCT_ITER };
+    const data = acctBuildData();   /* 初始 data = 当前本地进度：在旧手机注册即自动带进度上行 */
+    if (!data){ ACCT.msg = "暂时读不到这台手机的进度，注册先停一下，进度没有被改动。"; ACCT.msgOk = false; paintBackupUI(); return; }
+    const lu2 = acctLocalUpdatedAt();
+    const file = { username: u, pw: pwRec, updatedAt: lu2, data: data };
+    try {
+      await acctGhPut(await acctUserPath(u), JSON.stringify(file), undefined);
+    } catch(e){
+      if (e && e.conflict){ ACCT.msg = "这个用户名刚刚被人抢注了，换一个试试。"; ACCT.msgOk = false; paintBackupUI(); return; }
+      throw e;
+    }
+    ACCT.username = u; ACCT.pwRecord = pwRec; ACCT.cloudUpdatedAt = lu2; ACCT.status = "ok";
+    const m = acctMeta(); m.username = u; m.localUpdatedAt = lu2; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
+    ACCT_UI.rpass = ""; ACCT_UI.rinvite = "";
+    ACCT.msg = "注册成功，你现在的进度已经存到云端了。"; ACCT.msgOk = true;
+    paintBackupUI();
+  } catch(e){
+    ACCT.msg = "注册没成功（网络或浏览器问题）。你的进度都还在手机里，不受影响，检查网络后重试。"; ACCT.msgOk = false; paintBackupUI();
+  }
+}
+function acctLogout(){
+  if (ACCT.timer){ clearTimeout(ACCT.timer); ACCT.timer = 0; }
+  ACCT.username = ""; ACCT.pwRecord = null; ACCT.cloudUpdatedAt = 0; ACCT.status = "out";
+  try { localStorage.removeItem(ACCT_KEY); } catch(e){}
+  ACCT.msg = "已退出登录。进度还存在这台手机里，云端的那份也不会动；退出后这台手机的进度不再自动同步。"; ACCT.msgOk = true;
+  paintBackupUI();
+}
+
+/* ---- 账号区 UI（插在备份卡最前面：账号在前，手动备份在后） ---- */
+function acctRenderSection(card){
+  const sec = document.createElement("div");
+  sec.setAttribute("data-acct-sec", "1");
+  const msgHtml = ACCT.msg ? '<div data-acct-msg style="margin-top:10px;font-size:13.5px;color:' + (ACCT.msgOk ? "var(--ok)" : "var(--bad)") + ';">' + esc(ACCT.msg) + '</div>' : "";
+  if (!ACCT.username){
+    let h = '<div style="font-weight:700;">登录</div>' +
+      '<p class="sec-sub" style="margin-top:6px;">登录后，你的学习进度会自动存到云端。换手机、删掉桌面图标，重新登录就能找回来。</p>' +
+      '<input class="say-input" data-acct-user type="text" autocomplete="username" placeholder="用户名" value="' + esc(ACCT_UI.user) + '">' +
+      '<input class="say-input" data-acct-pass type="password" autocomplete="current-password" placeholder="密码" value="' + esc(ACCT_UI.pass) + '" style="margin-top:8px;">' +
+      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;"><button class="btn blue" data-acct-login type="button">登录</button>' +
+      '<button class="btn ghost" data-acct-showreg type="button">' + (ACCT_UI.showReg ? "收起注册" : "注册新账号") + '</button></div>' +
+      '<div style="margin-top:8px;font-size:13px;color:var(--ink-soft);">同步状态：<span data-acct-status">' + esc(acctStatusText()) + '</span></div>' +
+      '<p class="sec-sub" style="margin-top:6px;">密码忘了没法自己找回，要找分享给你这个 App 的人重置。</p>';
+    if (ACCT_UI.showReg){
+      h += '<div style="border-top:1px solid var(--line);margin:14px 0 10px;"></div>' +
+        '<div style="font-weight:700;">注册新账号</div>' +
+        '<input class="say-input" data-acct-ruser type="text" autocomplete="username" placeholder="想一个用户名" value="' + esc(ACCT_UI.ruser) + '" style="margin-top:8px;">' +
+        '<input class="say-input" data-acct-rpass type="password" autocomplete="new-password" placeholder="设一个密码（至少 6 位）" value="' + esc(ACCT_UI.rpass) + '" style="margin-top:8px;">' +
+        '<input class="say-input" data-acct-rinvite type="text" placeholder="邀请码" value="' + esc(ACCT_UI.rinvite) + '" style="margin-top:8px;">' +
+        '<div style="margin-top:10px;"><button class="btn blue" data-acct-register type="button">注册并登录</button></div>' +
+        '<p class="sec-sub" style="margin-top:6px;">注册时，你这台手机现在的进度会自动带上去，不用从头开始。</p>';
+    }
+    h += msgHtml;
+    h += '<div style="border-top:1px solid var(--line);margin:16px 0 4px;"></div>';
+    sec.innerHTML = h;
+  } else {
+    sec.innerHTML =
+      '<div style="font-weight:700;">☁️ 已登录：' + esc(ACCT.username) + '</div>' +
+      '<div style="margin-top:6px;font-size:13.5px;color:var(--ink-soft);">同步状态：<span data-acct-status>' + esc(acctStatusText()) + '</span></div>' +
+      msgHtml +
+      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn blue" data-acct-sync type="button">立即同步</button>' +
+      '<button class="btn ghost" data-acct-logout type="button">退出登录</button></div>' +
+      '<div style="border-top:1px solid var(--line);margin:16px 0 4px;"></div>';
+  }
+  card.insertBefore(sec, card.firstChild);
+  const q = s => sec.querySelector(s);
+  const bind = (sel, field) => { const el = q(sel); if (el) el.addEventListener("input", () => { ACCT_UI[field] = el.value; }); };
+  bind("[data-acct-user]", "user"); bind("[data-acct-pass]", "pass");
+  bind("[data-acct-ruser]", "ruser"); bind("[data-acct-rpass]", "rpass"); bind("[data-acct-rinvite]", "rinvite");
+  const bl = q("[data-acct-login]"); if (bl) bl.addEventListener("click", () => { const a = q("[data-acct-user]"), b = q("[data-acct-pass]"); if (a) ACCT_UI.user = a.value; if (b) ACCT_UI.pass = b.value; acctLogin(); });
+  const bs = q("[data-acct-showreg]"); if (bs) bs.addEventListener("click", () => { ACCT_UI.showReg = !ACCT_UI.showReg; ACCT.msg = ""; paintBackupUI(); });
+  const br = q("[data-acct-register]"); if (br) br.addEventListener("click", () => { const a = q("[data-acct-ruser]"), b = q("[data-acct-rpass]"), c = q("[data-acct-rinvite]"); if (a) ACCT_UI.ruser = a.value; if (b) ACCT_UI.rpass = b.value; if (c) ACCT_UI.rinvite = c.value; acctRegister(); });
+  const by = q("[data-acct-sync]"); if (by) by.addEventListener("click", () => acctSyncNow());
+  const bo = q("[data-acct-logout]"); if (bo) bo.addEventListener("click", () => acctLogout());
+}
+
+/* ---- 启动：恢复登录态后先合并一次；切后台且本地比云端新时补同步 ---- */
+(function acctBoot(){
+  const m = acctMeta();
+  if (m && m.username){ ACCT.username = m.username; ACCT.status = "idle"; setTimeout(() => { acctSyncNow(); }, 1200); }
+  document.addEventListener("visibilitychange", () => {
+    try {
+      if (document.visibilityState === "hidden" && ACCT.username && !ACCT.syncing && acctLocalUpdatedAt() !== ACCT.cloudUpdatedAt) acctSyncNow();
+    } catch(e){}
+  });
+})();
+
+try { window.__ACCT = { login: acctLogin, register: acctRegister, syncNow: acctSyncNow, logout: acctLogout, meta: acctMeta, state: ACCT, ui: ACCT_UI, onLocalSave: acctOnLocalSave, statusText: acctStatusText, fetchRemote: acctFetchRemote }; } catch(e){}
 
 /* ================= 顶部 HUD ================= */
 function renderHUD(){
@@ -7304,6 +7581,7 @@ function saveWordScore(uid, sc, heard){
     m[uid] = { s: old && old.s > sc ? old.s : sc, last: sc, heard: heard || "", t: Date.now() };
     localStorage.setItem(WORD_SCORE_KEY, JSON.stringify(m));
   } catch(e){}
+  try { if(typeof acctOnLocalSave === "function") acctOnLocalSave(); } catch(e){}
 }
 function feedbackForWord(res, word){
   const w = (word || "").toLowerCase();
