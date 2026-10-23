@@ -14,7 +14,7 @@
    让长缓存旧页面的手机（iOS Safari/主屏幕图标）自动换到新版。
    防循环：sessionStorage 键 english-app-verjump 记本次会话已为哪个目标版本跳过；
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610222108";
+var APP_BUILD = "v202610222203";
 (function () {
   try {
     if (!APP_BUILD || APP_BUILD === "__" + "BUILD__") return; /* 开发态/工件态不检查 */
@@ -1241,6 +1241,7 @@ figure.wfig{margin:0 0 8px;}
       <section id="view-vocab" class="hidden">
         <div class="hero"><div class="hero-kick">VOCABULARY</div><div class="hero-title">单词 · Vocabulary</div><p class="hero-sub" id="wbSummary">课程每课 8 个单词，加上扩展词库，一共 3000 个，从简单到难。</p></div>
         <div class="xsec" data-sec="v-today" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">今日单词<small>就是今天这一档要学的词，和「今日」页同一份清单</small></span><span class="xsec-count" id="cntVocabToday"></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
+          <div id="planInfo"></div>
           <div id="vocabMain"></div>
           <div id="vocabTodayGroups"></div>
         </div></div></div>
@@ -1271,6 +1272,9 @@ figure.wfig{margin:0 0 8px;}
         <div class="xsec" data-sec="r-main" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">今日到期复习</span><span class="xsec-count" id="cntReview"></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
           <p class="sec-sub">按艾宾浩斯遗忘曲线排队：学完第 1 天、第 3 天、第 7 天把词推回来考你。遮住一半、自己先想，答对才算过。复习结果和「今日」「单词」是同一份进度。</p>
           <div id="reviewMain"></div>
+        </div></div></div>
+        <div class="xsec" data-sec="r-backlog" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">待补新词<small>前几天发过、还没来得及学的新词——点开就能学，不占今天的新词名额</small></span><span class="xsec-count" id="cntBacklog"></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
+          <div id="backlogMain"></div>
         </div></div></div>
       </section>
 
@@ -1321,6 +1325,7 @@ figure.wfig{margin:0 0 8px;}
 
       <!-- VIEW: pronunciation -->
       <section id="view-pron" class="hidden">
+        <div id="srWarnPron" class="sr-warn-host" style="display:none;"></div>
         <div class="hero"><div class="hero-kick">PRONUNCIATION</div><div class="hero-title">发音 · Pronunciation</div><p class="hero-sub">逐句跟读打分：读错标红、漏读标金，给 0–100 分和中文点评。</p></div>
         <div class="xsec" data-sec="p-today" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">今日发音<small>和「今日」页同一份清单</small></span><span class="xsec-count" id="cntPronToday"></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
           <div id="pronToday"></div>
@@ -4322,7 +4327,7 @@ const state = {
   grammarSeen: new Set(), grammarQuiz: new Set(),
   stats: { pronAttempts: 0, pron90: 0, roleRounds: 0, corrTotal: 0, roleScoreSum: 0, roleScoreN: 0 },
   studySecs: 0, badgesSeen: [],
-  planTier: 30, dailyPlan: null,
+  planTier: 30, dailyPlan: null, servedNew: {},
   voiceURI: "auto", speed: 1,
   currentLesson: null, currentStep: "words"
 };
@@ -4338,7 +4343,7 @@ function saveState(){
       corr: state.corr.slice(0, 150), pron: state.pron.slice(0, 200), pronBest: state.pronBest,
       grammarSeen: [...state.grammarSeen], grammarQuiz: [...state.grammarQuiz],
       stats: state.stats, studySecs: state.studySecs, badgesSeen: state.badgesSeen,
-      planTier: state.planTier, dailyPlan: state.dailyPlan,
+      planTier: state.planTier, dailyPlan: state.dailyPlan, servedNew: state.servedNew,
       voiceURI: state.voiceURI, speed: state.speed
     }));
   } catch(e){ }
@@ -4380,6 +4385,7 @@ function loadState(){
   state.badgesSeen = d.badgesSeen || [];
   state.planTier = TIERS[d.planTier] ? d.planTier : 30;
   state.dailyPlan = d.dailyPlan || null;
+  state.servedNew = (d.servedNew && typeof d.servedNew === "object" && !Array.isArray(d.servedNew)) ? d.servedNew : {};
   state.voiceURI = d.voiceURI || "auto";
   state.speed = d.speed || 1;
 }
@@ -4421,6 +4427,47 @@ function addXP(n){ state.xp += n; todayLog().xp += n; markStudied(); saveState()
 function renderStatus(){ renderHUD(); saveState(); }
 
 /* ================= 每日清单 ================= */
+/* ---------- 每日新词：严格全新发放 ----------
+   一个词只要 (a) 有 wordGrades 记录，或 (b) 在 wordReview 复习队列里，
+   或 (c) 曾被任一天的新词名单发过（servedNew 发放记录），就永远不再进新词名单。
+   昨天发了没学完的词靠 (c) 排除：它们去复习页「待补新词」区，不回锅、不占名额。
+   复习到期词本来就不在这个池子里（池子只从未记录的词里取），两边互不混入。 */
+function planExcludedIds(){
+  const ex = new Set();
+  Object.keys(state.wordGrades).forEach(id => ex.add(id));
+  Object.keys(state.wordReview).forEach(id => ex.add(id));
+  Object.keys(state.servedNew || {}).forEach(dk => {
+    const list = state.servedNew[dk];
+    if(Array.isArray(list)) list.forEach(id => ex.add(id));
+  });
+  return ex;
+}
+function serveNewWords(tier, prevWords){
+  const today = dayKey();
+  const quota = TIERS[tier].words;
+  if(!state.servedNew || typeof state.servedNew !== "object" || Array.isArray(state.servedNew)) state.servedNew = {};
+  /* 今天的发放记录是同日名单的唯一事实源：刷新/切 tab/重启都按它复现同一份名单；
+     记录缺失时（旧版本当天已生成计划）用同日旧名单播种，保证升级当天不乱序 */
+  let record = Array.isArray(state.servedNew[today]) ? state.servedNew[today].slice()
+    : (Array.isArray(prevWords) ? prevWords.slice() : []);
+  if(record.length < quota){
+    /* 只补发从没发过、没学过、不在复习队列里的全新词，按课程顺序（主课→扩展）依次取 */
+    const ex = planExcludedIds();
+    record.forEach(id => ex.add(id));
+    for(const w of ALL_WORDS){
+      if(record.length >= quota) break;
+      if(!ex.has(w.id)){ record.push(w.id); ex.add(w.id); }
+    }
+  }
+  state.servedNew[today] = record;
+  if(record.length <= quota) return record.slice();
+  /* 记录比当前档位多（同日先选大档又切回小档）：显示名单截断到档位——
+     已打分的优先保留（进度不能丢），其余按发放顺序取前几个；
+     发放记录本身不删：被截掉的词明天进「待补新词」，永不重发 */
+  const graded = record.filter(id => state.wordGrades[id] !== undefined);
+  const fresh = record.filter(id => state.wordGrades[id] === undefined);
+  return graded.concat(fresh.slice(0, Math.max(0, quota - graded.length)));
+}
 function buildPlanFor(tier, prev){
   const t = TIERS[tier];
   /* 先保留今天已打勾的项，再保留原清单里未做的，最后按从易到难补没学过的内容，凑满新档数量 */
@@ -4432,9 +4479,7 @@ function buildPlanFor(tier, prev){
     pool.forEach(id => { if(out.length < quota) push(id); });
     return out;
   };
-  const words = keep(prev && prev.words, t.words,
-    id => state.wordGrades[id] !== undefined,
-    ALL_WORDS.filter(w => state.wordGrades[w.id] === undefined).map(w => w.id));
+  const words = serveNewWords(tier, prev && prev.words);
   const grammar = keep(prev && prev.grammar, t.grammar,
     id => state.grammarSeen.has(id),
     ALL_LESSONS.filter(l => !state.grammarSeen.has(l.id)).map(l => l.id));
@@ -4455,7 +4500,16 @@ function planComplete(p, tier){
 function genPlan(){
   const today = dayKey();
   const tier = TIERS[state.planTier] ? state.planTier : 30;
-  if(state.dailyPlan && state.dailyPlan.date === today && state.dailyPlan.tier === tier && planComplete(state.dailyPlan, tier)) return state.dailyPlan;
+  if(state.dailyPlan && state.dailyPlan.date === today && state.dailyPlan.tier === tier && planComplete(state.dailyPlan, tier)){
+    /* 升级迁移：旧版本今天生成的计划还没有发放记录时先补记，
+       免得名单里没学完的词明天被当成全新词再发一遍 */
+    if(!state.servedNew || typeof state.servedNew !== "object" || Array.isArray(state.servedNew)) state.servedNew = {};
+    if(!Array.isArray(state.servedNew[today])){
+      state.servedNew[today] = (state.dailyPlan.words || []).slice();
+      saveState();
+    }
+    return state.dailyPlan;
+  }
   const prev = (state.dailyPlan && state.dailyPlan.date === today) ? state.dailyPlan : null;
   state.dailyPlan = buildPlanFor(tier, prev);
   saveState();
@@ -5057,6 +5111,7 @@ function shadowRead(pairs, enRate, done){
   if(!list.length){ if(done) done(); return; }
   const rate = Math.min(1.1, Math.max(0.5, (typeof enRate === "number" ? enRate : 0.62) * (state.speed || 1)));
   SH = { pairs: list, rate: rate, idx: 0, loop: false, paused: false, done: done || null, gen: 0, stepIdx: 0, steps: [], phase: "", pending: null };
+  paintSrWarns();
   shPlayCurrent();
 }
 function shStepsFor(p){
@@ -5601,6 +5656,68 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
    （时好时坏、播放切录音后麦克风没声），与学习者「有时能打分、有时听不到」的间歇表现吻合；
    失败收尾要给针对性说法，不能笼统怪「没听清」 */
 const IS_STANDALONE = (() => { try { return navigator.standalone === true || !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches); } catch(e){ return false; } })();
+/* ---------- standalone 识别失败：持久标记 + 提前提醒 + 结果卡复制链接 ----------
+   v3.8 的 sa-fail 是读完整句才在结果卡里告诉她白读了；这里把提醒提前：
+   失败当下就往独立辅助键 english-srfail-v1 写时间戳（不进 state、不动 LS_KEY 数据），
+   下次打开出发音页 / 开始整课跟读时，先在页面顶部把话说在前面。 */
+const SRFAIL_KEY = "english-srfail-v1";
+let srFailedThisSession = false;
+let srWarnDismissed = false;
+function markSrFail(){
+  srFailedThisSession = true;
+  try { localStorage.setItem(SRFAIL_KEY, String(Date.now())); } catch(e){}
+  paintSrWarns();
+}
+function srFailMarked(){
+  if(srFailedThisSession) return true;
+  try { return !!localStorage.getItem(SRFAIL_KEY); } catch(e){ return false; }
+}
+function srWarnShouldShow(){
+  /* 只在 standalone 且确实失败过（本会话或留有标记）时提醒；Safari 标签页永不显示 */
+  return IS_STANDALONE && !srWarnDismissed && srFailMarked();
+}
+function paintSrWarns(){
+  document.querySelectorAll(".sr-warn-host").forEach(host => {
+    if(srWarnShouldShow()){
+      host.innerHTML = '<div class="mic-warn" style="margin:0;">桌面图标打开时跟读识别不稳定，上次就没识别成功——建议在 Safari 里打开链接练跟读。' +
+        '<button class="btn ghost small" data-srwarnok type="button" style="margin-left:8px;">知道了</button></div>';
+      host.style.display = "";
+      const b = host.querySelector("[data-srwarnok]");
+      if(b) b.addEventListener("click", () => { srWarnDismissed = true; paintSrWarns(); });
+    } else {
+      host.innerHTML = "";
+      host.style.display = "none";
+    }
+  });
+}
+/* sa-fail 结果卡的「复制链接」：复制不带 ?v= 的干净站点链接；
+   剪贴板 API 不可用/被拒时降级为把链接文本显示出来让她长按复制，绝不报错、绝不死按钮 */
+const COPY_LINK_HTML = ' <button class="btn ghost small" data-copylink type="button">复制链接</button>' +
+  '<div data-linkbox hidden style="margin-top:8px;word-break:break-all;-webkit-user-select:all;user-select:all;font-size:13.5px;"></div>';
+function wireCopyLink(scope){
+  if(!scope) return;
+  const b = scope.querySelector("[data-copylink]");
+  if(b) b.addEventListener("click", () => copySiteLink(b));
+}
+function copySiteLink(btn){
+  const link = location.origin + location.pathname;
+  const showLink = () => {
+    try {
+      const wrap = btn.parentElement;
+      const box = wrap && wrap.querySelector("[data-linkbox]");
+      if(box){ box.hidden = false; box.textContent = link; }
+      btn.textContent = "链接在下面，长按复制";
+    } catch(e){}
+  };
+  try {
+    if(navigator.clipboard && typeof navigator.clipboard.writeText === "function"){
+      navigator.clipboard.writeText(link).then(() => {
+        btn.textContent = "已复制，去 Safari 粘贴打开";
+        toast("已复制，去 Safari 粘贴打开");
+      }, showLink);
+    } else showLink();
+  } catch(e){ showLink(); }
+}
 /* 全局麦克风会话管理：同一时间只允许一个识别/录音会话，避免 iOS 上抢麦克风报 audio-capture */
 let curRec = null;                 /* 当前 SpeechRecognition 实例 */
 let mrRecorder = null, mrChunks = [], mrStream = null;
@@ -5901,7 +6018,7 @@ function listenGradeAccum(target, cb, opts){
         /* 整场零结果的收尾口径：iOS 独立模式（桌面图标打开）下识别失败是系统不稳，
            给针对性说法；其它环境里录音明明有声、识别却零结果＝识别服务没响应。
            两种都不许再笼统说「没听清」 */
-        if(!out.res && IS_STANDALONE && (out.err === "no-speech" || out.err === "timeout" || out.err === "end")) out.err = "sa-fail";
+        if(!out.res && IS_STANDALONE && (out.err === "no-speech" || out.err === "timeout" || out.err === "end")){ out.err = "sa-fail"; markSrFail(); }
         else if(out.err === "no-speech" && pk !== null && !out.recSilent) out.err = "no-response";
         cb(out);
       });
@@ -6045,7 +6162,7 @@ function listenGrade(target, cb, opts){
     out.recPeak = lastPeak; out.recSilent = recSilentOf(lastPeak);
     /* 与累积路径同一口径：零结果时，独立模式→sa-fail，录音有声→no-response，都不说「没听清」 */
     if(!out.res && (out.err === "no-speech" || out.err === "end" || out.err === "timeout")){
-      if(IS_STANDALONE) out.err = "sa-fail";
+      if(IS_STANDALONE){ out.err = "sa-fail"; markSrFail(); }
       else if(lastPeak !== null && !out.recSilent) out.err = "no-response";
     }
     meterStop(); cb(out);
@@ -6787,9 +6904,28 @@ function reviewGrade(id, pass){
   }
   markStudied(); saveState(); renderHUD();
 }
+/* 今日单词区头部：规划信息（第 N 天 / 今日全新词数 / 累计已学 / 明日预告） */
+function renderPlanInfo(){
+  const host = $("#planInfo");
+  if(!host) return;
+  const p = genPlan();
+  const today = dayKey();
+  let n = state.checkins.size + (state.checkins.has(today) ? 0 : 1);
+  if(n < 1) n = 1;
+  const learned = Object.keys(state.wordGrades).length;
+  const ex = planExcludedIds();
+  let nextW = null;
+  for(const w of ALL_WORDS){ if(!ex.has(w.id)){ nextW = w; break; } }
+  host.innerHTML =
+    '<p class="sec-sub" style="margin:0 0 4px;">第 ' + n + ' 天 · 今日新词 ' + p.words.length + ' 个（全部全新，学过的不会再重复发）· 累计已学新词 ' + learned + ' / ' + TOTAL_WORDS + '</p>' +
+    '<p class="sec-sub" style="margin:0 0 10px;">' + (nextW
+      ? '明天的新词从《' + esc(nextW.lesson && nextW.lesson.t ? nextW.lesson.t : "下一课") + '》开始'
+      : '新词已经全部发完啦，接下来以复习为主') + '</p>';
+}
 function renderVocab(){
   const pp = planProgress();
   refreshVocabCounts(pp);
+  renderPlanInfo();
   drawDeck();
   drawTodayGroups();
   const pk = $("#vocabPicker");
@@ -7053,7 +7189,56 @@ function dueReviewIds(){
     .sort((a, b) => state.wordReview[a].due - state.wordReview[b].due);
 }
 function wordById(id){ return ALL_WORDS.find(x => x.id === id) || null; }
+/* 「待补新词」：往日发过、至今没打分、也不在复习队列里的新词。
+   点开去单词页学（走现有 goVocab），学会后经 gradeWord 正常进艾宾浩斯复习队列。 */
+function backlogItems(){
+  const today = dayKey();
+  const out = [];
+  Object.keys(state.servedNew || {}).sort().forEach(dk => {
+    if(dk >= today) return;
+    const list = state.servedNew[dk];
+    if(!Array.isArray(list)) return;
+    list.forEach(id => {
+      if(state.wordGrades[id] === undefined && !state.wordReview[id]) out.push({ id, date: dk });
+    });
+  });
+  return out;
+}
+function renderBacklog(){
+  const host = $("#backlogMain");
+  if(!host) return;
+  const items = backlogItems();
+  const cnt = $("#cntBacklog");
+  if(cnt) cnt.textContent = items.length ? items.length + " 个待补" : "";
+  if(!items.length){
+    host.innerHTML = '<p class="sec-sub" style="margin:0;">没有待补的词——之前发过的新词都学完了。</p>';
+    return;
+  }
+  const groups = [], byDate = {};
+  items.forEach(x => {
+    if(!byDate[x.date]){ byDate[x.date] = { date: x.date, items: [] }; groups.push(byDate[x.date]); }
+    byDate[x.date].items.push(x);
+  });
+  groups.sort((a, b) => a.date < b.date ? 1 : -1);
+  host.innerHTML = '<p class="sec-sub" style="margin-top:0;">这些词是前几天发给你、但还没学的。点开任意一个就能学；学会后会照常进入复习队列。它们不会再出现在每天的新词里，也不占新词名额。</p>' +
+    groups.map((gr, gi) => {
+      const sid = "rbk-" + gr.date;
+      const label = gr.date.slice(5).replace("-", "月") + "日发的";
+      return '<div class="xsec xsub" data-sec="' + sid + '"' + secOpenAttr(sid, gi === 0) + '>' +
+        '<div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">' + label + '</span>' +
+        '<span class="xsec-count">' + gr.items.length + ' 个</span><span class="xsec-arrow">▾</span></div>' +
+        '<div class="xsec-body"><div class="xsec-inner">' +
+        gr.items.map(x => { const w = wordById(x.id); return w ? planWordRow(w, ' data-bkword="' + w.id + '" style="cursor:pointer;"') : ""; }).join("") +
+        '</div></div></div>';
+    }).join("");
+  host.querySelectorAll("[data-wspeak]").forEach(b => b.addEventListener("click", e => { e.stopPropagation(); speak(b.dataset.wspeak, 1); }));
+  host.querySelectorAll("[data-bkword]").forEach(el => el.addEventListener("click", () => {
+    const w = wordById(el.dataset.bkword);
+    if(w) goVocab(w.lesson.id, w.lesson.v.indexOf(w.v));
+  }));
+}
 function renderReview(){
+  renderBacklog();
   const host = $("#reviewMain");
   if(!host) return;
   const cntR = $("#cntReview");
@@ -7340,6 +7525,7 @@ function renderDlgBrowse(){
       '</div>' +
       '<div class="ctl-prog"><i id="ctlBar" style="width:0%"></i></div>' +
       '<div class="ctl-info" id="ctlInfo">点「整段跟读」开始；播放中点任意一句，可直接跳到那句跟读。</div>' +
+      '<div id="ctlSrWarn" class="sr-warn-host" style="display:none;margin-top:8px;"></div>' +
       '<div id="ctlFail" style="display:none;margin-top:8px;"></div>' +
       '<div class="mic-meter" id="ctlMeter"></div>' +
     '</div>' +
@@ -7518,9 +7704,10 @@ function drawRole(zone, ls){
             const rz = zone.querySelector("#rpResult");
             if(rz){
               rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div>' +
-                '<div style="margin-top:8px;"><button class="btn soft small" id="rpRetry" type="button">再试一次</button></div></div>';
+                '<div style="margin-top:8px;"><button class="btn soft small" id="rpRetry" type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div></div>';
               const rb3 = rz.querySelector("#rpRetry");
               if(rb3) rb3.addEventListener("click", () => { const mb = zone.querySelector("#rpMic"); if(mb) mb.click(); });
+              wireCopyLink(rz);
             } else toast(srErrText(out.err));
           } else {
             toast(out.err === "unsupported" ? NO_SR_HINT + "请切换到打字模式。" : srErrText(out.err));
@@ -7666,6 +7853,7 @@ function renderVoiceCard(){
     speak("Hello! Let's practise English together, one sentence at a time.", 0.98));
 }
 function renderPron(){
+  paintSrWarns();
   renderVoiceCard();
   renderPronToday();
   renderPronBrowse();
@@ -7781,9 +7969,10 @@ function pronCard(ls, i){
     if(!out.res){
       const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
       result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>' +
-        ((out.err === "no-response" || out.err === "sa-fail") ? '<div style="margin-top:8px;"><button class="btn soft small" data-retry2 type="button">再试一次</button></div>' : '');
+        ((out.err === "no-response" || out.err === "sa-fail") ? '<div style="margin-top:8px;"><button class="btn soft small" data-retry2 type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div>' : '');
       const rt2 = result.querySelector("[data-retry2]");
       if(rt2) rt2.addEventListener("click", () => checkBtn.click());
+      wireCopyLink(result);
       return;
     }
     const text = out.text, res = out.res;
