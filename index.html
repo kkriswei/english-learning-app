@@ -14,7 +14,7 @@
    让长缓存旧页面的手机（iOS Safari/主屏幕图标）自动换到新版。
    防循环：sessionStorage 键 english-app-verjump 记本次会话已为哪个目标版本跳过；
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610222203";
+var APP_BUILD = "v202610230022";
 (function () {
   try {
     if (!APP_BUILD || APP_BUILD === "__" + "BUILD__") return; /* 开发态/工件态不检查 */
@@ -5679,7 +5679,7 @@ function srWarnShouldShow(){
 function paintSrWarns(){
   document.querySelectorAll(".sr-warn-host").forEach(host => {
     if(srWarnShouldShow()){
-      host.innerHTML = '<div class="mic-warn" style="margin:0;">桌面图标打开时跟读识别不稳定，上次就没识别成功——建议在 Safari 里打开链接练跟读。' +
+      host.innerHTML = '<div class="mic-warn" style="margin:0;">桌面图标打开时跟读识别不稳定，上次就没识别成功——建议在 Safari 里打开链接练跟读。也可以用离线识别打分（首次需下载）。' +
         '<button class="btn ghost small" data-srwarnok type="button" style="margin-left:8px;">知道了</button></div>';
       host.style.display = "";
       const b = host.querySelector("[data-srwarnok]");
@@ -6013,6 +6013,7 @@ function listenGradeAccum(target, cb, opts){
     meterStop();
     stopCapture(u => {
       out.url = u || null; out.retried = retried;
+      out.blob = mrLastBlob || null;   /* v3.10：本场录音留给离线 ASR 兜底用 */
       measureBlobPeak(mrLastBlob, pk => {
         out.recPeak = pk; out.recSilent = recSilentOf(pk);
         /* 整场零结果的收尾口径：iOS 独立模式（桌面图标打开）下识别失败是系统不稳，
@@ -6160,6 +6161,7 @@ function listenGrade(target, cb, opts){
   const done = out => {
     if(settled) return; settled = true;
     out.recPeak = lastPeak; out.recSilent = recSilentOf(lastPeak);
+    out.blob = recBlob || null;   /* v3.10：本场录音留给离线 ASR 兜底用 */
     /* 与累积路径同一口径：零结果时，独立模式→sa-fail，录音有声→no-response，都不说「没听清」 */
     if(!out.res && (out.err === "no-speech" || out.err === "end" || out.err === "timeout")){
       if(IS_STANDALONE){ out.err = "sa-fail"; markSrFail(); }
@@ -6168,6 +6170,7 @@ function listenGrade(target, cb, opts){
     meterStop(); cb(out);
   };
   let firstUrl = null;
+  let recBlob = null;
   meterStart(opts.meterEl);
   const attempt = (withRec, isRetry) => {
     if(seq !== gradeSeq || settled) return;
@@ -6189,7 +6192,7 @@ function listenGrade(target, cb, opts){
         }
         done({ text: null, res: null, url: firstUrl, retried: isRetry, err: e2 });
       };
-      if(withRec) stopCapture(url => { if(url) firstUrl = url; measureBlobPeak(mrLastBlob, pk => { lastPeak = pk; proceed(); }); });
+      if(withRec) stopCapture(url => { if(url) firstUrl = url; recBlob = mrLastBlob || null; measureBlobPeak(mrLastBlob, pk => { lastPeak = pk; proceed(); }); });
       else proceed();
     }, { maxMs: maxMs, onStart: () => {
       if(withRec && seq === gradeSeq && !settled)
@@ -6200,6 +6203,148 @@ function listenGrade(target, cb, opts){
 }
 /* 取消进行中的判分会话：序号递增让迟到的回调全部作废，再彻底释放麦克风（「聆听中再点一次＝取消」用） */
 function cancelGrade(){ gradeSeq++; gradeDoneHook = null; meterStop(); releaseMic(); }
+/* ---------- 离线 ASR 兜底打分（v3.10） ----------
+   触发口径只有一条：一次判分以整场零结果收场（sa-fail / no-response）且这次有录音时，
+   才提供离线识别。做法：把那段录音在本机用 whisper-tiny（多语 q8，transformers.js）转成
+   文字，再喂现有 scoreFirst 原口径判分——判分逻辑一字不改。模型+运行时约 55MB，首次必须
+   由用户点按钮触发下载（库的 progress 回调驱动进度条），下载完自动转写刚才那段录音；
+   下载过（打了标记）则零结果时直接自动转写。转写为空/失败/引擎坏掉，一律回落到既有
+   失败卡（再试一次/打字纠错），绝不假打分、绝不卡死。原生识别正常出结果时，本段代码
+   零调用、零下载、零预载。引擎可经 window.__ASR_ENGINE 注入（冒烟用），与 __SR_TIMING /
+   __REC_PEAK 同一种注入口径；生产不设该变量。资产在站点 asr/ 目录，坏掉不拖垮主 App。 */
+const ASR_FLAG_KEY = "english-asr-v1";
+const ASR_BASE = (() => { try { return new URL("asr/", document.baseURI).href; } catch(e){ return "asr/"; } })();
+const ASR_PROG_HTML = '<div data-asrprog hidden style="margin-top:10px;"><div style="height:8px;border-radius:99px;background:rgba(23,20,14,.12);overflow:hidden;"><i style="display:block;height:100%;width:0%;background:#c2a14d;transition:width .2s;"></i></div><div data-asrpt style="font-size:12.5px;color:var(--ink-faint);margin-top:4px;">正在下载离线识别模型… 0%</div></div>';
+const ASR_OFFLINE_NOTE = "离线识别打分：这分是手机在本机把你的录音转成文字后打的，没用苹果的识别服务。";
+function asrZeroApplies(out){
+  return !!out && (out.err === "sa-fail" || out.err === "no-response") && !!out.blob && !!out.blob.size;
+}
+function asrMarkCached(){ try { localStorage.setItem(ASR_FLAG_KEY, "1"); } catch(e){} }
+/* 录音 Blob → 16kHz 单声道 Float32Array（报告实测链：AudioContext({sampleRate:16000}).decodeAudioData → getChannelData(0)） */
+function asrDecodePcm(blob){
+  return new Promise(res => {
+    let settled = false;
+    const done = v => { if(!settled){ settled = true; res(v); } };
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if(!AC || !blob || !blob.arrayBuffer){ done(null); return; }
+      const ctx = new AC({ sampleRate: 16000 });
+      blob.arrayBuffer().then(ab => ctx.decodeAudioData(ab)).then(buf => {
+        let pcm = null;
+        try { pcm = buf.getChannelData(0).slice(0); } catch(e){}
+        try { ctx.close(); } catch(e){}
+        done(pcm && pcm.length ? pcm : null);
+      }).catch(() => { try { ctx.close(); } catch(e){} done(null); });
+    } catch(e){ done(null); }
+  });
+}
+/* ---- 真实引擎：优先模块 Worker（asr/asr-worker.js），起不来/中途坏掉退主线程动态 import ---- */
+let asrWorker = null, asrWorkerDead = false, asrSeq = 0;
+const asrWaiters = new Map();
+let asrProgSink = null;
+function asrEmitProg(p){ if(asrProgSink){ try { asrProgSink(p); } catch(e){} } }
+function asrSpawn(){
+  if(asrWorker || asrWorkerDead) return asrWorker;
+  try {
+    const w = new Worker(ASR_BASE + "asr-worker.js", { type: "module" });
+    w.addEventListener("message", e => {
+      const m = (e && e.data) || {};
+      if(m.type === "progress"){ asrEmitProg(m.pct); return; }
+      const fn = asrWaiters.get(m.id);
+      if(fn){ asrWaiters.delete(m.id); fn(m); }
+    });
+    w.addEventListener("error", () => {
+      asrWorkerDead = true;
+      try { w.terminate(); } catch(e){}
+      if(asrWorker === w) asrWorker = null;
+      asrWaiters.forEach(fn => { try { fn({ type: "error", error: "worker error" }); } catch(e){} });
+      asrWaiters.clear();
+    });
+    asrWorker = w;
+  } catch(e){ asrWorkerDead = true; asrWorker = null; }
+  return asrWorker;
+}
+function asrWorkerCall(msg){
+  return new Promise(resolve => {
+    const w = asrSpawn();
+    if(!w){ resolve({ type: "error", error: "no worker" }); return; }
+    const id = ++asrSeq;
+    asrWaiters.set(id, resolve);
+    try {
+      if(msg.pcm) w.postMessage({ type: msg.type, id: id, pcm: msg.pcm }, [msg.pcm.buffer]);
+      else w.postMessage({ type: msg.type, id: id });
+    } catch(e){ asrWaiters.delete(id); resolve({ type: "error", error: String(e) }); }
+  });
+}
+function asrProgAgg(){
+  const files = new Map();
+  return info => {
+    try {
+      if(!info || info.status !== "progress" || !info.file) return;
+      if(typeof info.loaded === "number" && typeof info.total === "number" && info.total > 0){
+        files.set(info.file, { loaded: info.loaded, total: info.total });
+        let l = 0, t = 0;
+        files.forEach(v => { l += v.loaded; t += v.total; });
+        if(t > 0) asrEmitProg(Math.max(0, Math.min(99, Math.round(l / t * 100))));
+      }
+    } catch(e){}
+  };
+}
+let asrMainPipeP = null;
+function asrMainLoad(){
+  if(asrMainPipeP) return asrMainPipeP;
+  asrMainPipeP = (async () => {
+    const T = await import(ASR_BASE + "lib/transformers.web.min.js");
+    const env = T.env;
+    env.remoteHost = ASR_BASE;
+    env.remotePathTemplate = "model/";
+    env.backends.onnx.wasm.numThreads = 1;
+    env.backends.onnx.wasm.wasmPaths = { mjs: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.mjs", wasm: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.wasm" };
+    return await T.pipeline("automatic-speech-recognition", "whisper-tiny", { device: "wasm", dtype: "q8", progress_callback: asrProgAgg() });
+  })();
+  asrMainPipeP.catch(() => { asrMainPipeP = null; });
+  return asrMainPipeP;
+}
+async function asrDoTranscribe(blob){
+  const pcm = await asrDecodePcm(blob);
+  if(!pcm || !pcm.length) return null;
+  if(!asrWorkerDead){
+    const r = await asrWorkerCall({ type: "transcribe", pcm: pcm });
+    if(r && r.type === "result"){ asrMarkCached(); return (r.text || "").trim() || null; }
+    /* Worker 起不来或中途坏掉：标记后退主线程再试一次 */
+    asrWorkerDead = true;
+    if(asrWorker){ const w = asrWorker; asrWorker = null; try { w.terminate(); } catch(e){} }
+  }
+  const p = await asrMainLoad();
+  asrEmitProg(100);
+  const r = await p(pcm, { chunk_length_s: 30, language: "english", task: "transcribe" });
+  asrMarkCached();
+  return ((Array.isArray(r) ? (r[0] && r[0].text) : (r && r.text)) || "").trim() || null;
+}
+const realAsrEngine = {
+  cached(){ try { return localStorage.getItem(ASR_FLAG_KEY) === "1"; } catch(e){ return false; } },
+  transcribe(blob, prog, cb){
+    asrProgSink = prog || null;
+    asrDoTranscribe(blob).then(t => { asrProgSink = null; cb(t || null); }, () => { asrProgSink = null; cb(null); });
+  }
+};
+function asrEngine(){
+  return (typeof window !== "undefined" && window.__ASR_ENGINE) || realAsrEngine;
+}
+/* 跑一次离线转写：progEl 是 ASR_PROG_HTML 的根元素（可为 null）；成功 onText(文字)，失败/空 onFail() */
+function asrRunOffline(out, progEl, onText, onFail){
+  let finished = false;
+  const finish = t => { if(finished) return; finished = true; if(t) onText(t); else onFail(); };
+  try {
+    asrEngine().transcribe(out.blob, pct => {
+      if(!progEl) return;
+      progEl.hidden = false;
+      const bar = progEl.querySelector("i"), tx = progEl.querySelector("[data-asrpt]");
+      if(bar) bar.style.width = pct + "%";
+      if(tx) tx.textContent = pct >= 100 ? "下载完成，正在识别…" : "正在下载离线识别模型… " + pct + "%（下完自动打分）";
+    }, finish);
+  } catch(e){ finish(null); }
+}
 
 
 const FREE_RULES = [
@@ -6697,28 +6842,66 @@ function startWordScore(host, v, uid){
     if(panel._wsTok !== wsTok) return;   /* 已被取消/取代：迟到的原音回调不再启动识别 */
     if(!panel.isConnected) return;
     panel.innerHTML = '<div class="ws-state"><span class="ws-listening">🎤</span> 听着呢，照着读：<b class="en" style="font-size:19px;">' + esc(v[0]) + '</b><br><span style="font-size:13px;">读完停一下，马上出分</span></div>' + '<div class="mic-meter"></div>';
-    listenGrade(v[0], out => {
-      panel.dataset.wsbusy = "";
-      if(!panel.isConnected) return;
-      if(!out || !out.res){
-        const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
-        panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>' +
-          '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">再试一次</button></div>';
-      } else {
-        const sc = out.res.score;
-        saveWordScore(uid, sc, out.text);
-        panel.innerHTML = '<div class="ws-big ' + scoreClass(sc) + '">' + sc + ' 分</div>' +
-          '<div class="ws-heard">你读的是：<b class="en">' + esc(out.text || "") + '</b></div>' +
-          '<div class="ws-fb">' + esc(feedbackForWord(out.res, v[0])) + '</div>' +
-          (out.url ? '<audio controls src="' + out.url + '"></audio>' : '') +
-          (out.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
-          '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">🎤 再读一次</button>' +
-          '<button class="btn ghost small" data-wsorig type="button">▶ 再听原音</button></div>';
-      }
+    const wsWire = () => {
       const rt = panel.querySelector("[data-wsretry]");
       if(rt) rt.addEventListener("click", () => startWordScore(host, v, uid));
       const og = panel.querySelector("[data-wsorig]");
       if(og) og.addEventListener("click", () => speak(v[0], 1));
+    };
+    const wsShowScore = out2 => {
+      const sc = out2.res.score;
+      saveWordScore(uid, sc, out2.text);
+      panel.innerHTML = '<div class="ws-big ' + scoreClass(sc) + '">' + sc + ' 分</div>' +
+        '<div class="ws-heard">你读的是：<b class="en">' + esc(out2.text || "") + '</b></div>' +
+        '<div class="ws-fb">' + esc(feedbackForWord(out2.res, v[0])) + '</div>' +
+        (out2.offline ? '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>' : '') +
+        (out2.url ? '<audio controls src="' + out2.url + '"></audio>' : '') +
+        (out2.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
+        '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">🎤 再读一次</button>' +
+        '<button class="btn ghost small" data-wsorig type="button">▶ 再听原音</button></div>';
+      wsWire();
+    };
+    const wsShowFail = out => {
+      const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
+      panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>' +
+        '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">再试一次</button></div>';
+      wsWire();
+    };
+    listenGrade(v[0], out => {
+      panel.dataset.wsbusy = "";
+      if(!panel.isConnected) return;
+      if(!out || !out.res){
+        /* v3.10 离线 ASR 兜底：单词判分零结果（sa-fail/no-response）且有录音时才接管本面板 */
+        if(out && asrZeroApplies(out)){
+          const asrScoredW = text => {
+            const scw = scoreFirst(v[0], [text]);
+            if(scw) wsShowScore({ text: scw.text, res: scw.res, url: out.url, recSilent: out.recSilent, offline: true });
+            else wsShowFail(out);
+          };
+          if(asrEngine().cached()){
+            panel.innerHTML = '<div class="ws-state">识别服务没给出结果，正在用离线识别打分…</div>' + ASR_PROG_HTML;
+            asrRunOffline(out, panel.querySelector("[data-asrprog]"), asrScoredW, () => wsShowFail(out));
+          } else {
+            panel.innerHTML = '<div class="ws-state">这次没识别出结果，可以用离线识别打分（在本机识别，不用联网）。</div>' +
+              '<div class="ws-row"><button class="btn blue small" data-wsasr type="button">用离线识别打分（首次下载约 55MB）</button>' +
+              '<button class="btn soft small" data-wsretry type="button">再试一次</button></div>' +
+              '<div data-asrprogwrap></div>' +
+              '<div class="mic-note" style="margin-top:8px;">' + esc(srErrText(out.err)) + '</div>';
+            wsWire();
+            const go = panel.querySelector("[data-wsasr]");
+            if(go) go.addEventListener("click", () => {
+              go.disabled = true; go.textContent = "正在准备离线识别…";
+              const wrap = panel.querySelector("[data-asrprogwrap]");
+              if(wrap) wrap.innerHTML = ASR_PROG_HTML;
+              asrRunOffline(out, wrap ? wrap.querySelector("[data-asrprog]") : null, asrScoredW, () => wsShowFail(out));
+            });
+          }
+          return;
+        }
+        wsShowFail(out);
+        return;
+      }
+      wsShowScore(out);
     }, { word: true, meterEl: panel.querySelector(".mic-meter") });
   };
   const demoFail = () => {
@@ -7703,11 +7886,40 @@ function drawRole(zone, ls){
                别只弹一句就让她对着空气再读 */
             const rz = zone.querySelector("#rpResult");
             if(rz){
-              rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div>' +
-                '<div style="margin-top:8px;"><button class="btn soft small" id="rpRetry" type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div></div>';
-              const rb3 = rz.querySelector("#rpRetry");
-              if(rb3) rb3.addEventListener("click", () => { const mb = zone.querySelector("#rpMic"); if(mb) mb.click(); });
-              wireCopyLink(rz);
+              const renderRpZero = () => {
+                rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div>' +
+                  '<div style="margin-top:8px;"><button class="btn soft small" id="rpRetry" type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div></div>';
+                const rb3 = rz.querySelector("#rpRetry");
+                if(rb3) rb3.addEventListener("click", () => { const mb = zone.querySelector("#rpMic"); if(mb) mb.click(); });
+                wireCopyLink(rz);
+              };
+              /* v3.10 离线 ASR 兜底：与发音页共用判分收口，零结果且有录音时顺带覆盖；出分走 rpAnswer 原口径 */
+              if(asrZeroApplies(out)){
+                const asrScoredR = text => {
+                  rpAnswer(zone, ls, text, out.url);
+                  const rz4 = zone.querySelector("#rpResult");
+                  if(rz4) rz4.insertAdjacentHTML("beforeend", '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>');
+                };
+                if(asrEngine().cached()){
+                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">识别服务没给出结果，正在用离线识别打分…</div>' + ASR_PROG_HTML + '</div>';
+                  asrRunOffline(out, rz.querySelector("[data-asrprog]"), asrScoredR, renderRpZero);
+                } else {
+                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">这次没识别出结果，可以用离线识别打分（在本机识别，不用联网）。</div>' +
+                    '<div style="margin-top:8px;"><button class="btn blue small" data-asrgo type="button">用离线识别打分（首次下载约 55MB）</button> <button class="btn soft small" id="rpRetry" type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div>' +
+                    '<div data-asrprogwrap></div>' +
+                    '<div class="mic-note" style="margin-top:8px;">' + esc(srErrText(out.err)) + '</div></div>';
+                  const rb3 = rz.querySelector("#rpRetry");
+                  if(rb3) rb3.addEventListener("click", () => { const mb = zone.querySelector("#rpMic"); if(mb) mb.click(); });
+                  wireCopyLink(rz);
+                  const go = rz.querySelector("[data-asrgo]");
+                  if(go) go.addEventListener("click", () => {
+                    go.disabled = true; go.textContent = "正在准备离线识别…";
+                    const wrap = rz.querySelector("[data-asrprogwrap]");
+                    if(wrap) wrap.innerHTML = ASR_PROG_HTML;
+                    asrRunOffline(out, wrap ? wrap.querySelector("[data-asrprog]") : null, asrScoredR, renderRpZero);
+                  });
+                }
+              } else renderRpZero();
             } else toast(srErrText(out.err));
           } else {
             toast(out.err === "unsupported" ? NO_SR_HINT + "请切换到打字模式。" : srErrText(out.err));
@@ -7967,12 +8179,43 @@ function pronCard(ls, i){
     checkBtn.textContent = "再练一次";
     if(out.url) showMine(out.url);
     if(!out.res){
-      const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
-      result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>' +
-        ((out.err === "no-response" || out.err === "sa-fail") ? '<div style="margin-top:8px;"><button class="btn soft small" data-retry2 type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div>' : '');
-      const rt2 = result.querySelector("[data-retry2]");
-      if(rt2) rt2.addEventListener("click", () => checkBtn.click());
-      wireCopyLink(result);
+      const renderZeroFail = () => {
+        const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
+        result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>' +
+          ((out.err === "no-response" || out.err === "sa-fail") ? '<div style="margin-top:8px;"><button class="btn soft small" data-retry2 type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div>' : '');
+        const rt9 = result.querySelector("[data-retry2]");
+        if(rt9) rt9.addEventListener("click", () => checkBtn.click());
+        wireCopyLink(result);
+      };
+      /* v3.10 离线 ASR 兜底：零结果（sa-fail/no-response）且有录音时才接管本卡 */
+      if(asrZeroApplies(out)){
+        const asrScored = text => {
+          const sc = scoreFirst(d[1], [text]);
+          if(sc) gradeOut({ text: sc.text, res: sc.res, url: out.url, retried: false, err: null, offline: true });
+          else renderZeroFail();
+        };
+        if(asrEngine().cached()){
+          result.innerHTML = '<div class="comment-line">识别服务没给出结果，正在用离线识别打分…</div>' + ASR_PROG_HTML;
+          asrRunOffline(out, result.querySelector("[data-asrprog]"), asrScored, renderZeroFail);
+        } else {
+          result.innerHTML = '<div class="comment-line">这次没识别出结果，可以用离线识别给这句打分（在本机识别，不用联网）。</div>' +
+            '<div style="margin-top:8px;"><button class="btn blue small" data-asrgo type="button">用离线识别打分（首次下载约 55MB）</button> <button class="btn soft small" data-retry2 type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div>' +
+            '<div data-asrprogwrap></div>' +
+            '<div class="mic-note" style="margin-top:8px;">' + esc(srErrText(out.err)) + '</div>';
+          const rt2 = result.querySelector("[data-retry2]");
+          if(rt2) rt2.addEventListener("click", () => checkBtn.click());
+          wireCopyLink(result);
+          const go = result.querySelector("[data-asrgo]");
+          if(go) go.addEventListener("click", () => {
+            go.disabled = true; go.textContent = "正在准备离线识别…";
+            const wrap = result.querySelector("[data-asrprogwrap]");
+            if(wrap) wrap.innerHTML = ASR_PROG_HTML;
+            asrRunOffline(out, wrap ? wrap.querySelector("[data-asrprog]") : null, asrScored, renderZeroFail);
+          });
+        }
+        return;
+      }
+      renderZeroFail();
       return;
     }
     const text = out.text, res = out.res;
@@ -7989,6 +8232,7 @@ function pronCard(ls, i){
       '<div class="corr-right en" style="margin-top:10px;">' + diffHTML(res) + '</div>' + extraHTML(res) + pointsHTML(res) +
       (out.typed ? '<div class="mic-note">这是打字纠错的结果：拼对不等于读准，有条件时用 Safari 打开、语音再读一遍。</div>' : !out.url ? '<div class="mic-note">这次没录上回放音频，想听自己的声音可以用🎙单独录一遍</div>' : '') +
       (out.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
+      (out.offline ? '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>' : '') +
       '<div class="comment-line"><b>点评：</b>' + esc(pronComment(res, d[1])) + '</div>' +
       '<div class="mic-note">红色词上面小字是识别到的你的读法；金色虚线是漏读的词；橙色是发音接近但还不准的词。这一句已算进今日发音进度。</div>' +
       '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn soft small" data-reread type="button">↻ 重读这句</button>' +
