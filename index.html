@@ -14,7 +14,7 @@
    让长缓存旧页面的手机（iOS Safari/主屏幕图标）自动换到新版。
    防循环：sessionStorage 键 english-app-verjump 记本次会话已为哪个目标版本跳过；
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610230022";
+var APP_BUILD = "v202610230734";
 (function () {
   try {
     if (!APP_BUILD || APP_BUILD === "__" + "BUILD__") return; /* 开发态/工件态不检查 */
@@ -1325,7 +1325,7 @@ figure.wfig{margin:0 0 8px;}
 
       <!-- VIEW: pronunciation -->
       <section id="view-pron" class="hidden">
-        <div id="srWarnPron" class="sr-warn-host" style="display:none;"></div>
+        <div id="asrSetupPron" class="asr-setup-host" style="display:none;"></div>
         <div class="hero"><div class="hero-kick">PRONUNCIATION</div><div class="hero-title">发音 · Pronunciation</div><p class="hero-sub">逐句跟读打分：读错标红、漏读标金，给 0–100 分和中文点评。</p></div>
         <div class="xsec" data-sec="p-today" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">今日发音<small>和「今日」页同一份清单</small></span><span class="xsec-count" id="cntPronToday"></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
           <div id="pronToday"></div>
@@ -4822,6 +4822,73 @@ function playRec(text, rate, speaker, onDone, onFail){
   }
   return true;
 }
+/* ---------- 单词示范固定序列（v3.11）：常速 1 遍 → 停 400ms → 慢速 1 遍 → 停 400ms → 慢速再 1 遍 ----------
+   单词卡主播放（点单词喇叭）与跟读打分前的示范步共用。全程走现有共享单通道（playFileOnce）。
+   常速遍的文件全灭＝整序失败（调用方走既有 demoFail：停步＋重新加载，绝不默默轮到她读）；
+   慢速遍直查单词 -ss 文件单通道播——不许走 playRec，它慢速失败会静默退回常速文件、序列里
+   会混进假慢速；-ss 缺失/失败＝跳过该遍继续下一遍，不中断整序。代次守卫：序列被别的播放
+   抢占（playSeq 变化）立即作废——playFileOnce 被抢占时不回调，靠轮询 playSeq 发现；
+   每一遍另有 9s 通道卡死看门狗，按失败处理，绝不吊死。 */
+const WORD_DEMO_GAP_MS = 400;
+let wordDemoGen = 0;
+function playWordDemo(text, opts){
+  opts = opts || {};
+  const gen = ++wordDemoGen;
+  ensureAudioData();
+  const file = AUDIO_MAP[text];
+  if(!file) return false;
+  const slowFile = file.replace(/\.mp3$/, "-ss.mp3");
+  stopRec();
+  if("speechSynthesis" in window){ try { speechSynthesis.cancel(); } catch(e){} }
+  clearTimeout(chunkTimer);
+  let finished = false, stepIdx = 0, gapTimer = null, wdTimer = null, pollTimer = null, gapSeq = null;
+  const clearT = () => { if(gapTimer){ clearTimeout(gapTimer); gapTimer = null; } if(wdTimer){ clearTimeout(wdTimer); wdTimer = null; } if(pollTimer){ clearInterval(pollTimer); pollTimer = null; } };
+  const end = ok => {
+    if(finished) return; finished = true; clearT();
+    if(gen !== wordDemoGen) return;
+    if(ok){ if(opts.onDone) opts.onDone(); }
+    else if(opts.onFail) opts.onFail();
+  };
+  const abort = () => {   /* 被别的播放抢占/被新序列取代：作废；打分示范步可经 onAbort 落到 demoFail（不静默） */
+    if(finished) return; finished = true; clearT();
+    if(gen === wordDemoGen && opts.onAbort) opts.onAbort();
+  };
+  const steps = [file, slowFile, slowFile];
+  const runStep = () => {
+    if(finished || gen !== wordDemoGen) return;
+    if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+    if(stepIdx >= steps.length){ end(true); return; }
+    const f = steps[stepIdx];
+    const hard = stepIdx === 0;
+    let stepDone = false, mySeq = 0;
+    const stepEnd = ok => {
+      if(stepDone || finished || gen !== wordDemoGen) return;
+      stepDone = true; clearT();
+      if(!ok && hard){ end(false); return; }
+      stepIdx++;
+      gapSeq = playSeq;   /* 间隔期守卫：400ms 间隔内若有别的播放/stopRec 动过共享通道（playSeq 变化），序列已作废——间隔到点不再出声；此前间隔期 pollTimer 已被清掉、无人检查，是作废盲区 */
+      gapTimer = setTimeout(() => {
+        if(finished || gen !== wordDemoGen) return;
+        if(playSeq !== gapSeq){ abort(); return; }
+        if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+        runStep();
+      }, WORD_DEMO_GAP_MS);
+      pollTimer = setInterval(() => {   /* 间隔期内继续轮询抢占，作废不必等间隔走完 */
+        if(finished) return;
+        if(gen !== wordDemoGen || playSeq !== gapSeq) abort();
+      }, 200);
+    };
+    playFileOnce(f, () => stepEnd(true), () => stepEnd(false));
+    mySeq = playSeq;
+    pollTimer = setInterval(() => {
+      if(stepDone || finished) return;
+      if(gen !== wordDemoGen || playSeq !== mySeq) abort();
+    }, 200);
+    wdTimer = setTimeout(() => { if(!stepDone && playSeq === mySeq) stepEnd(false); }, 9000);
+  };
+  runStep();
+  return true;
+}
 /* ---------- 逐词读：按词切分，逐个播单词的常速录音 + 词间停顿，卡拉OK式高亮 ---------- */
 function wbwParse(text){
   const segs = [];
@@ -5111,7 +5178,7 @@ function shadowRead(pairs, enRate, done){
   if(!list.length){ if(done) done(); return; }
   const rate = Math.min(1.1, Math.max(0.5, (typeof enRate === "number" ? enRate : 0.62) * (state.speed || 1)));
   SH = { pairs: list, rate: rate, idx: 0, loop: false, paused: false, done: done || null, gen: 0, stepIdx: 0, steps: [], phase: "", pending: null };
-  paintSrWarns();
+  refreshAsrSetup();
   shPlayCurrent();
 }
 function shStepsFor(p){
@@ -5500,6 +5567,7 @@ function diffSentence(target, saidRaw){
   const perToken = dispTokens.map((t, ti) => ({ disp: t, status: "ok", said: "" }));
   const extras = [], wrong = [];
   let okCount = 0, totalW = 0, earnedW = 0;
+  let capZero = false, capNear = false;   /* v3.12 封顶标记：实词（权重 2）错/漏、实词近音 */
   tFlat.forEach(tf => { totalW += wordWeight(tf.w); });
   ops.forEach(op => {
     if(op.type === "ins"){ extras.push(op.said); wrong.push({ w: op.said, type: "extra" }); return; }
@@ -5507,14 +5575,20 @@ function diffSentence(target, saidRaw){
     const pt = perToken[op.ti];
     if(rank[op.type] > rank[pt.status]){ pt.status = op.type; if(op.said) pt.said = op.said; }
     else if(op.said && !pt.said && op.type !== "ok") pt.said = op.said;
+    if(wgt >= 2 && (op.type === "sub" || op.type === "miss")) capZero = true;
+    if(wgt >= 2 && op.type === "near") capNear = true;
     if(op.type === "ok"){ okCount++; earnedW += wgt; if(op.said && op.said !== op.w && !pt.said) pt.said = op.said; }
-    else if(op.type === "near"){ earnedW += wgt / 2; wrong.push({ w: op.w, type: "near", said: op.said }); }
+    else if(op.type === "near"){ earnedW += wgt * 0.3; wrong.push({ w: op.w, type: "near", said: op.said }); }
     else if(op.type === "sub"){ wrong.push({ w: op.w, type: "wrong", said: op.said }); }
     else { wrong.push({ w: op.w, type: "miss" }); }
   });
   let score = Math.round(100 * earnedW / Math.max(1, totalW)) - extras.length * 4;
   score = Math.max(0, Math.min(100, score));
-  /* 扣分明细：多读词固定扣 4 分；其余扣分按「丢失权重」比例分给漏读/读错/近音（近音只丢一半权重）；
+  /* 苛刻封顶（v3.12，用户点名）：任一实词读错/漏读 → 整句封顶 59；任一实词近音 → 封顶 79。
+     功能词不触发封顶（漏一个 a/the 不至于不及格）。 */
+  if(capZero) score = Math.min(score, 59);
+  else if(capNear) score = Math.min(score, 79);
+  /* 扣分明细：多读词固定扣 4 分；其余扣分按「丢失权重」比例分给漏读/读错/近音（近音丢七成权重）；
      最后对账校正，保证 points 之和恰好等于 100 − score */
   const points = [];
   wrong.forEach(x => {
@@ -5525,7 +5599,7 @@ function diffSentence(target, saidRaw){
   });
   const restPts = (100 - score) - 4 * extras.length;
   const shares = points.filter(p => p.type !== "extra");
-  const lostOf = p => p.type === "near" ? wordWeight(p.w) / 2 : wordWeight(p.w);
+  const lostOf = p => p.type === "near" ? wordWeight(p.w) * 0.7 : wordWeight(p.w);
   const lostSum = shares.reduce((a, p) => a + lostOf(p), 0);
   if(shares.length && lostSum > 0){
     let assigned = 0;
@@ -5656,68 +5730,9 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
    （时好时坏、播放切录音后麦克风没声），与学习者「有时能打分、有时听不到」的间歇表现吻合；
    失败收尾要给针对性说法，不能笼统怪「没听清」 */
 const IS_STANDALONE = (() => { try { return navigator.standalone === true || !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches); } catch(e){ return false; } })();
-/* ---------- standalone 识别失败：持久标记 + 提前提醒 + 结果卡复制链接 ----------
-   v3.8 的 sa-fail 是读完整句才在结果卡里告诉她白读了；这里把提醒提前：
-   失败当下就往独立辅助键 english-srfail-v1 写时间戳（不进 state、不动 LS_KEY 数据），
-   下次打开出发音页 / 开始整课跟读时，先在页面顶部把话说在前面。 */
-const SRFAIL_KEY = "english-srfail-v1";
-let srFailedThisSession = false;
-let srWarnDismissed = false;
-function markSrFail(){
-  srFailedThisSession = true;
-  try { localStorage.setItem(SRFAIL_KEY, String(Date.now())); } catch(e){}
-  paintSrWarns();
-}
-function srFailMarked(){
-  if(srFailedThisSession) return true;
-  try { return !!localStorage.getItem(SRFAIL_KEY); } catch(e){ return false; }
-}
-function srWarnShouldShow(){
-  /* 只在 standalone 且确实失败过（本会话或留有标记）时提醒；Safari 标签页永不显示 */
-  return IS_STANDALONE && !srWarnDismissed && srFailMarked();
-}
-function paintSrWarns(){
-  document.querySelectorAll(".sr-warn-host").forEach(host => {
-    if(srWarnShouldShow()){
-      host.innerHTML = '<div class="mic-warn" style="margin:0;">桌面图标打开时跟读识别不稳定，上次就没识别成功——建议在 Safari 里打开链接练跟读。也可以用离线识别打分（首次需下载）。' +
-        '<button class="btn ghost small" data-srwarnok type="button" style="margin-left:8px;">知道了</button></div>';
-      host.style.display = "";
-      const b = host.querySelector("[data-srwarnok]");
-      if(b) b.addEventListener("click", () => { srWarnDismissed = true; paintSrWarns(); });
-    } else {
-      host.innerHTML = "";
-      host.style.display = "none";
-    }
-  });
-}
-/* sa-fail 结果卡的「复制链接」：复制不带 ?v= 的干净站点链接；
-   剪贴板 API 不可用/被拒时降级为把链接文本显示出来让她长按复制，绝不报错、绝不死按钮 */
-const COPY_LINK_HTML = ' <button class="btn ghost small" data-copylink type="button">复制链接</button>' +
-  '<div data-linkbox hidden style="margin-top:8px;word-break:break-all;-webkit-user-select:all;user-select:all;font-size:13.5px;"></div>';
-function wireCopyLink(scope){
-  if(!scope) return;
-  const b = scope.querySelector("[data-copylink]");
-  if(b) b.addEventListener("click", () => copySiteLink(b));
-}
-function copySiteLink(btn){
-  const link = location.origin + location.pathname;
-  const showLink = () => {
-    try {
-      const wrap = btn.parentElement;
-      const box = wrap && wrap.querySelector("[data-linkbox]");
-      if(box){ box.hidden = false; box.textContent = link; }
-      btn.textContent = "链接在下面，长按复制";
-    } catch(e){}
-  };
-  try {
-    if(navigator.clipboard && typeof navigator.clipboard.writeText === "function"){
-      navigator.clipboard.writeText(link).then(() => {
-        btn.textContent = "已复制，去 Safari 粘贴打开";
-        toast("已复制，去 Safari 粘贴打开");
-      }, showLink);
-    } else showLink();
-  } catch(e){ showLink(); }
-}
+/* ---------- （v3.12 删除）standalone 失败提前提醒条 + 结果卡复制链接 ----------
+   设置卡已当面说清离线组件的事，结果区不再出现 Safari 建议与复制链接；
+   english-srfail-v1 标记不再写入（她手机上已有的旧标记就此闲置，无害）。 */
 /* 全局麦克风会话管理：同一时间只允许一个识别/录音会话，避免 iOS 上抢麦克风报 audio-capture */
 let curRec = null;                 /* 当前 SpeechRecognition 实例 */
 let mrRecorder = null, mrChunks = [], mrStream = null;
@@ -5847,7 +5862,7 @@ function stopCapture(cb){
        并小字显示当前麦克风名称；只接现有流，绝不为此新开抢麦的流，没有 capture 流就不显示。
    (2) 录音结束解码算峰值，整段低于阈值＝录音里没有声音，结果区改给「选对麦克风」的明确提示。 */
 const MIC_HINT = "录音里没有声音——浏览器可能选了别的麦克风，去地址栏的麦克风图标或系统『声音 → 输入』里，选对你正在用的麦克风再试";
-const NO_SR_HINT = "这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）。点右上角 ···，选『在 Safari 中打开』，就能对着麦克风跟读了。";
+const NO_SR_HINT = "这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）。";
 const MIC_SILENT_PEAK = 0.02;   /* 峰值阈值：整段录音峰值低于满量程 2%（约 -34 dBFS）视为录音里没有声音 */
 let mrLastBlob = null;          /* 最近一段录音的 Blob（stopCapture 同步存下，供峰值检测） */
 function peakOfSamples(ch){
@@ -5950,25 +5965,41 @@ function meterStop(){
    识别的语言模型会把标准句作为候选「猜」出来，用户读得含糊也能被某个候选命中 → 虚高。
    新口径：只按识别自认最佳的第一候选（alts[0]）判分；其它候选不许整句替判。
    个别词被识别写成同音/近音词的，由 diffSentence 内部的同音/音素等价判定在第一候选上逐词救回。 */
-function scoreFirst(target, alts){
+function scoreFirst(target, alts, wordMode){
   if(!alts || !alts.length) return null;
-  return { text: alts[0], res: diffSentence(target, alts[0]) };
+  const res = diffSentence(target, alts[0]);
+  if(wordMode) strictWordRes(target, res);
+  return { text: alts[0], res };
+}
+/* 单词严判（v3.12，用户点名「再苛刻」）：单单词条目不按权重折算——转写与目标一致
+   （完全相同，或同音/音素全等：pairCost=0，真同音不罚）才 100；近音一律 35；
+   读错/漏读一律 0。多读的填充词（uh、the 之类识别噪声）不罚。
+   多词条目（如 post office）不套严判，走句子口径（含封顶）。 */
+function strictWordRes(target, res){
+  const tgt = String(target || "").trim();
+  if(!tgt || /\s/.test(tgt)) return res;
+  const bad = (res.wrong || []).filter(x => x.type !== "extra");
+  if(!bad.length){ res.score = 100; res.points = []; return res; }
+  const nearOnly = bad.every(x => x.type === "near");
+  res.score = nearOnly ? 35 : 0;
+  res.points = [{ type: nearOnly ? "near" : (bad[0].type === "miss" ? "miss" : "wrong"), w: tgt.toLowerCase(), said: bad[0].said || "", points: 100 - res.score }];
+  return res;
 }
 /* 识别错误 → 给用户看的中文提示（原始错误码绝不出现在界面上） */
 function srErrText(err){
   if(err === "unsupported")
     return NO_SR_HINT;
   if(err === "sa-fail")
-    return "桌面图标打开时，跟读识别不太稳定（这是苹果的已知问题，时好时坏）。请在 Safari 里打开这个链接练跟读——进度都存在这台手机里，不会丢。也可以先点『再试一次』。";
+    return "这次识别没出结果（苹果的识别服务没响应）。";
   if(err === "no-response")
-    return "麦克风录到了你的声音，但识别服务没给出结果——多半是这个浏览器里识别服务连不上。点『再试一次』；还不行就点右上角 ···，选『在 Safari 中打开』再练。";
+    return "麦克风录到了声音，但识别服务没给出结果。";
   if(err === "not-allowed" || err === "service-not-allowed")
     return "没有麦克风权限：弹出提示时请点『允许』；如果之前拒绝过，去 iPhone 设置 → Safari → 麦克风改成允许，再刷新页面";
   if(err === "timeout")
-    return "识别服务没反应——在 App 里打开的页面经常用不了语音识别，请用 Safari 打开这个链接再试跟读";
+    return "识别服务没反应，这次没出结果。";
   if(err === "no-speech" || err === "end")
     return "没听清你说什么，靠近麦克风、周围安静一点再试一次";
-  return "识别没成功，再试一次；一直不行就先用🎙把自己读的录下来回放着听";
+  return "识别没成功，再试一次。";
 }
 const SR_RETRYABLE = ["audio-capture", "network", "aborted", "end", "error", "start", "timeout"];
 /* 「我说完了」钩子：指向当前累积判分会话的立即收尾函数；无会话时为 null */
@@ -5977,7 +6008,7 @@ function endGradeNow(){ if(gradeDoneHook) gradeDoneHook(); }
 /* 句子判分（累积模式）：新手说得慢、句中停顿会被 iOS 识别当成说完而提前结束。
    本引擎打开 interimResults，识别因停顿自动结束时自动重启并把已确认的段拼起来，直到：
    (a) 用户点「我说完了」(endGradeNow)；(b) 最后一次出声后静默约 4 秒；(c) 整场硬上限 30 秒。
-   无事件看门狗沿用 v3 口径：onstart 不来 / 引擎挂死（零结果零错误）→ 先整场重启一次，再犯按 timeout 结算（Safari 提示）；
+   无事件看门狗沿用 v3 口径：onstart 不来 / 引擎挂死（零结果零错误）→ 先整场重启一次，再犯按 timeout 结算（事实提示）；
    引擎活着但用户全程没出声（反复 no-speech）→ 按 no-speech 结算。全程与 gradeSeq / releaseMic 兼容：
    只有开场调一次 releaseMic，段间重启只换识别实例、不碰录音（MediaRecorder 整场连续录）。 */
 function listenGradeAccum(target, cb, opts){
@@ -6019,7 +6050,7 @@ function listenGradeAccum(target, cb, opts){
         /* 整场零结果的收尾口径：iOS 独立模式（桌面图标打开）下识别失败是系统不稳，
            给针对性说法；其它环境里录音明明有声、识别却零结果＝识别服务没响应。
            两种都不许再笼统说「没听清」 */
-        if(!out.res && IS_STANDALONE && (out.err === "no-speech" || out.err === "timeout" || out.err === "end")){ out.err = "sa-fail"; markSrFail(); }
+        if(!out.res && IS_STANDALONE && (out.err === "no-speech" || out.err === "timeout" || out.err === "end")){ out.err = "sa-fail"; }
         else if(out.err === "no-speech" && pk !== null && !out.recSilent) out.err = "no-response";
         cb(out);
       });
@@ -6162,9 +6193,13 @@ function listenGrade(target, cb, opts){
     if(settled) return; settled = true;
     out.recPeak = lastPeak; out.recSilent = recSilentOf(lastPeak);
     out.blob = recBlob || null;   /* v3.10：本场录音留给离线 ASR 兜底用 */
-    /* 与累积路径同一口径：零结果时，独立模式→sa-fail，录音有声→no-response，都不说「没听清」 */
-    if(!out.res && (out.err === "no-speech" || out.err === "end" || out.err === "timeout")){
-      if(IS_STANDALONE){ out.err = "sa-fail"; markSrFail(); }
+    /* 零结果收尾口径（v3.11 扩展，与累积路径同口径）：凡是没出结果的收尾——没听清/end/
+       超时（SR 整场零事件靠 listenOnce 看门狗按 timeout 结算）/start() 同步抛错/
+       service-not-allowed/网络/音频设备/被掐断——都进同一口径：独立模式→sa-fail、
+       录音有声→no-response，让离线兜底入口必然出现，不许静默回 idle。
+       not-allowed（麦克风权限）与 unsupported 有专门文案，不在此列。 */
+    if(!out.res && ["no-speech", "end", "timeout", "start", "service-not-allowed", "audio-capture", "network", "error", "aborted"].indexOf(out.err) >= 0){
+      if(IS_STANDALONE){ out.err = "sa-fail"; }
       else if(lastPeak !== null && !out.recSilent) out.err = "no-response";
     }
     meterStop(); cb(out);
@@ -6172,16 +6207,95 @@ function listenGrade(target, cb, opts){
   let firstUrl = null;
   let recBlob = null;
   meterStart(opts.meterEl);
+  /* ---- 单词路径自有录音留存（v3.11）----
+     旧法把录音挂在 SR 的 onstart 上（onstart 后 200ms 才 startCapture）：真机上 SR 整场
+     零事件、或 start() 同步抛错时，onstart 根本不来，录音永远起不来，v3.10 的离线兜底
+     在单词路径实际上接不上（冒烟的 SR mock 都会回 onstart，掩盖了这一点）；且结算时
+     stopCapture 的 onstop 在 iOS 独立模式下可能永不触发，measureBlobPeak 的回调链
+     就此断裂，面板永远停在「听着呢」——没分数、没报错、没下文。
+     改为本路径自带 MediaRecorder（与发音 accum 同口径：录音与识别并行、互不干扰；
+     400ms 抢麦隔离不破坏——启动时机对齐识别启动：示范后会话间隔 playSettleWait()+150ms，
+     不依赖 onstart）。自持 stream/recorder/chunks 引用：停录有 1.4s onstop 看门狗，
+     不来就直接从 chunks 拼 Blob 并强制停流；整场结算另有 3.5s 绝对兜底。 */
+  let wStream = null, wRec = null, wChunks = [], wBlob = null, wUrl = null;
+  let capState = 0;             /* 0 未启动 1 等 getUserMedia 2 录音中 3 已收尾 */
+  let capStartAt = 0, capStopWanted = false, capStopCb = null, capDoneFlag = false;
+  let capTimer = null, capGraceTimer = null, capBackstop = null, capStopWd = null;
+  const capClearTimers = () => { if(capTimer){ clearTimeout(capTimer); capTimer = null; } if(capGraceTimer){ clearTimeout(capGraceTimer); capGraceTimer = null; } if(capBackstop){ clearTimeout(capBackstop); capBackstop = null; } if(capStopWd){ clearTimeout(capStopWd); capStopWd = null; } };
+  const capKillStream = () => {
+    const st = wStream; wStream = null;
+    if(st){ if(meterStreamOverride === st) meterStreamOverride = null; st.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); }
+  };
+  const capFinish = url => {
+    if(capDoneFlag) return; capDoneFlag = true;
+    capState = 3;
+    capClearTimers();
+    if(capStopCb){ const f = capStopCb; capStopCb = null; f(url); }
+  };
+  const capHarvest = () => {   /* onstop 不来/getUserMedia 吊死时：用已录 chunks 直接拼 Blob 收尾 */
+    try {
+      if(wRec){ try { wRec.onstop = null; } catch(e){} try { wRec.stop(); } catch(e){} wRec = null; }
+      capKillStream();
+      if(!wBlob && wChunks.length){ wBlob = new Blob(wChunks, { type: wChunks[0].type || "audio/webm" }); wUrl = URL.createObjectURL(wBlob); }
+    } catch(e){}
+    capFinish(wUrl);
+  };
+  const capDoStop = () => {
+    if(capState === 3){ capFinish(wUrl); return; }
+    if(capState !== 2 || !wRec){ capHarvest(); return; }
+    const rec = wRec;
+    capStopWd = setTimeout(capHarvest, 1400);   /* onstop 看门狗：1.4s 不来就拼 Blob 收尾 */
+    rec.onstop = () => {
+      capKillStream();
+      if(wChunks.length){ wBlob = new Blob(wChunks, { type: wChunks[0].type || "audio/webm" }); wUrl = URL.createObjectURL(wBlob); }
+      wRec = null;
+      capFinish(wUrl);
+    };
+    try { rec.stop(); } catch(e){ capHarvest(); }
+  };
+  const capStart = () => {
+    if(capState !== 0) return;
+    capState = 1;
+    if(!navigator.mediaDevices || !window.MediaRecorder){ capState = 3; capFinish(null); return; }
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      if(seq !== gradeSeq){ stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); if(capState === 1){ capState = 3; capFinish(null); } return; }
+      wStream = stream; wChunks = [];
+      meterStreamOverride = stream;   /* 音量条接本路径自有流（与 SH 监视流同一机制），停录时清 */
+      try { wRec = new MediaRecorder(stream); } catch(e){ capState = 3; capKillStream(); capFinish(null); return; }
+      wRec.ondataavailable = e => { if(e.data && e.data.size) wChunks.push(e.data); };
+      capState = 2; capStartAt = Date.now();
+      try { wRec.start(); } catch(e){}
+      if(capStopWanted) capGraceTimer = setTimeout(capDoStop, 900);   /* 识别已先收尾：给她约 900ms 把这个词说完 */
+    }).catch(() => { if(capState === 1) capState = 3; capFinish(null); });
+  };
+  /* 结算停录：录音中→停（录入不足约 600ms 时补足，防 SR 瞬死时她的话没录进来）；
+     还没启动→立刻启动（随后按 capStopWanted 给约 900ms 说话窗口）；全程有 3.5s 绝对兜底 */
+  const stopWordCapture = cb2 => {
+    if(capDoneFlag){ cb2(wUrl); return; }
+    capStopCb = cb2; capStopWanted = true;
+    if(!capBackstop) capBackstop = setTimeout(capHarvest, 3500);
+    if(capState === 2){
+      const el = Date.now() - capStartAt;
+      if(el >= 600) capDoStop(); else if(!capGraceTimer) capGraceTimer = setTimeout(capDoStop, 600 - el);
+    } else if(capState === 0){
+      if(capTimer){ clearTimeout(capTimer); capTimer = null; }
+      capStart();
+    } else if(capState === 3){ capFinish(wUrl); }
+    /* capState===1：getUserMedia 在途，落地后 capStart 内按 capStopWanted 给窗口 */
+  };
   const attempt = (withRec, isRetry) => {
     if(seq !== gradeSeq || settled) return;
-    let capTimer = null;
+    if(withRec){
+      const wait = playSettleWait();   /* 与 listenOnce 内部同值：示范刚结束先让音频会话切回录音，再并行起录音与识别 */
+      capTimer = setTimeout(() => { if(seq === gradeSeq && !settled) capStart(); }, wait + 150);
+    }
     listenOnce((alts, err) => {
-      if(seq !== gradeSeq) return;
       if(capTimer){ clearTimeout(capTimer); capTimer = null; }
+      if(seq !== gradeSeq){ stopWordCapture(() => {}); return; }   /* 会话已被取代：录音也要收尾，不许留孤儿 */
       const proceed = () => {
         if(seq !== gradeSeq || settled) return;
         if(alts && alts.length){
-          const best = scoreFirst(target, alts);
+          const best = scoreFirst(target, alts, !!(opts && opts.word));
           if(best){ done({ text: best.text, res: best.res, url: firstUrl, retried: isRetry, err: null }); return; }
         }
         const e2 = err || "end";
@@ -6192,25 +6306,23 @@ function listenGrade(target, cb, opts){
         }
         done({ text: null, res: null, url: firstUrl, retried: isRetry, err: e2 });
       };
-      if(withRec) stopCapture(url => { if(url) firstUrl = url; recBlob = mrLastBlob || null; measureBlobPeak(mrLastBlob, pk => { lastPeak = pk; proceed(); }); });
+      if(withRec) stopWordCapture(url => { if(url) firstUrl = url; recBlob = wBlob || null; measureBlobPeak(wBlob, pk => { lastPeak = pk; proceed(); }); });
       else proceed();
-    }, { maxMs: maxMs, onStart: () => {
-      if(withRec && seq === gradeSeq && !settled)
-        capTimer = setTimeout(() => { if(seq === gradeSeq && !settled) startCapture(); }, 200);
-    }});
+    }, { maxMs: maxMs });
   };
   attempt(true, false);
 }
+
 /* 取消进行中的判分会话：序号递增让迟到的回调全部作废，再彻底释放麦克风（「聆听中再点一次＝取消」用） */
 function cancelGrade(){ gradeSeq++; gradeDoneHook = null; meterStop(); releaseMic(); }
 /* ---------- 离线 ASR 兜底打分（v3.10） ----------
    触发口径只有一条：一次判分以整场零结果收场（sa-fail / no-response）且这次有录音时，
    才提供离线识别。做法：把那段录音在本机用 whisper-tiny（多语 q8，transformers.js）转成
-   文字，再喂现有 scoreFirst 原口径判分——判分逻辑一字不改。模型+运行时约 55MB，首次必须
-   由用户点按钮触发下载（库的 progress 回调驱动进度条），下载完自动转写刚才那段录音；
-   下载过（打了标记）则零结果时直接自动转写。转写为空/失败/引擎坏掉，一律回落到既有
-   失败卡（再试一次/打字纠错），绝不假打分、绝不卡死。原生识别正常出结果时，本段代码
-   零调用、零下载、零预载。引擎可经 window.__ASR_ENGINE 注入（冒烟用），与 __SR_TIMING /
+   文字，再喂 scoreFirst 判分。模型+运行时约 55MB；v3.12 起下载改由一次性设置卡
+   触发（见 asrDownloadModel），打分流内不再询问、不再给按钮让她选：零结果时已下载
+   就直接自动转写出分，没下载只留一行事实提示。转写为空/失败/引擎坏掉，一律回落
+   事实提示，绝不假打分、绝不卡死。原生识别正常出结果时，句子路径本段零调用；
+   单词路径仅在已下载时做双验复核（asrVerifyWord）。引擎可经 window.__ASR_ENGINE 注入（冒烟用），与 __SR_TIMING /
    __REC_PEAK 同一种注入口径；生产不设该变量。资产在站点 asr/ 目录，坏掉不拖垮主 App。 */
 const ASR_FLAG_KEY = "english-asr-v1";
 const ASR_BASE = (() => { try { return new URL("asr/", document.baseURI).href; } catch(e){ return "asr/"; } })();
@@ -6330,6 +6442,82 @@ const realAsrEngine = {
 };
 function asrEngine(){
   return (typeof window !== "undefined" && window.__ASR_ENGINE) || realAsrEngine;
+}
+/* ---------- v3.12：一次性离线组件设置卡 + 单词双验 ----------
+   口径（用户定）：打分只许一条直线——读完→原生出分；原生零结果→已下载就自动离线
+   出分、没下载就只留一行事实提示，全程不出现让她做选择的面板。下载从失败流里摘
+   出来做成设置卡：发音页顶部、对话页顶部、单词打分面板上方各一份（未下载常驻、
+   下载完永久消失，全站同步刷新）。 */
+const ASR_SETUP_HTML = '<div class="card" data-asrsetup style="border:1.5px solid #c2a14d;background:rgba(194,161,77,.08);">' +
+  '<div style="font-weight:700;">跟读打分，先装一个离线组件（只装一次）</div>' +
+  '<div style="margin-top:4px;">跟读打分先下载一个离线组件（约 55MB，只下一次），之后读完直接出分，不依赖苹果的识别。</div>' +
+  '<div style="margin-top:8px;"><button class="btn blue small" data-asrdl type="button">下载离线组件（约 55MB）</button></div>' +
+  ASR_PROG_HTML + '</div>';
+function asrSetupNeeded(){ try { return !asrEngine().cached(); } catch(e){ return false; } }
+function paintAsrSetup(host){
+  if(!host) return;
+  if(!asrSetupNeeded()){ host.innerHTML = ""; host.style.display = "none"; return; }
+  host.style.display = "";
+  host.innerHTML = ASR_SETUP_HTML;
+  const b = host.querySelector("[data-asrdl]");
+  if(b) b.addEventListener("click", () => asrSetupDownload(host));
+}
+function refreshAsrSetup(){ document.querySelectorAll(".asr-setup-host").forEach(h => paintAsrSetup(h)); }
+function asrSetupDownload(host){
+  const btn = host.querySelector("[data-asrdl]");
+  if(btn){ btn.disabled = true; btn.textContent = "正在下载…"; }
+  const progEl = host.querySelector("[data-asrprog]");
+  asrDownloadModel(pct => {
+    if(!progEl) return;
+    progEl.hidden = false;
+    const bar = progEl.querySelector("i"), tx = progEl.querySelector("[data-asrpt]");
+    if(bar) bar.style.width = pct + "%";
+    if(tx) tx.textContent = pct >= 100 ? "下载完成" : "正在下载离线组件… " + pct + "%";
+  }, ok => {
+    if(ok){ refreshAsrSetup(); toast("离线组件下载完成，读完直接出分"); }
+    else if(btn){ btn.disabled = false; btn.textContent = "下载没成功，点这里重试"; }
+  });
+}
+/* 只下载模型、不转写：注入引擎（冒烟）可自备 download(prog, cb)；生产走 Worker 的
+   preload 消息（模型进缓存、进度走同一条 progress 通道），Worker 不可用退主线程加载 */
+function asrDownloadModel(prog, cb){
+  let finished = false;
+  const finish = ok => { if(finished) return; finished = true; asrProgSink = null; cb(!!ok); };
+  const eng = asrEngine();
+  if(eng !== realAsrEngine && eng && typeof eng.download === "function"){
+    try { eng.download(prog, finish); } catch(e){ finish(false); }
+    return;
+  }
+  asrProgSink = prog || null;
+  (async () => {
+    if(!asrWorkerDead){
+      const r = await asrWorkerCall({ type: "preload" });
+      if(r && r.type === "loaded"){ asrMarkCached(); finish(true); return; }
+      asrWorkerDead = true;
+      if(asrWorker){ const wk = asrWorker; asrWorker = null; try { wk.terminate(); } catch(e){} }
+    }
+    try { await asrMainLoad(); asrEmitProg(100); asrMarkCached(); finish(true); }
+    catch(e){ finish(false); }
+  })();
+}
+/* 单词双验（v3.12，仅单词打分、仅模型已下载时）：原生 SR 出了分，也把这场录音喂离线
+   引擎复核，两个转写分别严判、取低者——堵识别引擎把含糊发音「猜」成正确词。
+   离线转写为空＝引擎没听出任何词，按 0 分裁决参与取低；引擎坏掉/超时＝复核不可用，
+   不拦原生分。重试轮（retried）的录音与转写不是同一轮，不做双验。 */
+function asrVerifyWord(target, out, cb){
+  let finished = false;
+  const finish = o => { if(finished) return; finished = true; cb(o); };
+  const wd = setTimeout(() => finish(out), 25000);
+  try {
+    asrEngine().transcribe(out.blob, null, text => {
+      clearTimeout(wd);
+      if(text === null || text === undefined){ finish(out); return; }
+      const sc = scoreFirst(target, [text], true);
+      if(sc && sc.res.score < out.res.score)
+        finish({ text: sc.text, res: sc.res, url: out.url, recSilent: out.recSilent, offline: true });
+      else finish(out);
+    });
+  } catch(e){ clearTimeout(wd); finish(out); }
 }
 /* 跑一次离线转写：progEl 是 ASR_PROG_HTML 的根元素（可为 null）；成功 onText(文字)，失败/空 onFail() */
 function asrRunOffline(out, progEl, onText, onFail){
@@ -6829,8 +7017,16 @@ function startWordScore(host, v, uid){
   }
   stopWordInline();
   panel.hidden = false;
+  let wsSetupHost = host.querySelector(".asr-setup-host");
+  if(!wsSetupHost){
+    wsSetupHost = document.createElement("div");
+    wsSetupHost.className = "asr-setup-host";
+    wsSetupHost.style.display = "none";
+    if(panel.parentNode) panel.parentNode.insertBefore(wsSetupHost, panel);
+  }
+  paintAsrSetup(wsSetupHost);
   if(!SR){
-    panel.innerHTML = '<div class="ws-state">这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的），没法自动打分。<br>想用语音打分：点右上角 ···，选『在 Safari 中打开』再回来。<br>现在可以点单词听原音，自己大声跟读几遍。</div>';
+    panel.innerHTML = '<div class="ws-state">这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的），没法自动打分。<br>现在可以点单词听原音，自己大声跟读几遍。</div>';
     return;
   }
   panel.dataset.wsbusy = "1";
@@ -6846,7 +7042,7 @@ function startWordScore(host, v, uid){
       const rt = panel.querySelector("[data-wsretry]");
       if(rt) rt.addEventListener("click", () => startWordScore(host, v, uid));
       const og = panel.querySelector("[data-wsorig]");
-      if(og) og.addEventListener("click", () => speak(v[0], 1));
+      if(og) og.addEventListener("click", () => { if(!playWordDemo(v[0])) speak(v[0], 1); });
     };
     const wsShowScore = out2 => {
       const sc = out2.res.score;
@@ -6863,8 +7059,7 @@ function startWordScore(host, v, uid){
     };
     const wsShowFail = out => {
       const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
-      panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>' +
-        '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">再试一次</button></div>';
+      panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>';
       wsWire();
     };
     listenGrade(v[0], out => {
@@ -6874,31 +7069,25 @@ function startWordScore(host, v, uid){
         /* v3.10 离线 ASR 兜底：单词判分零结果（sa-fail/no-response）且有录音时才接管本面板 */
         if(out && asrZeroApplies(out)){
           const asrScoredW = text => {
-            const scw = scoreFirst(v[0], [text]);
+            const scw = scoreFirst(v[0], [text], true);
             if(scw) wsShowScore({ text: scw.text, res: scw.res, url: out.url, recSilent: out.recSilent, offline: true });
             else wsShowFail(out);
           };
           if(asrEngine().cached()){
-            panel.innerHTML = '<div class="ws-state">识别服务没给出结果，正在用离线识别打分…</div>' + ASR_PROG_HTML;
+            panel.innerHTML = '<div class="ws-state">离线识别中…</div>' + ASR_PROG_HTML;
             asrRunOffline(out, panel.querySelector("[data-asrprog]"), asrScoredW, () => wsShowFail(out));
           } else {
-            panel.innerHTML = '<div class="ws-state">这次没识别出结果，可以用离线识别打分（在本机识别，不用联网）。</div>' +
-              '<div class="ws-row"><button class="btn blue small" data-wsasr type="button">用离线识别打分（首次下载约 55MB）</button>' +
-              '<button class="btn soft small" data-wsretry type="button">再试一次</button></div>' +
-              '<div data-asrprogwrap></div>' +
-              '<div class="mic-note" style="margin-top:8px;">' + esc(srErrText(out.err)) + '</div>';
-            wsWire();
-            const go = panel.querySelector("[data-wsasr]");
-            if(go) go.addEventListener("click", () => {
-              go.disabled = true; go.textContent = "正在准备离线识别…";
-              const wrap = panel.querySelector("[data-asrprogwrap]");
-              if(wrap) wrap.innerHTML = ASR_PROG_HTML;
-              asrRunOffline(out, wrap ? wrap.querySelector("[data-asrprog]") : null, asrScoredW, () => wsShowFail(out));
-            });
+            panel.innerHTML = '<div class="ws-state">先完成上面的离线组件下载，就能打分了。</div>';
           }
           return;
         }
         wsShowFail(out);
+        return;
+      }
+      /* 原生出分 + 模型已下载 + 有本场录音：离线双验复核，取低者（堵引擎猜词） */
+      if(out && out.blob && !out.retried && asrEngine().cached()){
+        panel.innerHTML = '<div class="ws-state">复核中…</div>';
+        asrVerifyWord(v[0], out, fin => { if(panel._wsTok === wsTok && panel.isConnected) wsShowScore(fin); });
         return;
       }
       wsShowScore(out);
@@ -6916,7 +7105,7 @@ function startWordScore(host, v, uid){
     if(sk) sk.addEventListener("click", () => begin());
   };
   let ok = false;
-  try { ok = playRec(v[0], 1, null, begin, demoFail); } catch(e){ ok = false; }
+  try { ok = playWordDemo(v[0], { onDone: begin, onFail: demoFail, onAbort: demoFail }); } catch(e){ ok = false; }
   if(!ok) demoFail();
 }
 /* ---- 单词视频：全屏 VL 播放器，只装一个词的瘦身干货流程 ---- */
@@ -7026,7 +7215,7 @@ function wireFlash(host, v, id, refresh){
   if(f) f.addEventListener("click", e => { if(e.target.closest("button, input, [data-bhrow], [data-wscore]")) return; f.classList.toggle("flipped"); });
   wireBaihua(host, id, v[1], refresh);
   const sw = host.querySelector("[data-speakword]");
-  if(sw) sw.addEventListener("click", () => speak(v[0], 1));
+  if(sw) sw.addEventListener("click", () => { if(!playWordDemo(v[0])) speak(v[0], 1); });
   const se = host.querySelector("[data-speakeex]");
   if(se) se.addEventListener("click", () => speak(v[3], 0.92));
   const wvb = host.querySelector("[data-wvvideo]");
@@ -7708,7 +7897,7 @@ function renderDlgBrowse(){
       '</div>' +
       '<div class="ctl-prog"><i id="ctlBar" style="width:0%"></i></div>' +
       '<div class="ctl-info" id="ctlInfo">点「整段跟读」开始；播放中点任意一句，可直接跳到那句跟读。</div>' +
-      '<div id="ctlSrWarn" class="sr-warn-host" style="display:none;margin-top:8px;"></div>' +
+      '<div id="ctlAsrSetup" class="asr-setup-host" style="display:none;margin-top:8px;"></div>' +
       '<div id="ctlFail" style="display:none;margin-top:8px;"></div>' +
       '<div class="mic-meter" id="ctlMeter"></div>' +
     '</div>' +
@@ -7723,6 +7912,7 @@ function renderDlgBrowse(){
       '<div class="avatar">' + d[0] + '</div>' +
       '<button class="dlg-bubble" data-line="' + i + '"><span class="en">' + esc(d[1]) + '</span><span class="cn dlg-cn">' + esc(d[2]) + '</span></button></div>'
     ).join("") + '</div>';
+  refreshAsrSetup();
   const dvb = host.querySelector('#dlgVideo');
   if(dvb) dvb.addEventListener('click', () => openDlgVideo(ls.id));
   preloadFiles(lessonAudioFiles(ls));
@@ -7887,11 +8077,7 @@ function drawRole(zone, ls){
             const rz = zone.querySelector("#rpResult");
             if(rz){
               const renderRpZero = () => {
-                rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div>' +
-                  '<div style="margin-top:8px;"><button class="btn soft small" id="rpRetry" type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div></div>';
-                const rb3 = rz.querySelector("#rpRetry");
-                if(rb3) rb3.addEventListener("click", () => { const mb = zone.querySelector("#rpMic"); if(mb) mb.click(); });
-                wireCopyLink(rz);
+                rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div></div>';
               };
               /* v3.10 离线 ASR 兜底：与发音页共用判分收口，零结果且有录音时顺带覆盖；出分走 rpAnswer 原口径 */
               if(asrZeroApplies(out)){
@@ -7901,23 +8087,10 @@ function drawRole(zone, ls){
                   if(rz4) rz4.insertAdjacentHTML("beforeend", '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>');
                 };
                 if(asrEngine().cached()){
-                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">识别服务没给出结果，正在用离线识别打分…</div>' + ASR_PROG_HTML + '</div>';
+                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">离线识别中…</div>' + ASR_PROG_HTML + '</div>';
                   asrRunOffline(out, rz.querySelector("[data-asrprog]"), asrScoredR, renderRpZero);
                 } else {
-                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">这次没识别出结果，可以用离线识别打分（在本机识别，不用联网）。</div>' +
-                    '<div style="margin-top:8px;"><button class="btn blue small" data-asrgo type="button">用离线识别打分（首次下载约 55MB）</button> <button class="btn soft small" id="rpRetry" type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div>' +
-                    '<div data-asrprogwrap></div>' +
-                    '<div class="mic-note" style="margin-top:8px;">' + esc(srErrText(out.err)) + '</div></div>';
-                  const rb3 = rz.querySelector("#rpRetry");
-                  if(rb3) rb3.addEventListener("click", () => { const mb = zone.querySelector("#rpMic"); if(mb) mb.click(); });
-                  wireCopyLink(rz);
-                  const go = rz.querySelector("[data-asrgo]");
-                  if(go) go.addEventListener("click", () => {
-                    go.disabled = true; go.textContent = "正在准备离线识别…";
-                    const wrap = rz.querySelector("[data-asrprogwrap]");
-                    if(wrap) wrap.innerHTML = ASR_PROG_HTML;
-                    asrRunOffline(out, wrap ? wrap.querySelector("[data-asrprog]") : null, asrScoredR, renderRpZero);
-                  });
+                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">先完成上面的离线组件下载，就能打分了。</div></div>';
                 }
               } else renderRpZero();
             } else toast(srErrText(out.err));
@@ -8065,7 +8238,7 @@ function renderVoiceCard(){
     speak("Hello! Let's practise English together, one sentence at a time.", 0.98));
 }
 function renderPron(){
-  paintSrWarns();
+  refreshAsrSetup();
   renderVoiceCard();
   renderPronToday();
   renderPronBrowse();
@@ -8078,7 +8251,7 @@ function renderPronToday(){
   const cnt = $("#cntPronToday");
   if(cnt) cnt.textContent = "已练 " + pp.c.pron.done + " / " + pp.c.pron.total;
   host.innerHTML = '<p class="sec-sub">今天要跟读打分的句子，练完一句，今日进度就记一句。' +
-    (SR ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）。点右上角 ···，选『在 Safari 中打开』就能语音打分；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
+    (SR ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
   let focusEl = null;
   pp.plan.pron.forEach(lid => {
     const x = ALL_LINES.find(y => y.lid === lid); if(!x) return;
@@ -8098,7 +8271,7 @@ function renderPronBrowse(){
   const ls = LESSON_MAP[sel.pron];
   const host = $("#pronMain");
   host.innerHTML = '<p class="sec-sub">《' + esc(ls.t) + '》的对话句子，逐句跟读打分。' +
-    (SR ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）。点右上角 ···，选『在 Safari 中打开』就能语音打分；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
+    (SR ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
   const pvWrap = document.createElement('div');
   pvWrap.style.margin = '0 0 10px';
   pvWrap.innerHTML = '<button class="btn main small" id="pronVideo">▶ 上这一课的视频课</button> <span class="mic-note" style="margin:0;">先看视频跟读，再回来逐句打分</span>';
@@ -8181,11 +8354,7 @@ function pronCard(ls, i){
     if(!out.res){
       const renderZeroFail = () => {
         const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
-        result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>' +
-          ((out.err === "no-response" || out.err === "sa-fail") ? '<div style="margin-top:8px;"><button class="btn soft small" data-retry2 type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div>' : '');
-        const rt9 = result.querySelector("[data-retry2]");
-        if(rt9) rt9.addEventListener("click", () => checkBtn.click());
-        wireCopyLink(result);
+        result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>';
       };
       /* v3.10 离线 ASR 兜底：零结果（sa-fail/no-response）且有录音时才接管本卡 */
       if(asrZeroApplies(out)){
@@ -8195,23 +8364,10 @@ function pronCard(ls, i){
           else renderZeroFail();
         };
         if(asrEngine().cached()){
-          result.innerHTML = '<div class="comment-line">识别服务没给出结果，正在用离线识别打分…</div>' + ASR_PROG_HTML;
+          result.innerHTML = '<div class="comment-line">离线识别中…</div>' + ASR_PROG_HTML;
           asrRunOffline(out, result.querySelector("[data-asrprog]"), asrScored, renderZeroFail);
         } else {
-          result.innerHTML = '<div class="comment-line">这次没识别出结果，可以用离线识别给这句打分（在本机识别，不用联网）。</div>' +
-            '<div style="margin-top:8px;"><button class="btn blue small" data-asrgo type="button">用离线识别打分（首次下载约 55MB）</button> <button class="btn soft small" data-retry2 type="button">再试一次</button>' + (out.err === "sa-fail" ? COPY_LINK_HTML : '') + '</div>' +
-            '<div data-asrprogwrap></div>' +
-            '<div class="mic-note" style="margin-top:8px;">' + esc(srErrText(out.err)) + '</div>';
-          const rt2 = result.querySelector("[data-retry2]");
-          if(rt2) rt2.addEventListener("click", () => checkBtn.click());
-          wireCopyLink(result);
-          const go = result.querySelector("[data-asrgo]");
-          if(go) go.addEventListener("click", () => {
-            go.disabled = true; go.textContent = "正在准备离线识别…";
-            const wrap = result.querySelector("[data-asrprogwrap]");
-            if(wrap) wrap.innerHTML = ASR_PROG_HTML;
-            asrRunOffline(out, wrap ? wrap.querySelector("[data-asrprog]") : null, asrScored, renderZeroFail);
-          });
+          result.innerHTML = '<div class="comment-line">先完成上面的离线组件下载，就能打分了。</div>';
         }
         return;
       }
@@ -8230,7 +8386,7 @@ function pronCard(ls, i){
       '<div class="pron-head" style="margin-top:12px;"><div class="score-big ' + (res.score >= 85 ? "good" : res.score >= 60 ? "mid" : "low") + '">' + res.score + '</div>' +
       '<div class="ph-txt"><div style="font-weight:700;">发音得分 / 100</div><div style="font-size:12.5px;color:var(--ink-faint);">识别到你读的是：<span class="en">' + esc(text) + '</span></div></div></div>' +
       '<div class="corr-right en" style="margin-top:10px;">' + diffHTML(res) + '</div>' + extraHTML(res) + pointsHTML(res) +
-      (out.typed ? '<div class="mic-note">这是打字纠错的结果：拼对不等于读准，有条件时用 Safari 打开、语音再读一遍。</div>' : !out.url ? '<div class="mic-note">这次没录上回放音频，想听自己的声音可以用🎙单独录一遍</div>' : '') +
+      (out.typed ? '<div class="mic-note">这是打字纠错的结果：拼对不等于读准，有条件时再用语音读一遍。</div>' : !out.url ? '<div class="mic-note">这次没录上回放音频，想听自己的声音可以用🎙单独录一遍</div>' : '') +
       (out.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
       (out.offline ? '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>' : '') +
       '<div class="comment-line"><b>点评：</b>' + esc(pronComment(res, d[1])) + '</div>' +
@@ -8250,7 +8406,7 @@ function pronCard(ls, i){
          不再只弹一句提示就没了下文，更不能装作「没听清」让她对着空气读 */
       result.innerHTML =
         '<div class="mic-warn" style="margin-top:10px;">' + NO_SR_HINT + '</div>' +
-        '<div class="mic-note">现在可以打字完成这句：把这句英文打出来，照样纠错打分、照样记入进度（打字对了不等于读准，用 Safari 打开时记得语音再练一遍）。</div>' +
+        '<div class="mic-note">现在可以打字完成这句：把这句英文打出来，照样纠错打分、照样记入进度（打字对了不等于读准，之后再用语音练一遍）。</div>' +
         '<textarea class="say-input" data-typein placeholder="把这句英文打在这里…"></textarea>' +
         '<div style="margin-top:8px;"><button class="btn blue small" data-typesub type="button">提交纠错</button></div>';
       const sub = result.querySelector("[data-typesub]");
@@ -8326,12 +8482,12 @@ function renderPronExtras(){
   st.querySelectorAll("[data-tipcheck]").forEach(b => b.addEventListener("click", () => {
     const ti = +b.dataset.tipcheck;
     const out = st.querySelector('[data-tipout="' + ti + '"]');
-    if(!SR){ out.textContent = "这个浏览器里用不了语音识别（多半是在微信等 App 里打开的），没法自测；点右上角 ···，选『在 Safari 中打开』就能自测。现在先点上面的词听示范，跟着大声读几遍。"; return; }
+    if(!SR){ out.textContent = "这个浏览器里用不了语音识别（多半是在微信等 App 里打开的），没法自测。现在先点上面的词听示范，跟着大声读几遍。"; return; }
     const word = shuffle(tips[ti].words.slice())[0];
     out.innerHTML = '请读这个词：<b class="en" style="font-size:16px;">' + word + '</b>（正在听…）';
     listenOnce((alts, err) => {
       if(!alts || !alts.length){ out.textContent = err === "timeout" ? srErrText("timeout") : "没听清，再点一次「跟读自测」试试。"; return; }
-      const bestW = scoreFirst(word, alts);
+      const bestW = scoreFirst(word, alts, true);
       const text = bestW ? bestW.text : alts[0];
       const said = normWord(text.split(/\s+/)[0] || "");
       out.innerHTML = (said === word || (bestW && bestW.res.score >= 100))
