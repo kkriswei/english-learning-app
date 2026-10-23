@@ -14,7 +14,7 @@
    让长缓存旧页面的手机（iOS Safari/主屏幕图标）自动换到新版。
    防循环：sessionStorage 键 english-app-verjump 记本次会话已为哪个目标版本跳过；
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610230734";
+var APP_BUILD = "v202610230905";
 (function () {
   try {
     if (!APP_BUILD || APP_BUILD === "__" + "BUILD__") return; /* 开发态/工件态不检查 */
@@ -9016,9 +9016,17 @@ function vlQuizRender(){
   if(q.v) h += vlVisHTML(q.v, ls);
   if(q.top) h += q.top;
   h += '<div class="vl-quiz-q">' + esc(q.s) + '</div>';
-  h += '<div class="vl-opts">' + q.o.map((o, i) =>
-    '<button class="vl-opt" data-qopt="' + i + '"><div class="oe' + (q.cnOpt ? ' cn-opt' : '') + '">' + esc(o[0]) + '</div>' + (o[1] ? '<div class="oc">' + esc(o[1]) + '</div>' : '') + '</button>'
-  ).join('') + '</div>';
+  /* 选项随机打乱（v3.13）：perm 是原始下标的一个随机排列，本次作答内锁定在 VL.q 上
+     （permFor 对齐题号，重渲染不跳位）；重新进入小测时 vlQuizStart 新建 VL.q → 重新洗牌。
+     data-qopt 仍写原始下标，vlQuizPick 的 i === q.a 身份判定、讲解与过关流程不受影响。
+     静态语法小测数据 q.a 恒为 0（正确项永远第一位）即靠这一层修复；
+     单词/对话小测的选项由 wvPick3 生成时已洗过一次，这里再洗不改变其随机性。 */
+  if(!VL.q.perm || VL.q.permFor !== VL.q.idx || VL.q.perm.length !== q.o.length){
+    VL.q.perm = shuffle(q.o.map((o0, i0) => i0)); VL.q.permFor = VL.q.idx;
+  }
+  h += '<div class="vl-opts">' + VL.q.perm.map(i => { const o = q.o[i];
+    return '<button class="vl-opt" data-qopt="' + i + '"><div class="oe' + (q.cnOpt ? ' cn-opt' : '') + '">' + esc(o[0]) + '</div>' + (o[1] ? '<div class="oc">' + esc(o[1]) + '</div>' : '') + '</button>';
+  }).join('') + '</div>';
   if(q.say && q.say.text) h += '<div class="vl-peek"><button class="btn ghost small" id="vlPeekBtn" type="button">👀 看一眼句子</button><div class="vl-peek-txt en" id="vlPeekTxt" hidden>' + esc(q.revealEn || q.say.text) + '</div></div>';
   h += '<div class="vl-why" id="vlWhy"></div>';
   h += '<div class="vl-sent" id="vlSent"></div>';
