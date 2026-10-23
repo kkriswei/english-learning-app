@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610231403";
+var APP_BUILD = "v202610231753";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6982,6 +6982,7 @@ function paintBackupUI(){
    {username, localUpdatedAt, lastSyncAt, lastSyncOk}，不存密码、不存令牌（会话内
    ACCT.pwRecord 只留 pw 记录本身用于远端文件被删时的重建，内存态、不落盘）。 */
 const ACCT_KEY = "english-account-v1";
+const PULL_GUARD_KEY = "english-pullguard-v1"; /* v3.18 拉取熔断：本会话已拉过的云端 updatedAt */
 const GH_API = "https://api.github.com/repos/kkriswei/english-progress-store/contents/";
 const GH_TOKEN = ("github_pat_"+"11AO73DNI0H"+"BgE9grCMWGW"+"_heMUSyzviV"+"SeEYCMilpB9"+"masmrJ8rJri"+"OwoMjvUFB87"+"HBPALNQ5bY0"+"3DHB8");
 const ACCT_INVITE = "doki2026";
@@ -7063,6 +7064,7 @@ function acctScheduleSync(){
 /* ---- 状态行 ---- */
 function acctStatusText(){
   if (!ACCT.username) return "未登录";
+  if (ACCT.pullBlocked) return "自动同步已暂停（同一份云端进度被重复拉取），点「立即同步」可重试一次。";
   if (ACCT.status === "syncing") return "同步中…";
   if (ACCT.status === "fail") return "同步失败，稍后自动重试（进度已存在这台手机里，不影响学习）";
   const m = acctMeta();
@@ -7099,8 +7101,9 @@ function acctApplyRemote(file){
 }
 
 /* ---- 同步引擎：三分支合并（云端新→拉下；本地新/云端无→上行；相同→不动） ---- */
-async function acctSyncNow(){
+async function acctSyncNow(manual){
   if (!ACCT.username || ACCT.syncing) return;
+  if (manual){ try { sessionStorage.removeItem(PULL_GUARD_KEY); } catch(e){} ACCT.pullBlocked = false; }
   ACCT.syncing = true; ACCT.status = "syncing"; acctPaintStatus();
   let done = false;
   try {
@@ -7109,9 +7112,19 @@ async function acctSyncNow(){
       const cu = remote ? (remote.file.updatedAt || 0) : 0;
       const lu = acctLocalUpdatedAt();
       /* v3.17 护栏：本地实质为空且云端有数据 → 无条件拉云端，忽略 updatedAt 比较 */
-      const forcePull = !!remote && acctRemoteHasData(remote.file) && acctLocalEmpty();
+      const forcePull = !!remote && cu !== lu && acctRemoteHasData(remote.file) && acctLocalEmpty();
       if (remote && (cu > lu || forcePull)){
-        if (!acctApplyRemote(remote.file)) throw new Error("apply-fail");
+        /* v3.18 熔断：同一用户同一份云端进度（updatedAt 相同）本会话已拉过 → 不许再拉、再刷新 */
+        let pg = null;
+        try { pg = JSON.parse(sessionStorage.getItem(PULL_GUARD_KEY) || "null"); } catch(e){}
+        if (pg && pg.u === ACCT.username && pg.at === cu){
+          ACCT.pullBlocked = true; ACCT.status = "fail";
+          const bm = acctMeta(); bm.username = ACCT.username; bm.lastSyncOk = false; acctMetaSave(bm);
+          done = true; break;
+        }
+        try { sessionStorage.setItem(PULL_GUARD_KEY, JSON.stringify({ u: ACCT.username, at: cu })); } catch(e){}
+        if (!acctApplyRemote(remote.file)){ try { sessionStorage.removeItem(PULL_GUARD_KEY); } catch(e){} throw new Error("apply-fail"); }
+        try { loadState(); } catch(e){}   /* v3.18：拉到的进度同步进内存态，本页后续判定不再误判为空 */
         const m = acctMeta(); m.username = ACCT.username; m.localUpdatedAt = cu; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
         ACCT.cloudUpdatedAt = cu; ACCT.status = "ok"; done = true;
         toast("已同步云端的最新进度，正在重新打开 App…");
@@ -7153,7 +7166,8 @@ async function acctLogin(){
     const pw = remote.file.pw;
     const hash = await acctPbkdf2(p, acctB64ToBytes(pw.salt), pw.iter || ACCT_ITER);
     if (!acctEqBytes(hash, acctB64ToBytes(pw.hash))){ ACCT.msg = "用户名或密码不对。"; ACCT.msgOk = false; paintBackupUI(); return; }
-    ACCT.username = u; ACCT.pwRecord = pw; ACCT.status = "idle";
+    ACCT.username = u; ACCT.pwRecord = pw; ACCT.status = "idle"; ACCT.pullBlocked = false;
+    try { sessionStorage.removeItem(PULL_GUARD_KEY); } catch(e){}
     const m = acctMeta(); m.username = u; acctMetaSave(m);
     ACCT_UI.pass = "";
     ACCT.msg = "登录成功。"; ACCT.msgOk = true;
@@ -7196,7 +7210,8 @@ async function acctRegister(){
 }
 function acctLogout(){
   if (ACCT.timer){ clearTimeout(ACCT.timer); ACCT.timer = 0; }
-  ACCT.username = ""; ACCT.pwRecord = null; ACCT.cloudUpdatedAt = 0; ACCT.status = "out";
+  ACCT.username = ""; ACCT.pwRecord = null; ACCT.cloudUpdatedAt = 0; ACCT.status = "out"; ACCT.pullBlocked = false;
+  try { sessionStorage.removeItem(PULL_GUARD_KEY); } catch(e){}
   try { localStorage.removeItem(ACCT_KEY); } catch(e){}
   ACCT.msg = "已退出登录。进度还存在这台手机里，云端的那份也不会动；退出后这台手机的进度不再自动同步。"; ACCT.msgOk = true;
   paintBackupUI();
@@ -7242,7 +7257,7 @@ function acctRenderSection(card){
   const bl = q("[data-acct-login]"); if (bl) bl.addEventListener("click", () => { const a = q("[data-acct-user]"), b = q("[data-acct-pass]"); if (a) ACCT_UI.user = a.value; if (b) ACCT_UI.pass = b.value; acctLogin(); });
   const bs = q("[data-acct-showreg]"); if (bs) bs.addEventListener("click", () => { ACCT_UI.showReg = !ACCT_UI.showReg; ACCT.msg = ""; paintBackupUI(); });
   const br = q("[data-acct-register]"); if (br) br.addEventListener("click", () => { const a = q("[data-acct-ruser]"), b = q("[data-acct-rpass]"), c = q("[data-acct-rinvite]"); if (a) ACCT_UI.ruser = a.value; if (b) ACCT_UI.rpass = b.value; if (c) ACCT_UI.rinvite = c.value; acctRegister(); });
-  const by = q("[data-acct-sync]"); if (by) by.addEventListener("click", () => acctSyncNow());
+  const by = q("[data-acct-sync]"); if (by) by.addEventListener("click", () => acctSyncNow(true));
   const bo = q("[data-acct-logout]"); if (bo) bo.addEventListener("click", () => acctLogout());
 }
 
