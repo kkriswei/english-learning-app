@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>第 3 课 · 我的家人 — 动漫版样板</title>
+<style>
+  :root{
+    --ink:#17140e; --gold:#c2a14d; --gold-soft:#e7cf8f; --paper:#f6f4ef;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{background:#0d0b08}
+  body{
+    font-family:"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+    color:var(--paper); min-height:100vh; display:flex; flex-direction:column; align-items:center;
+  }
+  .wrap{width:100%;max-width:520px;display:flex;flex-direction:column;min-height:100vh;background:#14110c}
+
+  /* 顶部黑金标题条 */
+  header{
+    background:linear-gradient(180deg,#221d13,#17140e);
+    border-bottom:2px solid var(--gold);
+    padding:12px 16px calc(10px + env(safe-area-inset-top)*0) 16px;
+    padding-top:calc(12px + env(safe-area-inset-top));
+    display:flex;align-items:baseline;gap:10px;
+  }
+  header .no{
+    font-family:Georgia,"Times New Roman",serif;letter-spacing:.22em;font-size:10px;color:var(--gold);
+    text-transform:uppercase;white-space:nowrap;
+  }
+  header h1{font-size:17px;font-weight:700;letter-spacing:.06em;color:#fdfaf2}
+  header h1 b{color:var(--gold-soft);font-weight:700}
+
+  /* 舞台 */
+  .stage{
+    position:relative;width:100%;aspect-ratio:16/10;overflow:hidden;background:#20261c;
+    user-select:none;touch-action:manipulation;flex:none;
+  }
+  .cam{
+    position:absolute;inset:0;will-change:transform;
+    transition:transform 700ms cubic-bezier(.45,.02,.25,1);
+    transform:scale(1.02) translateX(0);
+  }
+  .cam.to-a{transform:scale(1.12) translateX(4%)}
+  .cam.to-b{transform:scale(1.12) translateX(-4%)}
+  .cam img{width:100%;height:100%;object-fit:cover;display:block}
+  .shade{
+    position:absolute;left:0;right:0;bottom:0;height:46%;pointer-events:none;
+    background:linear-gradient(180deg,rgba(10,8,4,0) 0%,rgba(10,8,4,.55) 78%,rgba(10,8,4,.78) 100%);
+  }
+
+  /* 两侧点击区 */
+  .tapzone{position:absolute;top:0;bottom:0;width:22%;z-index:5;cursor:pointer}
+  .tapzone.left{left:0}.tapzone.right{right:0}
+  .tapzone:active{background:rgba(255,255,255,.06)}
+
+  /* 角标+字幕：底部堆叠容器，长句多行时角标自动上移不重叠 */
+  .subwrap{
+    position:absolute;left:0;right:0;bottom:18px;z-index:6;
+    display:flex;flex-direction:column;align-items:center;gap:9px;padding:0 26px;
+  }
+  /* 说话方角标 */
+  .badge{
+    background:rgba(23,20,14,.82);border:1px solid rgba(194,161,77,.75);color:#fdf6dd;
+    font-size:13px;font-weight:600;letter-spacing:.08em;padding:4px 14px;border-radius:999px;
+    opacity:0;transition:opacity 250ms ease;pointer-events:none;white-space:nowrap;
+  }
+  .badge.show{opacity:1}
+
+  /* 字幕 */
+  .subs{
+    text-align:center;cursor:pointer;width:100%;
+  }
+  .subs .en{
+    font-family:Georgia,"Times New Roman",serif;font-weight:700;color:#fff;
+    font-size:clamp(21px,6.2vw,30px);line-height:1.25;letter-spacing:.01em;
+    text-shadow:2px 0 0 rgba(10,8,4,.9),-2px 0 0 rgba(10,8,4,.9),0 2px 0 rgba(10,8,4,.9),0 -2px 0 rgba(10,8,4,.9),2px 2px 0 rgba(10,8,4,.9),-2px -2px 0 rgba(10,8,4,.9),0 6px 18px rgba(0,0,0,.55);
+  }
+  .subs .cn{
+    margin-top:6px;color:#ffeec2;font-weight:700;
+    font-size:clamp(16px,4.8vw,21px);line-height:1.3;
+    text-shadow:1.5px 0 0 rgba(10,8,4,.9),-1.5px 0 0 rgba(10,8,4,.9),0 1.5px 0 rgba(10,8,4,.9),0 -1.5px 0 rgba(10,8,4,.9),0 4px 12px rgba(0,0,0,.6);
+  }
+  .subs.pop .en,.subs.pop .cn{animation:rise .38s ease both}
+  @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+  .subs.hidden{opacity:0;pointer-events:none}
+  .subs{transition:opacity 200ms ease}
+
+  /* 封面 / 结尾 覆盖层 */
+  .veil{
+    position:absolute;inset:0;z-index:8;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:rgba(12,10,6,.34);text-align:center;padding:20px;
+    opacity:1;transition:opacity 350ms ease;
+  }
+  .veil.gone{opacity:0;pointer-events:none}
+  .veil .big{
+    font-size:clamp(26px,8vw,38px);font-weight:800;color:#fff;letter-spacing:.05em;
+    text-shadow:0 3px 0 rgba(10,8,4,.85),0 10px 26px rgba(0,0,0,.6);
+  }
+  .veil .sub{margin-top:8px;font-size:15px;color:#ffeec2;font-weight:600;text-shadow:0 2px 0 rgba(10,8,4,.85)}
+  .btn{
+    margin-top:22px;border:none;cursor:pointer;font-family:inherit;font-weight:700;letter-spacing:.06em;
+    border-radius:999px;padding:14px 34px;font-size:17px;
+    background:linear-gradient(180deg,#d9ba62,#b8933d);color:#221a08;
+    box-shadow:0 6px 22px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.55);
+    transition:transform 120ms ease,opacity 200ms ease;
+  }
+  .btn:active{transform:scale(.96)}
+  .btn.ghost{background:rgba(23,20,14,.78);color:#f3e5bb;border:1px solid rgba(194,161,77,.8);box-shadow:none}
+  .btnrow{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+  .btnrow .btn{margin-top:22px;padding:12px 24px;font-size:15px;text-decoration:none;display:inline-block}
+
+  /* 底部控制条 */
+  .controls{
+    flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;
+    padding:20px 16px calc(18px + env(safe-area-inset-bottom));gap:18px;
+    background:linear-gradient(180deg,#17140e,#100e09);
+  }
+  .dots{display:flex;gap:10px}
+  .dot{
+    width:11px;height:11px;border-radius:50%;border:1.5px solid rgba(194,161,77,.65);
+    background:transparent;cursor:pointer;padding:0;transition:background 200ms ease,transform 200ms ease;
+  }
+  .dot.done{background:var(--gold)}
+  .dot.now{background:#fdf6dd;transform:scale(1.35);border-color:#fdf6dd}
+  .cbtns{display:flex;align-items:center;gap:16px}
+  .cbtn{
+    width:52px;height:52px;border-radius:50%;border:1px solid rgba(194,161,77,.55);
+    background:rgba(246,244,239,.06);color:#f3e5bb;font-size:20px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;
+    transition:transform 120ms ease,background 200ms ease;font-family:inherit;
+  }
+  .cbtn:active{transform:scale(.93)}
+  .cbtn.main{width:64px;height:64px;font-size:24px;background:linear-gradient(180deg,#d9ba62,#b8933d);color:#221a08;border:none}
+  .hint{font-size:12.5px;color:rgba(246,244,239,.5);letter-spacing:.05em;text-align:center;line-height:1.7}
+
+  .toast{
+    position:fixed;left:50%;bottom:110px;transform:translateX(-50%) translateY(8px);z-index:50;
+    background:rgba(23,20,14,.92);border:1px solid rgba(194,161,77,.7);color:#fdf6dd;
+    font-size:13.5px;padding:9px 18px;border-radius:999px;opacity:0;pointer-events:none;
+    transition:opacity 250ms ease,transform 250ms ease;max-width:86vw;text-align:center;
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="no">Lesson 03 · Anime</span>
+    <h1>第 3 课 · 我的家人 <b>— 动漫版样板</b></h1>
+  </header>
+
+  <div class="stage" id="stage">
+    <div class="cam" id="cam"><img id="sceneImg" src="img/scene-main.webp" alt="森林空地里，小兔拿着相册和小虎说话"></div>
+    <div class="shade"></div>
+    <div class="tapzone left" id="tapPrev" aria-label="上一句"></div>
+    <div class="tapzone right" id="tapNext" aria-label="下一句"></div>
+    <div class="subwrap">
+      <div class="badge" id="badge">🐰 小兔</div>
+      <div class="subs hidden" id="subs" title="点字幕重播本句">
+        <div class="en" id="subEn"></div>
+        <div class="cn" id="subCn"></div>
+      </div>
+    </div>
+    <div class="veil" id="coverVeil">
+      <div class="big">我的家人</div>
+      <div class="sub">小兔和小虎看相册 · 一共 6 句</div>
+      <button class="btn" id="btnStart">▶ 开始</button>
+    </div>
+    <div class="veil gone" id="endVeil">
+      <div class="big">🎉 学完啦</div>
+      <div class="sub">这一课的对话听完啦，真棒！</div>
+      <div class="btnrow">
+        <button class="btn" id="btnAgain">↻ 再看一遍</button>
+        <a class="btn ghost" href="../">回 App 学习</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <div class="dots" id="dots"></div>
+    <div class="cbtns">
+      <button class="cbtn" id="btnPrev" aria-label="上一句">⏮</button>
+      <button class="cbtn main" id="btnPlay" aria-label="播放或暂停">▶</button>
+      <button class="cbtn" id="btnNext" aria-label="下一句">⏭</button>
+    </div>
+    <div class="hint">点舞台左 / 右侧也能翻句 · 点字幕重播本句<br>音频为 App 里的原音，跟着小兔小虎一起读吧</div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+/* 第 3 课 s1d《我和我的家人》dl 全 6 行：角色/英文/中文与 App 数据一字不差 */
+var LINES = [
+  {sp:"A", en:"Anna, is this your family photo?", cn:"安娜，这是你的全家福吗？"},
+  {sp:"B", en:"Yes. This is my father and this is my mother.", cn:"是的。这是我爸爸，这是我妈妈。"},
+  {sp:"A", en:"And this boy? Is he your brother?", cn:"这个男孩呢？他是你弟弟吗？"},
+  {sp:"B", en:"Yes, he is. He is ten years old.", cn:"是的。他十岁了。"},
+  {sp:"A", en:"What about you? How old are you?", cn:"那你呢？你多大了？"},
+  {sp:"B", en:"I'm fifteen. My father is a doctor and my mother is a teacher.", cn:"我十五岁。我爸爸是医生，妈妈是老师。"}
+];
+var NAMES = {A:"🐰 小兔", B:"🐯 小虎"};
+
+var stage = document.getElementById("stage"),
+    cam = document.getElementById("cam"),
+    sceneImg = document.getElementById("sceneImg"),
+    badge = document.getElementById("badge"),
+    subs = document.getElementById("subs"),
+    subEn = document.getElementById("subEn"),
+    subCn = document.getElementById("subCn"),
+    coverVeil = document.getElementById("coverVeil"),
+    endVeil = document.getElementById("endVeil"),
+    btnPlay = document.getElementById("btnPlay"),
+    dotsBox = document.getElementById("dots"),
+    toastEl = document.getElementById("toast");
+
+var idx = -1;            // 当前句序号，未开始为 -1
+var state = "cover";     // cover | playing | paused | ended
+var seq = 0;             // 播放代次，作废过期回调
+var watchdog = null, gapTimer = null;
+var toastTimer = null;
+
+var audio = new Audio();
+audio.preload = "auto";
+/* 预热全部 6 句，避免逐句加载卡顿 */
+var warm = LINES.map(function(_, i){ var a = new Audio(); a.preload = "auto"; a.src = "audio/line" + (i + 1) + ".mp3"; return a; });
+
+var dots = [];
+LINES.forEach(function(_, i){
+  var d = document.createElement("button");
+  d.className = "dot"; d.setAttribute("aria-label", "第 " + (i + 1) + " 句");
+  d.addEventListener("click", function(){ if (state !== "cover") playLine(i, true); });
+  dotsBox.appendChild(d); dots.push(d);
+});
+
+function toast(msg){
+  toastEl.textContent = msg; toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function(){ toastEl.classList.remove("show"); }, 2600);
+}
+function clearTimers(){ clearTimeout(watchdog); clearTimeout(gapTimer); watchdog = gapTimer = null; }
+
+function paintDots(){
+  dots.forEach(function(d, i){
+    d.classList.toggle("done", idx > i || state === "ended");
+    d.classList.toggle("now", idx === i && state !== "ended");
+  });
+}
+function setCam(sp){
+  cam.classList.remove("to-a", "to-b");
+  if (sp === "A") cam.classList.add("to-a");
+  else if (sp === "B") cam.classList.add("to-b");
+}
+function showSubs(i){
+  var L = LINES[i];
+  subEn.textContent = L.en; subCn.textContent = L.cn;
+  badge.textContent = NAMES[L.sp];
+  subs.classList.remove("hidden", "pop"); void subs.offsetWidth; subs.classList.add("pop");
+  badge.classList.add("show");
+}
+
+function playLine(i, manual){
+  if (i < 0) i = 0;
+  if (i >= LINES.length) return finish();
+  clearTimers();
+  idx = i; state = "playing";
+  var my = ++seq;
+  endVeil.classList.add("gone"); coverVeil.classList.add("gone");
+  if (sceneImg.getAttribute("src") !== "img/scene-main.webp") sceneImg.src = "img/scene-main.webp";
+  setCam(LINES[i].sp);
+  showSubs(i); paintDots();
+  btnPlay.textContent = "⏸";
+  audio.src = "audio/line" + (i + 1) + ".mp3";
+  var p = audio.play();
+  if (p && p.catch) p.catch(function(){ if (my === seq) onAudioFail(my, "这句音频没播出来，已自动跳到下一句"); });
+  armWatchdog(my);
+}
+function armWatchdog(my){
+  clearTimeout(watchdog);
+  var d = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 8;
+  var armedAt = audio.currentTime || 0;
+  watchdog = setTimeout(function(){
+    if (my !== seq || state !== "playing" || audio.ended) return;
+    /* 已正常播过一段且还在播：把看门狗顺延到预计结束之后再查 */
+    if (!audio.paused && audio.currentTime > armedAt + 0.3) {
+      var left = Math.max(1, (isFinite(audio.duration) && audio.duration > 0 ? audio.duration : d) - audio.currentTime);
+      watchdog = setTimeout(function(){
+        if (my === seq && state === "playing" && !audio.ended)
+          onAudioFail(my, "音频好像卡住了，已自动跳到下一句");
+      }, (left + 4) * 1000);
+      return;
+    }
+    onAudioFail(my, "音频好像卡住了，已自动跳到下一句");
+  }, (d + 5) * 1000);
+}
+function onAudioFail(my, msg){
+  if (my !== seq) return;
+  toast(msg);
+  clearTimers();
+  var nxt = idx + 1;
+  gapTimer = setTimeout(function(){ if (my === seq) { nxt >= LINES.length ? finish() : playLine(nxt); } }, 650);
+}
+audio.addEventListener("ended", function(){
+  if (state !== "playing") return;
+  var my = seq; clearTimers();
+  gapTimer = setTimeout(function(){
+    if (my !== seq || state !== "playing") return;
+    idx + 1 >= LINES.length ? finish() : playLine(idx + 1);
+  }, 380);
+});
+audio.addEventListener("error", function(){
+  if (state === "playing") onAudioFail(seq, "这句音频加载失败，已自动跳到下一句");
+});
+audio.addEventListener("loadedmetadata", function(){ if (state === "playing") armWatchdog(seq); });
+
+function finish(){
+  clearTimers(); seq++;
+  state = "ended"; idx = LINES.length;
+  try { audio.pause(); } catch (e) {}
+  setCam(null);
+  badge.classList.remove("show");
+  subs.classList.add("hidden");
+  sceneImg.src = "img/scene-happy.webp";
+  endVeil.classList.remove("gone");
+  btnPlay.textContent = "▶";
+  paintDots();
+}
+function startOver(){
+  idx = -1; playLine(0);
+}
+function togglePlay(){
+  if (state === "cover") return startOver();
+  if (state === "ended") return startOver();
+  if (state === "playing") {
+    state = "paused"; seq++; clearTimers();
+    try { audio.pause(); } catch (e) {}
+    btnPlay.textContent = "▶";
+  } else if (state === "paused") {
+    state = "playing"; var my = ++seq;
+    var p = audio.play();
+    if (p && p.catch) p.catch(function(){ if (my === seq) onAudioFail(my, "音频没播出来，已自动跳到下一句"); });
+    armWatchdog(my);
+    btnPlay.textContent = "⏸";
+  }
+  paintDots();
+}
+function step(delta){
+  if (state === "cover") return;
+  if (state === "ended") { if (delta < 0) playLine(LINES.length - 1); return; }
+  var t = idx + delta;
+  if (t < 0) t = 0;
+  if (t >= LINES.length) return finish();
+  playLine(t);
+}
+
+document.getElementById("btnStart").addEventListener("click", startOver);
+document.getElementById("btnAgain").addEventListener("click", startOver);
+btnPlay.addEventListener("click", togglePlay);
+document.getElementById("btnPrev").addEventListener("click", function(){ step(-1); });
+document.getElementById("btnNext").addEventListener("click", function(){ step(1); });
+document.getElementById("tapPrev").addEventListener("click", function(){ step(-1); });
+document.getElementById("tapNext").addEventListener("click", function(){ step(1); });
+subs.addEventListener("click", function(){ if (idx >= 0 && idx < LINES.length) playLine(idx); });
+</script>
+</body>
+</html>
