@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610231335";
+var APP_BUILD = "v202610231403";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6972,7 +6972,7 @@ function paintBackupUI(){
    data 就是 buildBackup().data 原样（与 v3.14 手动备份同一序列化层）。
    防坑条款对应：①同步内容=两份本地数据原样+updatedAt（acctBuildData 复用 buildBackup）；
    ②云端空/旧永不覆盖本地新——合并只比 updatedAt，严格新者胜，远端不存在只上行
-   （acctSyncNow 三分支）；③触发=登录后 acctLogin/acctRegister 末尾、本地保存防抖
+   （acctSyncNow 三分支；v3.17 护栏：本地实质为空〔已学 0 词且打卡 0 天〕且云端有数据时无条件拉云端、忽略 updatedAt，防数据丢失后的空本地反覆盖云端）；③触发=登录后 acctLogin/acctRegister 末尾、本地保存防抖
    （saveState/saveWordScore 尾部钩子 acctOnLocalSave→acctScheduleSync 5 秒）、
    切后台（acctBoot 的 visibilitychange）、手动「立即同步」；④状态行常驻账号卡
    （acctStatusText，未登录/同步中/已同步 HH:MM/失败稍后重试，失败只改状态不拦学习）；
@@ -6993,6 +6993,16 @@ const ACCT_UI = { user: "", pass: "", ruser: "", rpass: "", rinvite: "", showReg
 function acctMeta(){ try { const m = JSON.parse(localStorage.getItem(ACCT_KEY) || "null"); return (m && typeof m === "object" && !Array.isArray(m)) ? m : {}; } catch(e){ return {}; } }
 function acctMetaSave(m){ try { localStorage.setItem(ACCT_KEY, JSON.stringify(m)); } catch(e){} }
 function acctLocalUpdatedAt(){ return acctMeta().localUpdatedAt || 0; }
+/* v3.17 护栏判定：计数全用 App 现成口径（已学词数 learnedCount、打卡天数 checkins.size） */
+function acctLocalEmpty(){
+  try { return learnedCount() === 0 && state.checkins.size === 0; } catch(e){ return false; }
+}
+function acctRemoteHasData(file){
+  const d = file && file.data;
+  if (!d || typeof d !== "object" || Array.isArray(d)) return false;
+  const main = d[LS_KEY];
+  return !!(main && typeof main === "object" && !Array.isArray(main));
+}
 
 /* ---- 编码与密码学小工具（WebCrypto；iOS Safari 在 https 安全上下文原生具备） ---- */
 function acctBytesToB64(bytes){ let bin = ""; const CH = 0x8000; for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH)); return btoa(bin); }
@@ -7098,7 +7108,9 @@ async function acctSyncNow(){
       const remote = await acctFetchRemote(ACCT.username);
       const cu = remote ? (remote.file.updatedAt || 0) : 0;
       const lu = acctLocalUpdatedAt();
-      if (remote && cu > lu){
+      /* v3.17 护栏：本地实质为空且云端有数据 → 无条件拉云端，忽略 updatedAt 比较 */
+      const forcePull = !!remote && acctRemoteHasData(remote.file) && acctLocalEmpty();
+      if (remote && (cu > lu || forcePull)){
         if (!acctApplyRemote(remote.file)) throw new Error("apply-fail");
         const m = acctMeta(); m.username = ACCT.username; m.localUpdatedAt = cu; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
         ACCT.cloudUpdatedAt = cu; ACCT.status = "ok"; done = true;
