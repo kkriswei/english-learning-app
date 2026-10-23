@@ -14,7 +14,7 @@
    让长缓存旧页面的手机（iOS Safari/主屏幕图标）自动换到新版。
    防循环：sessionStorage 键 english-app-verjump 记本次会话已为哪个目标版本跳过；
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610221610";
+var APP_BUILD = "v202610222108";
 (function () {
   try {
     if (!APP_BUILD || APP_BUILD === "__" + "BUILD__") return; /* 开发态/工件态不检查 */
@@ -4510,9 +4510,17 @@ function ensureAudioData(){
   } catch(e){ AUDIO_DATA = {}; }
 }
 let curAudio = null;
+let lastPlayEndAt = 0;   /* 最近一次播放通道活动结束的时刻：开麦前要给 iOS 音频会话留从播放切回录音的时间 */
+const MIC_SETTLE_MS = 400;
+function playSettleWait(){
+  if(!lastPlayEndAt) return 0;
+  const dt = Date.now() - lastPlayEndAt;
+  return dt >= MIC_SETTLE_MS ? 0 : MIC_SETTLE_MS - dt;
+}
 function stopRec(){
   wbwStop();
   playSeq++;
+  lastPlayEndAt = Date.now();
   if(curAudio){ const a = curAudio; curAudio = null; try { a.pause(); } catch(e){} }
 }
 /* ================= 白话音：按音标生成的中文谐音注音（跟真人发音对照着看） ================= */
@@ -4714,6 +4722,7 @@ function playFileOnce(file, onOk, onErr){
   const t0 = Date.now();
   const done = ok => {
     if(settled) return; settled = true;
+    lastPlayEndAt = Date.now();
     clearInterval(iv);
     a.onended = null; a.onerror = null;
     if(curAudio === a) curAudio = null;
@@ -4759,7 +4768,7 @@ function playRec(text, rate, speaker, onDone, onFail){
   }
   return true;
 }
-/* ---------- 逐词读（慢速）：按词切分，逐个播单词的慢读录音，卡拉OK式高亮 ---------- */
+/* ---------- 逐词读：按词切分，逐个播单词的常速录音 + 词间停顿，卡拉OK式高亮 ---------- */
 function wbwParse(text){
   const segs = [];
   const src = String(text);
@@ -4783,9 +4792,12 @@ function wbwParse(text){
   return segs;
 }
 function wbwFile(key){
-  const f = AUDIO_MAP[key];
-  return f ? f.replace(/\.mp3$/, "-ss.mp3") : null;
+  /* 逐词读用单词的常速录音逐个播：-ss 慢读版是把单个词拉长录的，连着播时听感像被拽住的
+     电子音（学习者原话）；常速词本身清楚，靠词间停顿把节奏放慢。单词 -ss 文件保留不删
+     （单词卡慢读、视频课单词慢读仍在用）。 */
+  return AUDIO_MAP[key] || null;
 }
+var WBW_GAP_MS = 250;   /* 逐词读词间间隙：播完一个词，停 250ms 再播下一个 */
 let wbwGen = 0, wbwTimer = null;
 function wbwStop(){
   wbwGen++;
@@ -4824,10 +4836,12 @@ function playWordsSlow(text, opts, onDone, onFail){
   let spans = [];
   if(opts.el) spans = wbwWrap(opts.el, text);
   const clearHl = () => spans.forEach(sp => sp.classList.remove("wbw-on"));
+  let playedOk = 0;   /* 真正播出声的词数：有录音的词全军覆没时不许假装播成功过 */
   const finishAll = ok => {
     clearHl();
     if(opts.el) opts.el.textContent = text;
-    if(ok){ if(onDone) onDone(); } else if(onFail) onFail(); else if(onDone) onDone();
+    const realOk = ok && playedOk > 0;
+    if(realOk){ if(onDone) onDone(); } else if(onFail) onFail(); else if(onDone) onDone();
   };
   let wi = -1;
   const stepWord = () => {
@@ -4840,7 +4854,7 @@ function playWordsSlow(text, opts, onDone, onFail){
     const it = items[wi];
     if(!it.file){ wbwTimer = setTimeout(stepWord, 130); return; }
     playFileOnce(it.file,
-      () => { if(gen === wbwGen) wbwTimer = setTimeout(stepWord, 170); },
+      () => { playedOk++; if(gen === wbwGen) wbwTimer = setTimeout(stepWord, WBW_GAP_MS); },
       () => { if(gen === wbwGen) wbwTimer = setTimeout(stepWord, 60); });
   };
   stepWord();
@@ -5020,12 +5034,12 @@ function speakLines(lines, rate, done){
   };
   next();
 }
-/* ================= 跟读模式：慢速 + 多读几遍 + 英文中文穿插 =================
-   每一句的顺序：英文慢速读一遍（先听）→ 中文意思读一遍（知道在说什么）→
-   英文慢速再读两遍，每遍后面留出停顿，跟着出声读。
-   英文走真人录音：慢速用预先以 TTS 慢速录好的 -ss 文件（自然音调，不用播放器
-   变速）；中文沿用同一条播放通道。SH 是跟读会话：对话页有常驻控制条，可
-   暂停/继续、单句循环、上一句/下一句，点对话里的任意一句直接跳到那句。 */
+/* ================= 跟读模式：逐词读 + 多读几遍 + 英文中文穿插 =================
+   每一句的顺序：英文逐词读一遍（先听）→ 中文意思读一遍（知道在说什么）→
+   英文逐词再读两遍，每遍后面留出停顿，跟着出声读（长停顿＝她的回合，亮麦克风电平条）。
+   英文走逐词常速录音（playWordsSlow），整句录音/TTS 只作回退；示范彻底没声时停在
+   当前步等重试，绝不静默轮到她读。中文沿用同一条播放通道。SH 是跟读会话：对话页有
+   常驻控制条，可暂停/继续、单句循环、上一句/下一句，点对话里的任意一句直接跳到那句。 */
 let shadowGen = 0;
 let zhVoice = null;
 function pickZhVoice(){
@@ -5054,14 +5068,14 @@ function shStepsFor(p){
   steps.push({ text: p.en, speaker: p.speaker, rate: SH.rate, gap: pause });
   return steps;
 }
-function shEnTTS(st, advance){
-  if(!("speechSynthesis" in window)){ advance(); return; }
+function shEnTTS(st, advance, fail){
+  if(!("speechSynthesis" in window)){ if(fail) fail(); else advance(); return; }
   const u = makeUtter(st.text, st.rate, st.speaker);
   utterWatchdog(u, st.text.length * 460 / Math.max(0.3, st.rate || 0.62), advance);
   speechSynthesis.speak(u);
 }
-function shZhTTS(st, advance){
-  if(!("speechSynthesis" in window)){ advance(); return; }
+function shZhTTS(st, advance, fail){
+  if(!("speechSynthesis" in window)){ if(fail) fail(); else advance(); return; }
   pickZhVoice();
   const u = new SpeechSynthesisUtterance(st.text);
   u.lang = "zh-CN";
@@ -5075,31 +5089,35 @@ function shPlayCurrent(){
   wbwStop();
   stopRec();
   const gen = ++SH.gen;
-  SH.paused = false; SH.stepIdx = 0; SH.pending = null;
+  SH.paused = false; SH.stepIdx = 0; SH.pending = null; SH.demoFail = false;
+  shHideFail(); shMicMonStop();
   SH.steps = shStepsFor(SH.pairs[SH.idx]);
   shRenderBar();
   shStep(gen);
 }
 function shStep(gen){
-  if(!SH || gen !== SH.gen || SH.paused) return;
+  if(!SH || gen !== SH.gen || SH.paused || SH.demoFail) return;
   if(SH.stepIdx >= SH.steps.length){ shSentenceDone(gen); return; }
   const st = SH.steps[SH.stepIdx];
   SH.phase = "play";
+  shMicMonStop();
   const advance = () => {
-    if(!SH || gen !== SH.gen) return;
+    if(!SH || gen !== SH.gen || SH.demoFail) return;
     SH.stepIdx++;
     SH.phase = "gap";
     SH.pending = () => shStep(gen);
     clearTimeout(chunkTimer);
     chunkTimer = setTimeout(() => { if(SH && gen === SH.gen && !SH.paused) shStep(gen); }, st.gap);
+    /* 长停顿就是「轮到她读」的回合：亮麦克风电平条，让她亲眼确认麦克风在收声 */
+    if(st.gap >= 1000) shMicMonStart(); else shMicMonStop();
   };
   if(st.zh){
-    if(playRec(st.text, st.rate, null, advance, () => shZhTTS(st, advance))) return;
-    shZhTTS(st, advance);
+    if(playRec(st.text, st.rate, null, advance, () => shZhTTS(st, advance, () => shDemoFail(gen)))) return;
+    shZhTTS(st, advance, () => shDemoFail(gen));
     return;
   }
-  /* 英文慢读段改逐词读：一个词一个词播慢读录音，对话页上同步高亮；
-     一个词都播不了时才退回整句设备 TTS（带看门狗）。 */
+  /* 英文段逐词读：一个词一个词播常速录音，对话页上同步高亮；
+     逐词全灭才退回整句设备 TTS（带看门狗），TTS 也不存在就停在示范步报错重试。 */
   const pair = SH.pairs[SH.idx];
   let hlEl = null;
   const dlgHost = document.getElementById("dlgLines");
@@ -5107,8 +5125,70 @@ function shStep(gen){
     const lineEl = dlgHost.querySelectorAll(".dlg-line")[pair.li];
     if(lineEl) hlEl = lineEl.querySelector(".en");
   }
-  if(playWordsSlow(st.text, { el: hlEl, shadow: true, isPaused: () => !!(SH && SH.paused) }, advance, () => shEnTTS(st, advance))) return;
-  shEnTTS(st, advance);
+  const enFail = () => shEnTTS(st, advance, () => shDemoFail(gen));
+  if(playWordsSlow(st.text, { el: hlEl, shadow: true, isPaused: () => !!(SH && SH.paused) }, advance, enFail)) return;
+  enFail();
+}
+/* ---------- 跟读示范失败 & 回合麦克风监视 ----------
+   示范彻底没声（逐词录音全灭、整句录音也没有、设备朗读又不存在）时停在当前步等重试：
+   旧行为是静默 advance——她没听过这句就轮到她读、甚至直接翻到下一句（学习者原话②）。 */
+function shDemoFail(gen){
+  if(!SH || gen !== SH.gen || SH.demoFail) return;
+  SH.demoFail = true;
+  clearTimeout(chunkTimer);
+  shMicMonStop();
+  wbwStop();
+  if("speechSynthesis" in window){ try { speechSynthesis.cancel(); } catch(e){} }
+  const box = document.getElementById("ctlFail");
+  if(box){
+    box.innerHTML = '<div class="mic-warn" style="margin:0;">这句的示范朗读没加载出来（网络或浏览器的问题）。</div>' +
+      '<button class="btn soft small" id="ctlRetryDemo" type="button" style="margin-top:8px;">↻ 重新加载这句</button>';
+    box.style.display = "";
+    const b = box.querySelector("#ctlRetryDemo");
+    if(b) b.addEventListener("click", () => {
+      if(!SH || gen !== SH.gen) return;
+      SH.demoFail = false;
+      shHideFail();
+      shStep(gen);
+    });
+  } else {
+    toast("这句的示范朗读没加载出来，检查网络后再点一次跟读");
+  }
+}
+function shHideFail(){
+  const box = document.getElementById("ctlFail");
+  if(box){ box.style.display = "none"; box.innerHTML = ""; }
+}
+/* 回合麦克风监视：跟读停顿（她的回合）里自开一条只供电平条的流，让她确认麦克风在收声；
+   不录音、不判分、不碰判分 capture。示范刚播完不立刻抢麦：先停播放通道，再留 300ms
+   给 iOS 音频会话从播放切回录音（独立模式下切换更慢）。环境不支持就静默跳过。 */
+let shMonStream = null, shMonTimer = null;
+function shMicMonStart(){
+  const el = document.getElementById("ctlMeter");
+  if(!el || shMonStream || meterStreamOverride) return;
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+  const gen = SH ? SH.gen : -1;
+  stopRec();
+  if(shMonTimer) clearTimeout(shMonTimer);
+  shMonTimer = setTimeout(() => {
+    shMonTimer = null;
+    if(!SH || SH.gen !== gen || !document.getElementById("ctlMeter")) return;
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      if(!SH || SH.gen !== gen || !document.getElementById("ctlMeter")){
+        stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} });
+        return;
+      }
+      shMonStream = stream;
+      meterStreamOverride = stream;
+      meterStart(el);
+    }).catch(() => {});
+  }, 300);
+}
+function shMicMonStop(){
+  if(shMonTimer){ clearTimeout(shMonTimer); shMonTimer = null; }
+  if(meterStreamOverride && meterStreamOverride === shMonStream) meterStreamOverride = null;
+  if(shMonStream){ const s = shMonStream; shMonStream = null; s.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); }
+  if(meterHost && meterHost.id === "ctlMeter") meterStop();
 }
 function shSentenceDone(gen){
   if(!SH || gen !== SH.gen) return;
@@ -5162,6 +5242,7 @@ function shToggleLoop(){
 function stopShadow(){
   if(SH){ SH.gen++; SH = null; }
   wbwStop();
+  shMicMonStop(); shHideFail();
   clearTimeout(chunkTimer);
   shRenderBar();
 }
@@ -5516,6 +5597,10 @@ function grammarHints(res){
 }
 /* ---------- 语音识别 ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+/* iOS 独立模式（添加到主屏幕、从桌面图标打开）：该模式下系统网页语音识别出了名地不稳
+   （时好时坏、播放切录音后麦克风没声），与学习者「有时能打分、有时听不到」的间歇表现吻合；
+   失败收尾要给针对性说法，不能笼统怪「没听清」 */
+const IS_STANDALONE = (() => { try { return navigator.standalone === true || !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches); } catch(e){ return false; } })();
 /* 全局麦克风会话管理：同一时间只允许一个识别/录音会话，避免 iOS 上抢麦克风报 audio-capture */
 let curRec = null;                 /* 当前 SpeechRecognition 实例 */
 let mrRecorder = null, mrChunks = [], mrStream = null;
@@ -5560,15 +5645,11 @@ function srAccTiming(){
 function listenOnce(onDone, opts){
   opts = opts || {};
   if(!SR){ onDone(null, "unsupported"); return; }
+  const waitMs = playSettleWait();   /* 先算间隔（releaseMic/stopRec 会刷新播放时间戳，必须在它们之前算） */
   releaseMic();                    /* 启动新会话前先彻底释放旧会话 */
   try { speechSynthesis.cancel(); } catch(e){}
   stopRec();                       /* 停掉任何正在播放的声音 */
-  let rec;
-  try { rec = new SR(); } catch(e){ onDone(null, "unsupported"); return; }
-  curRec = rec;
-  rec.lang = "en-US";
-  rec.interimResults = false;
-  rec.maxAlternatives = 5;
+  let rec = null;
   const T = srTiming();
   const maxMs = opts.maxMs || T.defMs;
   let finished = false, started = false, wdStart = null, wdMax = null;
@@ -5578,24 +5659,37 @@ function listenOnce(onDone, opts){
     clearWd();
     if(curRec === rec) curRec = null;
     if(err === "timeout"){ try { rec.abort(); } catch(e){} }   /* 超时：强制掐断并释放麦克风 */
-    try { rec.stop(); } catch(e){}
+    try { if(rec) rec.stop(); } catch(e){}
     onDone(alts, err);
   };
-  rec.onstart = () => { started = true; if(wdStart){ clearTimeout(wdStart); wdStart = null; } if(opts.onStart) opts.onStart(); };
-  rec.onresult = e => {
-    const alts = [];
-    try {
-      const r0 = e.results[0];
-      for(let k = 0; k < r0.length; k++){ const t = r0[k] && r0[k].transcript; if(t) alts.push(t); }
-    } catch(err2){}
-    finish(alts.length ? alts : null, alts.length ? null : "end");
+  const g1 = micGen;
+  const startRec = () => {
+    if(finished) return;
+    if(micGen !== g1){ finish(null, "aborted"); return; }   /* settle 等待期间会话已被释放/取代，别再抢麦 */
+    try { rec = new SR(); } catch(e){ onDone(null, "unsupported"); return; }
+    curRec = rec;
+    rec.lang = "en-US";
+    rec.interimResults = false;
+    rec.maxAlternatives = 5;
+    rec.onstart = () => { started = true; if(wdStart){ clearTimeout(wdStart); wdStart = null; } if(opts.onStart) opts.onStart(); };
+    rec.onresult = e => {
+      const alts = [];
+      try {
+        const r0 = e.results[0];
+        for(let k = 0; k < r0.length; k++){ const t = r0[k] && r0[k].transcript; if(t) alts.push(t); }
+      } catch(err2){}
+      finish(alts.length ? alts : null, alts.length ? null : "end");
+    };
+    rec.onerror = e => finish(null, (e && e.error) || "error");
+    rec.onend = () => finish(null, "end");
+    /* 看门狗：3s 内 onstart 没来、或 maxMs 内没有任何终局事件（result/error/end），一律按 timeout 结算 */
+    wdStart = setTimeout(() => { if(!started) finish(null, "timeout"); }, T.startMs);
+    wdMax = setTimeout(() => finish(null, "timeout"), maxMs);
+    try { rec.start(); } catch(e){ finish(null, "start"); }
   };
-  rec.onerror = e => finish(null, (e && e.error) || "error");
-  rec.onend = () => finish(null, "end");
-  /* 看门狗：3s 内 onstart 没来、或 maxMs 内没有任何终局事件（result/error/end），一律按 timeout 结算 */
-  wdStart = setTimeout(() => { if(!started) finish(null, "timeout"); }, T.startMs);
-  wdMax = setTimeout(() => finish(null, "timeout"), maxMs);
-  try { rec.start(); } catch(e){ finish(null, "start"); }
+  /* 示范播放刚结束时不立刻开麦：补足 MIC_SETTLE_MS 让 iOS 音频会话从播放切回录音再启动识别
+     （独立模式下切换更慢，示范一停就抢麦是「麦克风听不到」的头号嫌疑）；距上次播放已久则不等 */
+  if(waitMs > 0) setTimeout(startRec, waitMs); else startRec();
 }
 /* 录音（用于回放对比；失败则静默跳过）。带代次守卫：会话已释放后迟到的流立即停掉丢弃 */
 function startCapture(){
@@ -5636,6 +5730,7 @@ function stopCapture(cb){
        并小字显示当前麦克风名称；只接现有流，绝不为此新开抢麦的流，没有 capture 流就不显示。
    (2) 录音结束解码算峰值，整段低于阈值＝录音里没有声音，结果区改给「选对麦克风」的明确提示。 */
 const MIC_HINT = "录音里没有声音——浏览器可能选了别的麦克风，去地址栏的麦克风图标或系统『声音 → 输入』里，选对你正在用的麦克风再试";
+const NO_SR_HINT = "这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）。点右上角 ···，选『在 Safari 中打开』，就能对着麦克风跟读了。";
 const MIC_SILENT_PEAK = 0.02;   /* 峰值阈值：整段录音峰值低于满量程 2%（约 -34 dBFS）视为录音里没有声音 */
 let mrLastBlob = null;          /* 最近一段录音的 Blob（stopCapture 同步存下，供峰值检测） */
 function peakOfSamples(ch){
@@ -5677,10 +5772,11 @@ function measureBlobPeak(blob, cb){
 }
 /* ---- 实时音量条：只接现有 capture 流（mrStream） ---- */
 let meterHost = null, meterTimer = null, meterCtx = null, meterAnalyser = null, meterSrc = null, meterStreamRef = null;
-function micTrackLabel(){
+let meterStreamOverride = null;   /* 跟读停顿的监视流（SH 专用）：只供电平显示，不走判分 capture */
+function micTrackLabel(s){
   try {
-    const s = mrStream; if(!s) return "";
-    const t = (s.getAudioTracks && s.getAudioTracks()[0]) || (s.getTracks && s.getTracks()[0]);
+    const st = s || mrStream; if(!st) return "";
+    const t = (st.getAudioTracks && st.getAudioTracks()[0]) || (st.getTracks && st.getTracks()[0]);
     return (t && t.label) || "";
   } catch(e){ return ""; }
 }
@@ -5695,17 +5791,18 @@ function meterStart(el){
 function meterTick(){
   const host = meterHost;
   if(!host){ meterStop(); return; }
-  if(!mrStream){ host.classList.remove("on"); return; }   /* 没有 capture 流的会话不显示 */
+  const sNow = meterStreamOverride || mrStream;
+  if(!sNow){ host.classList.remove("on"); return; }   /* 没有 capture 流的会话不显示 */
   host.classList.add("on");
   const lab = host.querySelector(".mm-label");
   if(lab){
-    const name = micTrackLabel();
+    const name = micTrackLabel(sNow);
     const txt = name ? "麦克风：" + name : "麦克风录音中（说话时这条会动）";
     if(lab.textContent !== txt) lab.textContent = txt;
   }
   try {
-    if(meterStreamRef !== mrStream){
-      meterStreamRef = mrStream;
+    if(meterStreamRef !== sNow){
+      meterStreamRef = sNow;
       const AC = window.AudioContext || window.webkitAudioContext;
       if(AC){
         if(!meterCtx) meterCtx = new AC();
@@ -5713,7 +5810,7 @@ function meterTick(){
         if(meterSrc){ try { meterSrc.disconnect(); } catch(e){} meterSrc = null; }
         meterAnalyser = meterCtx.createAnalyser();
         meterAnalyser.fftSize = 512;
-        meterSrc = meterCtx.createMediaStreamSource(mrStream);
+        meterSrc = meterCtx.createMediaStreamSource(sNow);
         meterSrc.connect(meterAnalyser);
       }
     }
@@ -5742,6 +5839,12 @@ function scoreFirst(target, alts){
 }
 /* 识别错误 → 给用户看的中文提示（原始错误码绝不出现在界面上） */
 function srErrText(err){
+  if(err === "unsupported")
+    return NO_SR_HINT;
+  if(err === "sa-fail")
+    return "桌面图标打开时，跟读识别不太稳定（这是苹果的已知问题，时好时坏）。请在 Safari 里打开这个链接练跟读——进度都存在这台手机里，不会丢。也可以先点『再试一次』。";
+  if(err === "no-response")
+    return "麦克风录到了你的声音，但识别服务没给出结果——多半是这个浏览器里识别服务连不上。点『再试一次』；还不行就点右上角 ···，选『在 Safari 中打开』再练。";
   if(err === "not-allowed" || err === "service-not-allowed")
     return "没有麦克风权限：弹出提示时请点『允许』；如果之前拒绝过，去 iPhone 设置 → Safari → 麦克风改成允许，再刷新页面";
   if(err === "timeout")
@@ -5793,7 +5896,15 @@ function listenGradeAccum(target, cb, opts){
     meterStop();
     stopCapture(u => {
       out.url = u || null; out.retried = retried;
-      measureBlobPeak(mrLastBlob, pk => { out.recPeak = pk; out.recSilent = recSilentOf(pk); cb(out); });
+      measureBlobPeak(mrLastBlob, pk => {
+        out.recPeak = pk; out.recSilent = recSilentOf(pk);
+        /* 整场零结果的收尾口径：iOS 独立模式（桌面图标打开）下识别失败是系统不稳，
+           给针对性说法；其它环境里录音明明有声、识别却零结果＝识别服务没响应。
+           两种都不许再笼统说「没听清」 */
+        if(!out.res && IS_STANDALONE && (out.err === "no-speech" || out.err === "timeout" || out.err === "end")) out.err = "sa-fail";
+        else if(out.err === "no-speech" && pk !== null && !out.recSilent) out.err = "no-response";
+        cb(out);
+      });
     });
   };
   function settleScore(){
@@ -5909,13 +6020,15 @@ function listenGradeAccum(target, cb, opts){
     };
     try { rec.start(); } catch(e){ handleError(inst, "start"); }
   }
+  const openWait = playSettleWait();   /* 必须在 releaseMic/stopRec 之前算：它们会刷新播放时间戳 */
   releaseMic();                    /* 开场彻底释放旧会话（整场只此一次，段间重启不碰麦克风/录音） */
   try { speechSynthesis.cancel(); } catch(e){}
   stopRec();
   gradeDoneHook = hook;
   T_(() => settleScore(), A.hardMs);
-  armZeroTimers();
-  startInstance();
+  /* 示范刚播完时，首次启动识别前补足会话切换间隔（见 MIC_SETTLE_MS）；段间重启自带 250ms+ 间隔，不再叠加 */
+  if(openWait > 0){ T_(() => { armZeroTimers(); startInstance(); }, openWait); }
+  else { armZeroTimers(); startInstance(); }
 }
 /* 完整判分会话：识别先启动，录音在 onstart 后约 200ms 才跟上（不与识别同时抢麦克风）；
    临时错误时完整清理后自动重试一次（重试只开识别、不并行录音）。
@@ -5927,7 +6040,16 @@ function listenGrade(target, cb, opts){
   const seq = ++gradeSeq;
   let settled = false;
   let lastPeak = null;
-  const done = out => { if(settled) return; settled = true; out.recPeak = lastPeak; out.recSilent = recSilentOf(lastPeak); meterStop(); cb(out); };
+  const done = out => {
+    if(settled) return; settled = true;
+    out.recPeak = lastPeak; out.recSilent = recSilentOf(lastPeak);
+    /* 与累积路径同一口径：零结果时，独立模式→sa-fail，录音有声→no-response，都不说「没听清」 */
+    if(!out.res && (out.err === "no-speech" || out.err === "end" || out.err === "timeout")){
+      if(IS_STANDALONE) out.err = "sa-fail";
+      else if(lastPeak !== null && !out.recSilent) out.err = "no-response";
+    }
+    meterStop(); cb(out);
+  };
   let firstUrl = null;
   meterStart(opts.meterEl);
   const attempt = (withRec, isRetry) => {
@@ -6446,7 +6568,7 @@ function startWordScore(host, v, uid){
   stopWordInline();
   panel.hidden = false;
   if(!SR){
-    panel.innerHTML = '<div class="ws-state">这个浏览器不支持语音识别，没法自动打分。<br>可以点单词听原音，自己大声跟读几遍。</div>';
+    panel.innerHTML = '<div class="ws-state">这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的），没法自动打分。<br>想用语音打分：点右上角 ···，选『在 Safari 中打开』再回来。<br>现在可以点单词听原音，自己大声跟读几遍。</div>';
     return;
   }
   panel.dataset.wsbusy = "1";
@@ -6482,9 +6604,20 @@ function startWordScore(host, v, uid){
       if(og) og.addEventListener("click", () => speak(v[0], 1));
     }, { word: true, meterEl: panel.querySelector(".mic-meter") });
   };
+  const demoFail = () => {
+    if(panel._wsTok !== wsTok || !panel.isConnected) return;
+    /* 原音彻底没加载出来：停在示范步让她自己选，不再默默轮到她读——她还没听过这个词怎么读 */
+    panel.innerHTML = '<div class="ws-state">原音没加载出来（网络或浏览器的问题）。</div>' +
+      '<div class="ws-row"><button class="btn soft small" data-wsdemo type="button">↻ 重新加载原音</button>' +
+      '<button class="btn ghost small" data-wsskip type="button">直接打分</button></div>';
+    const rb = panel.querySelector("[data-wsdemo]");
+    if(rb) rb.addEventListener("click", () => { panel.dataset.wsbusy = ""; startWordScore(host, v, uid); });
+    const sk = panel.querySelector("[data-wsskip]");
+    if(sk) sk.addEventListener("click", () => begin());
+  };
   let ok = false;
-  try { ok = playRec(v[0], 1, null, begin, begin); } catch(e){ ok = false; }
-  if(!ok) setTimeout(begin, 700);
+  try { ok = playRec(v[0], 1, null, begin, demoFail); } catch(e){ ok = false; }
+  if(!ok) demoFail();
 }
 /* ---- 单词视频：全屏 VL 播放器，只装一个词的瘦身干货流程 ---- */
 function wvWordStage1(ls, v, uid){
@@ -6506,10 +6639,10 @@ function wvWordPlaySingle(ls, v, uid, gen){
   const items = [
     n => { wvSetPhase('先看这个词，照着白话音在心里念一遍'); wvPulse('word'); wvLater(n, 1700); },
     n => { wvSetPhase('听小偏方，把意思钉住'); wvPulse('hook'); if(hookF) wvPlayPath(hookF, gen, n); else wvLater(n, 500); },
-    n => { wvSetPhase('听发音'); wvPulse('word'); wvPlayRec(word, 1, null, gen, n); },
-    n => { wvSetPhase('慢速，再听一遍'); wvPlayRec(word, 0.6, null, gen, n); },
+    n => { wvSetPhase('听发音'); wvPulse('word'); wvPlayRec2(word, 1, null, gen, ok => { if(ok) n(); else vlDemoFail(gen); }); },
+    n => { wvSetPhase('慢速，再听一遍'); wvPlayRec2(word, 0.6, null, gen, ok => { if(ok) n(); else vlDemoFail(gen); }); },
     n => { wvSetPhase('跟我读一遍：' + word); wvLater(n, Math.min(5000, Math.max(2600, 1900 + word.length * 300))); },
-    n => { wvSetPhase('例句先慢速听，看着屏幕上的句子跟上'); wvPulse('ex'); wvPlayRec(v[3], 0.6, null, gen, n); },
+    n => { wvSetPhase('例句逐词听，看着屏幕上的句子跟上'); wvPulse('ex'); wvPlayWords(v[3], null, gen, document.querySelector('#vlStage .wv-ex .en'), n); },
     n => { wvSetPhase('例句的意思'); if(exF) wvPlayPath(exF, gen, n); else wvPlayRec(v[4], 1, null, gen, n); }
   ];
   wvSeq(items, gen, () => vlAdvance(gen));
@@ -7207,6 +7340,8 @@ function renderDlgBrowse(){
       '</div>' +
       '<div class="ctl-prog"><i id="ctlBar" style="width:0%"></i></div>' +
       '<div class="ctl-info" id="ctlInfo">点「整段跟读」开始；播放中点任意一句，可直接跳到那句跟读。</div>' +
+      '<div id="ctlFail" style="display:none;margin-top:8px;"></div>' +
+      '<div class="mic-meter" id="ctlMeter"></div>' +
     '</div>' +
     '<div class="dlg-tools">' +
       '<button class="btn soft small" id="dlgPlayAll">▶ 整段跟读（慢速 · 英中穿插）</button>' +
@@ -7285,7 +7420,7 @@ function drawRole(zone, ls){
         '<button class="pick-card" id="rpRoleA" style="flex:1;min-width:140px;">演角色 A<small>对话里先开口的一方</small></button>' +
         '<button class="pick-card" id="rpRoleB" style="flex:1;min-width:140px;">演角色 B<small>对话里回应的一方</small></button>' +
       '</div>' +
-      (SR ? "" : '<p class="mic-note">提示：这个浏览器不支持语音识别，可以用打字演角色，纠错照样管用。想用语音，建议用 Chrome 或 Safari 打开。</p>');
+      (SR ? "" : '<p class="mic-note">提示：' + NO_SR_HINT + '现在可以先用打字演角色，纠错照样管用。</p>');
     zone.querySelector("#rpRoleA").addEventListener("click", () => { rp.role = "A"; rp.phase = "play"; rp.idx = 0; drawRole(zone, ls); });
     zone.querySelector("#rpRoleB").addEventListener("click", () => { rp.role = "B"; rp.phase = "play"; rp.idx = 0; drawRole(zone, ls); });
     return;
@@ -7377,8 +7512,18 @@ function drawRole(zone, ls){
             const rz = zone.querySelector("#rpResult");
             if(rz) rz.innerHTML = '<div class="card corr-card"><div class="mic-warn" style="margin-top:0;">' + MIC_HINT + '</div></div>';
             else toast(MIC_HINT);
+          } else if(out.err === "no-response" || out.err === "sa-fail"){
+            /* 录到了声、识别没响应（或独立模式识别不稳）：把原因说破并给「再试一次」，
+               别只弹一句就让她对着空气再读 */
+            const rz = zone.querySelector("#rpResult");
+            if(rz){
+              rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div>' +
+                '<div style="margin-top:8px;"><button class="btn soft small" id="rpRetry" type="button">再试一次</button></div></div>';
+              const rb3 = rz.querySelector("#rpRetry");
+              if(rb3) rb3.addEventListener("click", () => { const mb = zone.querySelector("#rpMic"); if(mb) mb.click(); });
+            } else toast(srErrText(out.err));
           } else {
-            toast(out.err === "unsupported" ? "这个浏览器不支持语音识别，请切换到打字模式" : srErrText(out.err));
+            toast(out.err === "unsupported" ? NO_SR_HINT + "请切换到打字模式。" : srErrText(out.err));
           }
           return;
         }
@@ -7533,7 +7678,7 @@ function renderPronToday(){
   const cnt = $("#cntPronToday");
   if(cnt) cnt.textContent = "已练 " + pp.c.pron.done + " / " + pp.c.pron.total;
   host.innerHTML = '<p class="sec-sub">今天要跟读打分的句子，练完一句，今日进度就记一句。' +
-    (SR ? "" : '提示：这个浏览器不支持语音识别，没法自动打分；可以录音回放对照原音自评，想用自动纠错建议用 Chrome 或 Safari 打开。') + '</p>';
+    (SR ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）。点右上角 ···，选『在 Safari 中打开』就能语音打分；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
   let focusEl = null;
   pp.plan.pron.forEach(lid => {
     const x = ALL_LINES.find(y => y.lid === lid); if(!x) return;
@@ -7553,7 +7698,7 @@ function renderPronBrowse(){
   const ls = LESSON_MAP[sel.pron];
   const host = $("#pronMain");
   host.innerHTML = '<p class="sec-sub">《' + esc(ls.t) + '》的对话句子，逐句跟读打分。' +
-    (SR ? "" : '提示：这个浏览器不支持语音识别，没法自动打分；可以录音回放对照原音自评，想用自动纠错建议用 Chrome 或 Safari 打开。') + '</p>';
+    (SR ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）。点右上角 ···，选『在 Safari 中打开』就能语音打分；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
   const pvWrap = document.createElement('div');
   pvWrap.style.margin = '0 0 10px';
   pvWrap.innerHTML = '<button class="btn main small" id="pronVideo">▶ 上这一课的视频课</button> <span class="mic-note" style="margin:0;">先看视频跟读，再回来逐句打分</span>';
@@ -7626,9 +7771,62 @@ function pronCard(ls, i){
   let checkBusy = false;
   const doneBtn = card.querySelector('[data-act="done"]');
   if(doneBtn) doneBtn.addEventListener("click", () => endGradeNow());
+  /* 判分结果统一处理：语音判分与无识别环境下的打字纠错共用（判分/入账/最好分/错句记录同一口径；
+     与角色扮演打字模式同口径：打字结果会计入，但注明是打字） */
+  const gradeOut = out => {
+    checkBusy = false;
+    if(doneBtn) doneBtn.style.display = "none";
+    checkBtn.textContent = "再练一次";
+    if(out.url) showMine(out.url);
+    if(!out.res){
+      const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
+      result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>' +
+        ((out.err === "no-response" || out.err === "sa-fail") ? '<div style="margin-top:8px;"><button class="btn soft small" data-retry2 type="button">再试一次</button></div>' : '');
+      const rt2 = result.querySelector("[data-retry2]");
+      if(rt2) rt2.addEventListener("click", () => checkBtn.click());
+      return;
+    }
+    const text = out.text, res = out.res;
+    pracLine(lid);
+    state.stats.pronAttempts++;
+    if(res.score >= 90) state.stats.pron90++;
+    if(state.pronBest[lid] === undefined || res.score > state.pronBest[lid]) state.pronBest[lid] = res.score;
+    state.pron.unshift({ lid, lesson: ls.t, en: d[1], cn: d[2], score: res.score, wrong: res.wrong, said: text, ts: Date.now() });
+    if(state.pron.length > 200) state.pron.length = 200;
+    addXP(res.score >= 85 ? 5 : 3);
+    result.innerHTML =
+      '<div class="pron-head" style="margin-top:12px;"><div class="score-big ' + (res.score >= 85 ? "good" : res.score >= 60 ? "mid" : "low") + '">' + res.score + '</div>' +
+      '<div class="ph-txt"><div style="font-weight:700;">发音得分 / 100</div><div style="font-size:12.5px;color:var(--ink-faint);">识别到你读的是：<span class="en">' + esc(text) + '</span></div></div></div>' +
+      '<div class="corr-right en" style="margin-top:10px;">' + diffHTML(res) + '</div>' + extraHTML(res) + pointsHTML(res) +
+      (out.typed ? '<div class="mic-note">这是打字纠错的结果：拼对不等于读准，有条件时用 Safari 打开、语音再读一遍。</div>' : !out.url ? '<div class="mic-note">这次没录上回放音频，想听自己的声音可以用🎙单独录一遍</div>' : '') +
+      (out.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
+      '<div class="comment-line"><b>点评：</b>' + esc(pronComment(res, d[1])) + '</div>' +
+      '<div class="mic-note">红色词上面小字是识别到的你的读法；金色虚线是漏读的词；橙色是发音接近但还不准的词。这一句已算进今日发音进度。</div>' +
+      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn soft small" data-reread type="button">↻ 重读这句</button>' +
+      (out.url ? '<button class="btn ghost small" data-playmine type="button">▶ 听我刚读的</button>' : '') + '</div>';
+    const rrb = result.querySelector("[data-reread]");
+    if(rrb) rrb.addEventListener("click", () => checkBtn.click());
+    const pmb = result.querySelector("[data-playmine]");
+    if(pmb) pmb.addEventListener("click", () => { showMine(out.url); try { const pp3 = audio.play(); if(pp3 && pp3.catch) pp3.catch(() => {}); } catch(e){} });
+    renderHUD(); saveState();
+    renderPronExtras();
+  };
   checkBtn.addEventListener("click", () => {
     if(!SR){
-      toast("这个浏览器不支持语音识别：先听原音，再用麦克风录下自己读的回放对比");
+      /* 没有语音识别的环境（多半是微信等 App 的内置浏览器）：把话说破，并给打字纠错的替代路径，
+         不再只弹一句提示就没了下文，更不能装作「没听清」让她对着空气读 */
+      result.innerHTML =
+        '<div class="mic-warn" style="margin-top:10px;">' + NO_SR_HINT + '</div>' +
+        '<div class="mic-note">现在可以打字完成这句：把这句英文打出来，照样纠错打分、照样记入进度（打字对了不等于读准，用 Safari 打开时记得语音再练一遍）。</div>' +
+        '<textarea class="say-input" data-typein placeholder="把这句英文打在这里…"></textarea>' +
+        '<div style="margin-top:8px;"><button class="btn blue small" data-typesub type="button">提交纠错</button></div>';
+      const sub = result.querySelector("[data-typesub]");
+      if(sub) sub.addEventListener("click", () => {
+        const ta = result.querySelector("[data-typein]");
+        const typed = ta ? ta.value.trim() : "";
+        if(!typed){ toast("先把这句英文打出来再提交"); return; }
+        gradeOut({ text: typed, res: diffSentence(d[1], typed), url: null, retried: false, err: null, typed: true });
+      });
       return;
     }
     if(checkBusy){
@@ -7643,41 +7841,7 @@ function pronCard(ls, i){
     checkBusy = true;
     checkBtn.textContent = "正在听你说…（再点一次取消）";
     if(doneBtn) doneBtn.style.display = "";
-    listenGrade(d[1], out => {
-      checkBusy = false;
-      if(doneBtn) doneBtn.style.display = "none";
-      checkBtn.textContent = "再练一次";
-      if(out.url) showMine(out.url);
-      if(!out.res){
-        const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
-        result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>';
-        return;
-      }
-      const text = out.text, res = out.res;
-      pracLine(lid);
-      state.stats.pronAttempts++;
-      if(res.score >= 90) state.stats.pron90++;
-      if(state.pronBest[lid] === undefined || res.score > state.pronBest[lid]) state.pronBest[lid] = res.score;
-      state.pron.unshift({ lid, lesson: ls.t, en: d[1], cn: d[2], score: res.score, wrong: res.wrong, said: text, ts: Date.now() });
-      if(state.pron.length > 200) state.pron.length = 200;
-      addXP(res.score >= 85 ? 5 : 3);
-      result.innerHTML =
-        '<div class="pron-head" style="margin-top:12px;"><div class="score-big ' + (res.score >= 85 ? "good" : res.score >= 60 ? "mid" : "low") + '">' + res.score + '</div>' +
-        '<div class="ph-txt"><div style="font-weight:700;">发音得分 / 100</div><div style="font-size:12.5px;color:var(--ink-faint);">识别到你读的是：<span class="en">' + esc(text) + '</span></div></div></div>' +
-        '<div class="corr-right en" style="margin-top:10px;">' + diffHTML(res) + '</div>' + extraHTML(res) + pointsHTML(res) +
-        (!out.url ? '<div class="mic-note">这次没录上回放音频，想听自己的声音可以用🎙单独录一遍</div>' : '') +
-        (out.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
-        '<div class="comment-line"><b>点评：</b>' + esc(pronComment(res, d[1])) + '</div>' +
-        '<div class="mic-note">红色词上面小字是识别到的你的读法；金色虚线是漏读的词；橙色是发音接近但还不准的词。这一句已算进今日发音进度。</div>' +
-        '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn soft small" data-reread type="button">↻ 重读这句</button>' +
-        (out.url ? '<button class="btn ghost small" data-playmine type="button">▶ 听我刚读的</button>' : '') + '</div>';
-      const rrb = result.querySelector("[data-reread]");
-      if(rrb) rrb.addEventListener("click", () => checkBtn.click());
-      const pmb = result.querySelector("[data-playmine]");
-      if(pmb) pmb.addEventListener("click", () => { showMine(out.url); try { const pp3 = audio.play(); if(pp3 && pp3.catch) pp3.catch(() => {}); } catch(e){} });
-      renderHUD(); saveState();
-      renderPronExtras();
-    }, { meterEl: card.querySelector(".mic-meter") });
+    listenGrade(d[1], gradeOut, { meterEl: card.querySelector(".mic-meter") });
   });
   return card;
 }
@@ -7729,7 +7893,7 @@ function renderPronExtras(){
   st.querySelectorAll("[data-tipcheck]").forEach(b => b.addEventListener("click", () => {
     const ti = +b.dataset.tipcheck;
     const out = st.querySelector('[data-tipout="' + ti + '"]');
-    if(!SR){ out.textContent = "这个浏览器不支持语音识别，没法自测；点上面的词听示范，跟着大声读几遍。"; return; }
+    if(!SR){ out.textContent = "这个浏览器里用不了语音识别（多半是在微信等 App 里打开的），没法自测；点右上角 ···，选『在 Safari 中打开』就能自测。现在先点上面的词听示范，跟着大声读几遍。"; return; }
     const word = shuffle(tips[ti].words.slice())[0];
     out.innerHTML = '请读这个词：<b class="en" style="font-size:16px;">' + word + '</b>（正在听…）';
     listenOnce((alts, err) => {
@@ -8207,11 +8371,10 @@ function vlPlayStep(step, gen){
     const ls = LESSON_MAP[VL.id], ex = ls.g[3][step.i];
     const playEx = () => {
       if(gen !== VL.gen) return;
-      const chain = (rate, done) => {
-        if(playRec(ex[0], rate, null, done, () => vlTtsOnce(ex[0], rate, done))) return;
-        vlTtsOnce(ex[0], rate, done);
-      };
-      chain(0.62, () => setTimeout(() => { if(gen === VL.gen) chain(0.62, () => vlAdvance(gen)); }, 380));
+      /* 例句改逐词常速词（与对话页同口径，不再整句 -ss 慢速）；逐词全灭才回退整句录音/TTS，
+         回退也没声就停在本段报错（vlDemoFail），不静默翻到下一段 */
+      const chain = done => wvPlayWords(ex[0], null, gen, document.querySelector('#vlStage .en'), done);
+      chain(() => setTimeout(() => { if(gen === VL.gen) chain(() => vlAdvance(gen)); }, 380));
     };
     if(step.lead){
       const a = new Audio(vlNar('shared-listen'));
@@ -8562,6 +8725,43 @@ function wvPlayRec(text, rate, speaker, gen, done){
   if(!ok) wvLater(fin, 60);
   wvLater(fin, 20000);
 }
+/* wvPlayRec 的成败版：done(ok)——ok=false 表示录音链（慢速→常速→TTS）彻底没声 */
+function wvPlayRec2(text, rate, speaker, gen, done){
+  let settled = false;
+  const fin = ok => { if(!settled){ settled = true; done(!!ok); } };
+  let started = false;
+  try { started = playRec(text, rate, speaker, () => fin(true), () => fin(false)); } catch(e){ started = false; }
+  if(!started) fin(false);
+  wvLater(() => fin(false), 20000);
+}
+/* VL 英文教学句统一口径：逐词常速词（与对话页同口径），播时在 el 上逐词高亮；
+   逐词一个都没声才回退整句慢速录音/TTS；回退也没声 → vlDemoFail 停在本段报错，
+   绝不静默翻段让她「直接读」没听过的句子 */
+function wvPlayWords(text, speaker, gen, el, next){
+  wbwStop();
+  const fallback = () => wvPlayRec2(text, 0.6, speaker, gen, ok2 => { if(gen !== VL.gen) return; if(ok2) next(); else vlDemoFail(gen); });
+  const ok = playWordsSlow(text, { shadow: true, el: el || null, isPaused: () => !(VL && VL.on && VL.playing) },
+    () => { if(gen === VL.gen) next(); },
+    () => { if(gen === VL.gen) fallback(); });
+  if(!ok) fallback();
+}
+/* VL 示范彻底没声：停在当前段，给可见提示 + 重新加载，不推进 */
+function vlDemoFail(gen){
+  if(!VL || gen !== VL.gen) return;
+  VL.playing = false;
+  vlSetPlayUI();
+  const stage = document.getElementById('vlStage');
+  if(stage && !stage.querySelector('.vl-fail')){
+    const box = document.createElement('div');
+    box.className = 'vl-fail';
+    box.style.cssText = 'margin:0 0 12px;';
+    box.innerHTML = '<div class="mic-warn" style="margin:0;">这句的示范朗读没加载出来（网络或浏览器的问题）。</div>' +
+      '<button class="btn soft small" id="vlRetryDemo" type="button" style="margin-top:8px;">↻ 重新加载</button>';
+    stage.prepend(box);
+    const b = box.querySelector('#vlRetryDemo');
+    if(b) b.addEventListener('click', () => { box.remove(); vlGo(VL.idx, true); });
+  }
+}
 function wvSeq(items, gen, done){
   let i = 0;
   const next = () => {
@@ -8609,11 +8809,11 @@ function wvWordPlay(ls, v, uid, gen){
   const items = [
     n => { wvSetPhase('先听小偏方，把意思钉住'); wvPulse('hook'); if(hookF) wvPlayPath(hookF, gen, n); else wvLater(n, 500); },
     n => { wvSetPhase('把这个画面在心里停一停'); wvLater(n, 1400); },
-    n => { wvSetPhase('听发音'); wvPulse('word'); wvPlayRec(word, 1, null, gen, n); },
-    n => { wvSetPhase('慢速，再听一遍'); wvPlayRec(word, 0.6, null, gen, n); },
+    n => { wvSetPhase('听发音'); wvPulse('word'); wvPlayRec2(word, 1, null, gen, ok => { if(ok) n(); else vlDemoFail(gen); }); },
+    n => { wvSetPhase('慢速，再听一遍'); wvPlayRec2(word, 0.6, null, gen, ok => { if(ok) n(); else vlDemoFail(gen); }); },
     n => { wvSetPhase('轮到你了，准备跟我读'); wvLater(n, 700); },
     n => { wvSetPhase('跟我读一遍：' + word); wvLater(n, Math.min(5000, Math.max(2600, 1900 + word.length * 300))); },
-    n => { wvSetPhase('例句先慢速听，看着屏幕上的句子跟上'); wvPulse('ex'); wvPlayRec(v[3], 0.6, null, gen, n); },
+    n => { wvSetPhase('例句逐词听，看着屏幕上的句子跟上'); wvPulse('ex'); wvPlayWords(v[3], null, gen, document.querySelector('#vlStage .wv-ex .en'), n); },
     n => { wvSetPhase('想一想，这句是什么意思'); wvLater(n, 900); },
     n => { wvSetPhase('例句的意思'); if(exF) wvPlayPath(exF, gen, n); else wvPlayRec(v[4], 1, null, gen, n); }
   ];
@@ -8679,12 +8879,13 @@ function wvDlgStage(ls, cur){
 }
 function wvLinePlay(ls, d, gen){
   const pauseMs = Math.min(5200, Math.max(2200, d[1].length * 95));
+  const lineEl = () => document.querySelector('#vlStage .wv-line.cur .en');
   const items = [
-    n => { wvSetPhase('先慢速听一遍'); wvPlayRec(d[1], 0.6, d[0], gen, n); },
+    n => { wvSetPhase('先逐词听一遍'); wvPlayWords(d[1], d[0], gen, lineEl(), n); },
     n => { wvSetPhase('听中文意思'); wvPlayRec(d[2], 1, null, gen, n); },
-    n => { wvSetPhase('慢速第一遍，听清楚每个词'); wvPlayRec(d[1], 0.6, d[0], gen, n); },
+    n => { wvSetPhase('逐词第一遍，听清楚每个词'); wvPlayWords(d[1], d[0], gen, lineEl(), n); },
     n => { wvSetPhase('跟我读一遍'); wvLater(n, pauseMs); },
-    n => { wvSetPhase('慢速第二遍'); wvPlayRec(d[1], 0.6, d[0], gen, n); },
+    n => { wvSetPhase('逐词第二遍'); wvPlayWords(d[1], d[0], gen, lineEl(), n); },
     n => { wvSetPhase('再跟我读一遍'); wvLater(n, pauseMs); }
   ];
   wvSeq(items, gen, () => vlAdvance(gen));
@@ -8722,9 +8923,9 @@ function wvDlgPreview(ls){
 function wvDlgSteps(ls){
   const steps = [{
     k: 'nar', f: 'wv-intro-d', tag: '开场',
-    cap: '这一课是对话《' + ls.t + '》：逐句听原声、听意思、慢速跟读，最后整段连播。',
+    cap: '这一课是对话《' + ls.t + '》：逐句听原声、听意思、逐词跟读，最后整段连播。',
     html: '<div class="vl-kicker">视频课 · 对话</div><div class="vl-big">' + esc(ls.t) + '</div>' +
-      '<div class="vl-sub-cn">逐句学：原声 → 中文意思 → 慢速跟读两遍，最后整段连播一遍。</div>' + wvDlgPreview(ls)
+      '<div class="vl-sub-cn">逐句学：原声 → 中文意思 → 逐词跟读两遍，最后整段连播一遍。</div>' + wvDlgPreview(ls)
   }];
   ls.dl.forEach((d, i) => {
     steps.push({ k: 'wv', tag: '第 ' + (i + 1) + ' 句', capTxt: '', html: wvDlgStage(ls, i), play: gen => wvLinePlay(ls, d, gen) });
@@ -8733,7 +8934,7 @@ function wvDlgSteps(ls){
     k: 'wv', tag: '整段连播', capTxt: '整段连起来听一遍，跟着默念。',
     html: wvDlgStage(ls, -1),
     play: gen => {
-      const items = ls.dl.map(d => n => wvPlayRec(d[1], 0.6, d[0], gen, () => wvLater(n, 150)));
+      const items = ls.dl.map(d => n => wvPlayWords(d[1], d[0], gen, null, () => wvLater(n, 150)));
       wvSeq(items, gen, () => vlAdvance(gen));
     }
   });
