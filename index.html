@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610231216";
+var APP_BUILD = "v202610231335";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -281,6 +281,20 @@ var APP_BUILD = "v202610231216";
       h2.sec{font-size:21px;margin:30px 0 4px;font-weight:700;letter-spacing:-.02em;}
       .sec-sub{color:var(--ink-soft);font-size:13.5px;margin:0 0 14px;}
       .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);}
+      /* ---- 账号与云端卡（v3.16 视觉重排） ---- */
+      .bk-card{padding:20px 18px 16px;}
+      .bk-head{margin-bottom:12px;}
+      .bk-title{font-family:Georgia,"Times New Roman","Songti SC",serif;font-size:19px;font-weight:700;letter-spacing:.02em;}
+      .bk-rule{height:2px;margin-top:8px;border-radius:2px;background:linear-gradient(90deg,var(--gold),rgba(194,161,77,0));}
+      .bk-sec-label{font-weight:700;font-size:15px;}
+      .btn.gold{background:var(--gold);color:#221a08;box-shadow:none;}
+      .sync-pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);background:var(--surface-2);border-radius:99px;padding:5px 12px;font-size:12.5px;font-weight:600;color:var(--ink-soft);max-width:100%;}
+      .sync-dot{width:8px;height:8px;border-radius:50%;background:#9a958a;flex:none;}
+      .sync-pill[data-st="syncing"] .sync-dot{background:var(--gold);}
+      .sync-pill[data-st="ok"] .sync-dot{background:var(--ok);}
+      .sync-pill[data-st="fail"] .sync-dot{background:var(--bad);}
+      .sync-pill[data-st="fail"]{color:var(--bad);}
+      .bk-card .xsub{margin-top:16px;}
       .toast{
         position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(20px);
         background:var(--ink);color:var(--bg);padding:10px 18px;border-radius:99px;font-size:13.5px;font-weight:500;
@@ -6887,7 +6901,7 @@ function paintBackupUI(){
   if(rem){
     if(backupShouldRemind()){
       rem.innerHTML = '<div class="card" data-bk-remind style="border:1.5px solid #c2a14d;background:rgba(194,161,77,.08);display:flex;align-items:center;gap:10px;">' +
-        '<button data-bk-go type="button" style="flex:1;text-align:left;background:none;border:none;font:inherit;color:inherit;cursor:pointer;padding:0;">记得备份一下进度（点这里）——进度只存在这台手机里，导出存一份更安心。</button>' +
+        '<button data-bk-go type="button" style="flex:1;text-align:left;background:none;border:none;font:inherit;color:inherit;cursor:pointer;padding:0;">记得偶尔导出一份备份存好（点这里）——账号同步之外，多一份手动备份更安心。</button>' +
         '<button data-bk-dismiss type="button" aria-label="关闭提醒" style="background:none;border:none;font-size:17px;color:var(--ink-faint);cursor:pointer;padding:2px 6px;">✕</button></div>';
       const go = rem.querySelector("[data-bk-go]");
       if(go) go.addEventListener("click", () => { const c = $("#backupCard"); if(c) c.scrollIntoView({ behavior: "smooth", block: "start" }); });
@@ -6898,19 +6912,22 @@ function paintBackupUI(){
   if(!card) return;
   const meta = backupMeta();
   const lastTxt = meta.lastExport ? new Date(meta.lastExport).toLocaleDateString("zh-CN") : "还没备份过";
-  let h = '<div class="card" data-bkcard>' +
-    '<div style="font-weight:700;font-size:16px;">账号与云端</div>' +
-    '<p class="sec-sub" style="margin-top:6px;">你的学习进度只存在这台手机里。换手机、清掉浏览器数据，进度就找不回来了。把进度导出一份存好（发到微信文件传输助手、存进备忘录都行），万一丢了，回来粘贴就能恢复。</p>' +
-    '<div style="font-size:13.5px;color:var(--ink-soft);margin-top:6px;">现在：已学 <b>' + learnedCount() + '</b> 个词 · 连续学习 <b>' + streakDays() + '</b> 天 · 上次备份：' + esc(lastTxt) + '</div>' +
-    '<div style="margin-top:10px;"><button class="btn blue" data-bk-export type="button">导出备份</button></div>';
+  let h = '<div class="card bk-card" data-bkcard>' +
+    '<div class="bk-head"><div class="bk-title">账号与云端</div><div class="bk-rule"></div></div>' +
+    '<div data-acct-slot></div>' +
+    '<div class="xsec xsub" data-sec="bk-manual"' + secOpenAttr("bk-manual", false) + '>' +
+    '<div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">手动备份<small>第二保险 · 账号同步之外，再存一份到自己手里</small></span><span class="xsec-arrow">▾</span></div>' +
+    '<div class="xsec-body"><div class="xsec-inner">' +
+    '<p class="sec-sub" style="margin:0 0 10px;">把进度导出一份存好（发到微信文件传输助手、存进备忘录都行）。万一账号和手机都用不了，回来粘贴这份备份就能恢复。</p>' +
+    '<div style="font-size:13.5px;color:var(--ink-soft);">现在：已学 <b>' + learnedCount() + '</b> 个词 · 连续学习 <b>' + streakDays() + '</b> 天 · 上次备份：' + esc(lastTxt) + '</div>' +
+    '<div style="margin-top:10px;"><button class="btn" data-bk-export type="button">导出备份</button></div>';
   if(BK_UI.exportText){
     h += '<div style="margin-top:10px;"><div style="font-size:13px;color:var(--ink-soft);margin-bottom:6px;">备份文字已经准备好（下面这一大段就是），复制下来存好：</div>' +
       '<textarea class="say-input" data-bk-export-text rows="4" readonly>' + esc(BK_UI.exportText) + '</textarea>' +
       '<div style="margin-top:8px;"><button class="btn" data-bk-copy type="button">复制备份文本</button></div></div>';
   }
-  h += '<div style="border-top:1px solid var(--line);margin:16px 0 12px;"></div>' +
-    '<div style="font-weight:700;">恢复进度</div>' +
-    '<p class="sec-sub" style="margin-top:6px;">把之前导出的备份文字完整粘贴到下面，或者选一个备份文件。点「检查备份」后，会先告诉你这是哪天的备份、学了多少词，你确认了才会覆盖现在的进度——确认之前什么都不会改。</p>' +
+  h += '<div class="bk-sec-label" style="margin-top:16px;">恢复进度</div>' +
+    '<p class="sec-sub" style="margin:4px 0 10px;">把之前导出的备份文字完整粘贴到下面，或者选一个备份文件。点「检查备份」后，会先告诉你这是哪天的备份、学了多少词，你确认了才会覆盖现在的进度——确认之前什么都不会改。</p>' +
     '<textarea class="say-input" data-bk-draft rows="4" placeholder="把备份文字粘贴到这里…">' + esc(BK_UI.draft) + '</textarea>' +
     '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn" data-bk-check type="button">检查备份</button>' +
     '<button class="btn ghost" data-bk-pickfile type="button">选备份文件</button>' +
@@ -6921,13 +6938,13 @@ function paintBackupUI(){
       '<div style="font-weight:700;">这是 ' + esc(p.whenText) + ' 的备份</div>' +
       '<div style="font-size:13.5px;color:var(--ink-soft);margin-top:4px;">已学 ' + p.learned + ' 个词 · 连续学习 ' + p.streak + ' 天 · 累计打卡 ' + p.checkinDays + ' 天</div>' +
       '<div style="font-size:13.5px;margin-top:6px;">恢复后，这台手机现在的进度会被这份备份替换。确定要恢复吗？</div>' +
-      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn blue" data-bk-confirm type="button">确认恢复</button>' +
+      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn gold" data-bk-confirm type="button">确认恢复</button>' +
       '<button class="btn ghost" data-bk-cancel type="button">先不恢复</button></div></div>';
   }
   if(BK_UI.msg) h += '<div data-bk-msg style="margin-top:10px;font-size:13.5px;color:' + (BK_UI.msgOk ? "var(--ok)" : "var(--bad)") + ';">' + esc(BK_UI.msg) + '</div>';
-  h += '</div>';
+  h += '</div></div></div></div>';
   card.innerHTML = h;
-  try { acctRenderSection(card); } catch(e){}
+  try { acctRenderSection(card.querySelector("[data-acct-slot]")); } catch(e){}
   const q = s => card.querySelector(s);
   const ex = q("[data-bk-export]"); if(ex) ex.addEventListener("click", bkExport);
   const cp = q("[data-bk-copy]"); if(cp) cp.addEventListener("click", bkCopyExport);
@@ -7042,9 +7059,20 @@ function acctStatusText(){
   if (m.lastSyncAt) return "已同步到云端 · " + new Date(m.lastSyncAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
   return "已登录，还没同步过";
 }
+function acctPillState(){
+  if (!ACCT.username) return "out";
+  if (ACCT.status === "syncing") return "syncing";
+  if (ACCT.status === "fail") return "fail";
+  return "ok";
+}
+function acctPillHtml(){
+  return '<span class="sync-pill" data-acct-pill data-st="' + acctPillState() + '"><i class="sync-dot"></i><span data-acct-status>' + esc(acctStatusText()) + '</span></span>';
+}
 function acctPaintStatus(){
   const el = document.querySelector("[data-acct-status]");
   if (el) el.textContent = acctStatusText();
+  const pill = document.querySelector("[data-acct-pill]");
+  if (pill) pill.setAttribute("data-st", acctPillState());
 }
 
 /* ---- 数据打包/落地：与 v3.14 备份同一序列化层 ---- */
@@ -7168,36 +7196,33 @@ function acctRenderSection(card){
   sec.setAttribute("data-acct-sec", "1");
   const msgHtml = ACCT.msg ? '<div data-acct-msg style="margin-top:10px;font-size:13.5px;color:' + (ACCT.msgOk ? "var(--ok)" : "var(--bad)") + ';">' + esc(ACCT.msg) + '</div>' : "";
   if (!ACCT.username){
-    let h = '<div style="font-weight:700;">登录</div>' +
-      '<p class="sec-sub" style="margin-top:6px;">登录后，你的学习进度会自动存到云端。换手机、删掉桌面图标，重新登录就能找回来。</p>' +
+    let h = '<p class="sec-sub" style="margin:0 0 10px;">登录后，你的学习进度会自动同步到云端。换手机、换设备，登录同一个账号就能接着学。</p>' +
       '<input class="say-input" data-acct-user type="text" autocomplete="username" placeholder="用户名" value="' + esc(ACCT_UI.user) + '">' +
       '<input class="say-input" data-acct-pass type="password" autocomplete="current-password" placeholder="密码" value="' + esc(ACCT_UI.pass) + '" style="margin-top:8px;">' +
-      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;"><button class="btn blue" data-acct-login type="button">登录</button>' +
+      '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;"><button class="btn gold" data-acct-login type="button">登录</button>' +
       '<button class="btn ghost" data-acct-showreg type="button">' + (ACCT_UI.showReg ? "收起注册" : "注册新账号") + '</button></div>' +
-      '<div style="margin-top:8px;font-size:13px;color:var(--ink-soft);">同步状态：<span data-acct-status">' + esc(acctStatusText()) + '</span></div>' +
-      '<p class="sec-sub" style="margin-top:6px;">密码忘了没法自己找回，要找分享给你这个 App 的人重置。</p>';
+      '<div style="margin-top:12px;">' + acctPillHtml() + '</div>' +
+      '<p style="margin:8px 0 0;font-size:12.5px;color:var(--ink-faint);">密码忘了没法自己找回，要找分享给你这个 App 的人重置。</p>';
     if (ACCT_UI.showReg){
-      h += '<div style="border-top:1px solid var(--line);margin:14px 0 10px;"></div>' +
-        '<div style="font-weight:700;">注册新账号</div>' +
+      h += '<div style="border-top:1px solid var(--line);margin:14px 0 12px;"></div>' +
+        '<div class="bk-sec-label">注册新账号</div>' +
         '<input class="say-input" data-acct-ruser type="text" autocomplete="username" placeholder="想一个用户名" value="' + esc(ACCT_UI.ruser) + '" style="margin-top:8px;">' +
         '<input class="say-input" data-acct-rpass type="password" autocomplete="new-password" placeholder="设一个密码（至少 6 位）" value="' + esc(ACCT_UI.rpass) + '" style="margin-top:8px;">' +
         '<input class="say-input" data-acct-rinvite type="text" placeholder="邀请码" value="' + esc(ACCT_UI.rinvite) + '" style="margin-top:8px;">' +
-        '<div style="margin-top:10px;"><button class="btn blue" data-acct-register type="button">注册并登录</button></div>' +
-        '<p class="sec-sub" style="margin-top:6px;">注册时，你这台手机现在的进度会自动带上去，不用从头开始。</p>';
+        '<div style="margin-top:12px;"><button class="btn gold" data-acct-register type="button">注册并登录</button></div>' +
+        '<p class="sec-sub" style="margin:8px 0 0;">注册时，你这台手机现在的进度会自动带上去，不用从头开始。</p>';
     }
     h += msgHtml;
-    h += '<div style="border-top:1px solid var(--line);margin:16px 0 4px;"></div>';
     sec.innerHTML = h;
   } else {
     sec.innerHTML =
-      '<div style="font-weight:700;">☁️ 已登录：' + esc(ACCT.username) + '</div>' +
-      '<div style="margin-top:6px;font-size:13.5px;color:var(--ink-soft);">同步状态：<span data-acct-status>' + esc(acctStatusText()) + '</span></div>' +
+      '<div class="bk-sec-label">已登录：' + esc(ACCT.username) + '</div>' +
+      '<div style="margin-top:10px;">' + acctPillHtml() + '</div>' +
       msgHtml +
-      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn blue" data-acct-sync type="button">立即同步</button>' +
-      '<button class="btn ghost" data-acct-logout type="button">退出登录</button></div>' +
-      '<div style="border-top:1px solid var(--line);margin:16px 0 4px;"></div>';
+      '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn gold" data-acct-sync type="button">立即同步</button>' +
+      '<button class="btn ghost" data-acct-logout type="button">退出登录</button></div>';
   }
-  card.insertBefore(sec, card.firstChild);
+  card.appendChild(sec);
   const q = s => sec.querySelector(s);
   const bind = (sel, field) => { const el = q(sel); if (el) el.addEventListener("input", () => { ACCT_UI[field] = el.value; }); };
   bind("[data-acct-user]", "user"); bind("[data-acct-pass]", "pass");
