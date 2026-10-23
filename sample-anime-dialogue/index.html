@@ -36,16 +36,50 @@
     position:relative;width:100%;aspect-ratio:16/10;overflow:hidden;background:#20261c;
     user-select:none;touch-action:manipulation;flex:none;
   }
-  .cam{
-    position:absolute;inset:0;will-change:transform;
-    transition:transform 700ms cubic-bezier(.45,.02,.25,1);
-    transform:scale(1.02) translateX(0);
+  .bgimg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;z-index:0}
+  .endimg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none;z-index:1}
+  .stage.ended .endimg{display:block}
+  .stage.ended .char{display:none}
+
+  /* 角色层：两帧叠放（neutral 底层 + talk 顶层 opacity 切换），羽化遮罩融入背景 */
+  .char{
+    position:absolute;bottom:0;z-index:2;pointer-events:none;
+    transform-origin:50% 100%;
+    transition:filter 350ms ease, transform 350ms ease;
+    -webkit-mask-image:radial-gradient(ellipse 72% 68% at 50% 46%, #000 55%, transparent 98%);
+            mask-image:radial-gradient(ellipse 72% 68% at 50% 46%, #000 55%, transparent 98%);
   }
-  .cam.to-a{transform:scale(1.12) translateX(4%)}
-  .cam.to-b{transform:scale(1.12) translateX(-4%)}
-  .cam img{width:100%;height:100%;object-fit:cover;display:block}
+  .char.rabbit{left:1%;width:41%;aspect-ratio:3/4}
+  .char.tiger{right:0;width:48%;aspect-ratio:1/1}
+  .char.is-speaking{filter:brightness(1.05);transform:scale(1.03)}
+  .char.is-listening{filter:brightness(.92)}
+  .char-inner{position:absolute;inset:0;will-change:transform}
+  .char-inner img.fr{
+    position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;
+  }
+  /* 说话律动：170ms 交替 = 340ms 一周期，与换帧同节拍 */
+  .char-inner.bounce{animation:bob 170ms ease-in-out infinite alternate}
+  @keyframes bob{from{transform:translateY(0) scale(1)}to{transform:translateY(-6px) scale(1.02)}}
+  /* 听者/待机呼吸：4s 周期极慢微动 */
+  .char-inner.breathe{animation:breath 4s ease-in-out infinite alternate}
+  @keyframes breath{from{transform:scale(1)}to{transform:scale(1.008)}}
+
+  /* 环境落叶/花瓣：纯 CSS 椭圆片，缓慢飘落旋转，低透明度 */
+  .petals{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:3}
+  .petal{
+    position:absolute;top:-6%;border-radius:62% 6px 62% 6px;opacity:0;
+    animation-name:fall;animation-timing-function:linear;animation-iteration-count:infinite;
+  }
+  @keyframes fall{
+    0%{top:-6%;transform:translateX(0) rotate(0deg);opacity:0}
+    8%{opacity:.5}
+    50%{transform:translateX(20px) rotate(190deg)}
+    92%{opacity:.42}
+    100%{top:103%;transform:translateX(-14px) rotate(385deg);opacity:0}
+  }
+
   .shade{
-    position:absolute;left:0;right:0;bottom:0;height:46%;pointer-events:none;
+    position:absolute;left:0;right:0;bottom:0;height:46%;pointer-events:none;z-index:4;
     background:linear-gradient(180deg,rgba(10,8,4,0) 0%,rgba(10,8,4,.55) 78%,rgba(10,8,4,.78) 100%);
   }
 
@@ -151,7 +185,21 @@
   </header>
 
   <div class="stage" id="stage">
-    <div class="cam" id="cam"><img id="sceneImg" src="img/scene-main.webp" alt="森林空地里，小兔拿着相册和小虎说话"></div>
+    <img class="bgimg" src="img/bg.webp" alt="白桦林空地，中间放着一本打开的相册">
+    <div class="char rabbit" id="charA">
+      <div class="char-inner breathe" id="innerA">
+        <img class="fr n" src="img/rabbit-neutral.webp" alt="小兔">
+        <img class="fr t" id="talkA" src="img/rabbit-talk.webp" alt="" style="opacity:0">
+      </div>
+    </div>
+    <div class="char tiger" id="charB">
+      <div class="char-inner breathe" id="innerB">
+        <img class="fr n" src="img/tiger-neutral.webp" alt="小虎">
+        <img class="fr t" id="talkB" src="img/tiger-talk.webp" alt="" style="opacity:0">
+      </div>
+    </div>
+    <img class="endimg" id="endImg" src="img/scene-happy.webp" alt="小兔和小虎开心地大笑挥手">
+    <div class="petals" id="petals" aria-hidden="true"></div>
     <div class="shade"></div>
     <div class="tapzone left" id="tapPrev" aria-label="上一句"></div>
     <div class="tapzone right" id="tapNext" aria-label="下一句"></div>
@@ -191,7 +239,7 @@
 
 <script>
 "use strict";
-/* 第 3 课 s1d《我和我的家人》dl 全 6 行：角色/英文/中文与 App 数据一字不差 */
+/* 第 3 课 s1d《我和我的家人》dl 全 6 行：角色/英文/中文与 App 数据一字不差（台词同 v1） */
 var LINES = [
   {sp:"A", en:"Anna, is this your family photo?", cn:"安娜，这是你的全家福吗？"},
   {sp:"B", en:"Yes. This is my father and this is my mother.", cn:"是的。这是我爸爸，这是我妈妈。"},
@@ -201,10 +249,9 @@ var LINES = [
   {sp:"B", en:"I'm fifteen. My father is a doctor and my mother is a teacher.", cn:"我十五岁。我爸爸是医生，妈妈是老师。"}
 ];
 var NAMES = {A:"🐰 小兔", B:"🐯 小虎"};
+var GAP_MS = 600;        /* 句间气口：一句播完停 600ms 再进下一句 */
 
 var stage = document.getElementById("stage"),
-    cam = document.getElementById("cam"),
-    sceneImg = document.getElementById("sceneImg"),
     badge = document.getElementById("badge"),
     subs = document.getElementById("subs"),
     subEn = document.getElementById("subEn"),
@@ -215,10 +262,86 @@ var stage = document.getElementById("stage"),
     dotsBox = document.getElementById("dots"),
     toastEl = document.getElementById("toast");
 
+/* ---------- 角色动画引擎：换帧木偶（张嘴/闭嘴两帧交替 + 身体律动） ---------- */
+var FLAP_OPEN_MS = 187;   /* 张嘴帧时长（170ms 间隔、占空比约 55% → 周期 340ms） */
+var FLAP_SHUT_MS = 153;   /* 闭嘴帧时长 */
+var chars = {
+  A: { wrap: document.getElementById("charA"), inner: document.getElementById("innerA"), talk: document.getElementById("talkA") },
+  B: { wrap: document.getElementById("charB"), inner: document.getElementById("innerB"), talk: document.getElementById("talkB") }
+};
+function setFrame(sp, open){ chars[sp].talk.style.opacity = open ? "1" : "0"; }
+function allNeutral(){ setFrame("A", false); setFrame("B", false); }
+
+var flap = { timer:null, sp:null, open:false, nextAt:0, remain:0, running:false, frozen:false };
+function flapStep(){
+  flap.open = !flap.open;
+  setFrame(flap.sp, flap.open);
+  var dur = flap.open ? FLAP_OPEN_MS : FLAP_SHUT_MS;
+  flap.nextAt = performance.now() + dur;
+  flap.timer = setTimeout(flapStep, dur);
+}
+function startFlap(sp){
+  stopFlap();
+  flap.sp = sp; flap.open = true; flap.running = true; flap.frozen = false;
+  setFrame(sp, true);
+  flap.nextAt = performance.now() + FLAP_OPEN_MS;
+  flap.timer = setTimeout(flapStep, FLAP_OPEN_MS);
+}
+function freezeFlap(){
+  if (!flap.running) return;
+  clearTimeout(flap.timer); flap.timer = null;
+  flap.remain = Math.max(20, flap.nextAt - performance.now());
+  flap.running = false; flap.frozen = true;
+}
+function resumeFlap(){
+  if (!flap.frozen || !flap.sp) return;
+  flap.frozen = false; flap.running = true;
+  flap.nextAt = performance.now() + flap.remain;
+  flap.timer = setTimeout(flapStep, flap.remain);
+}
+function stopFlap(){
+  clearTimeout(flap.timer); flap.timer = null;
+  flap.sp = null; flap.open = false; flap.running = false; flap.frozen = false;
+  allNeutral();
+}
+
+/* 角色视觉状态：说话方提亮+轻放大+律动；听者略暗+呼吸；暂停冻结 CSS 动画 */
+function curSp(){ return (idx >= 0 && idx < LINES.length) ? LINES[idx].sp : null; }
+function paintChars(){
+  var sp = curSp();
+  ["A","B"].forEach(function(k){
+    var c = chars[k], speaking = (state === "playing" && sp === k);
+    c.wrap.classList.toggle("is-speaking", speaking);
+    c.wrap.classList.toggle("is-listening", (state === "playing" || state === "paused") && sp && sp !== k);
+    c.inner.classList.toggle("bounce", speaking);
+    c.inner.classList.toggle("breathe", !speaking);
+    c.inner.style.animationPlayState = (state === "paused") ? "paused" : "";
+  });
+}
+
+/* ---------- 环境落叶（JS 生成 8 片，纯 CSS 椭圆片） ---------- */
+(function makePetals(){
+  var box = document.getElementById("petals");
+  var tints = ["rgba(240,206,118,.85)","rgba(196,150,66,.85)","rgba(168,196,110,.8)","rgba(240,178,168,.8)"];
+  for (var i = 0; i < 8; i++){
+    var p = document.createElement("span");
+    p.className = "petal";
+    var size = 7 + (i * 5) % 8;                     /* 7–14px */
+    p.style.width = size + "px"; p.style.height = (size * 0.72) + "px";
+    p.style.left = (4 + (i * 12.3) % 90) + "%";
+    p.style.background = "linear-gradient(135deg," + tints[i % 4] + "," + tints[(i + 1) % 4] + ")";
+    p.style.animationDuration = (10 + (i * 1.7) % 7) + "s";   /* 10–17s */
+    p.style.animationDelay = (-(i * 2.3)) + "s";               /* 错峰，一进来就分布在空中 */
+    box.appendChild(p);
+  }
+})();
+
+/* ---------- 播放流程（沿用 v1 口径：看门狗/失败跳句，节奏改为慢速音源 + 600ms 气口） ---------- */
 var idx = -1;            // 当前句序号，未开始为 -1
 var state = "cover";     // cover | playing | paused | ended
 var seq = 0;             // 播放代次，作废过期回调
 var watchdog = null, gapTimer = null;
+var pendingNext = -1;    // 句间气口中被暂停时，待播的下一句
 var toastTimer = null;
 
 var audio = new Audio();
@@ -247,11 +370,6 @@ function paintDots(){
     d.classList.toggle("now", idx === i && state !== "ended");
   });
 }
-function setCam(sp){
-  cam.classList.remove("to-a", "to-b");
-  if (sp === "A") cam.classList.add("to-a");
-  else if (sp === "B") cam.classList.add("to-b");
-}
 function showSubs(i){
   var L = LINES[i];
   subEn.textContent = L.en; subCn.textContent = L.cn;
@@ -264,15 +382,18 @@ function playLine(i, manual){
   if (i < 0) i = 0;
   if (i >= LINES.length) return finish();
   clearTimers();
+  pendingNext = -1;
+  stopFlap();                       /* 切句先让上一方复位闭嘴 */
   idx = i; state = "playing";
   var my = ++seq;
   endVeil.classList.add("gone"); coverVeil.classList.add("gone");
-  if (sceneImg.getAttribute("src") !== "img/scene-main.webp") sceneImg.src = "img/scene-main.webp";
-  setCam(LINES[i].sp);
-  showSubs(i); paintDots();
+  stage.classList.remove("ended");
+  showSubs(i); paintDots(); paintChars();
   btnPlay.textContent = "⏸";
   audio.src = "audio/line" + (i + 1) + ".mp3";
   var p = audio.play();
+  startFlap(LINES[i].sp);           /* 嘴型与律动随本句音频启动 */
+  paintChars();
   if (p && p.catch) p.catch(function(){ if (my === seq) onAudioFail(my, "这句音频没播出来，已自动跳到下一句"); });
   armWatchdog(my);
 }
@@ -298,16 +419,21 @@ function onAudioFail(my, msg){
   if (my !== seq) return;
   toast(msg);
   clearTimers();
+  stopFlap(); paintChars();
   var nxt = idx + 1;
-  gapTimer = setTimeout(function(){ if (my === seq) { nxt >= LINES.length ? finish() : playLine(nxt); } }, 650);
+  gapTimer = setTimeout(function(){ if (my === seq) { nxt >= LINES.length ? finish() : playLine(nxt); } }, GAP_MS);
 }
 audio.addEventListener("ended", function(){
   if (state !== "playing") return;
   var my = seq; clearTimers();
+  stopFlap();                       /* 音频一停，嘴型立刻回闭嘴、律动停 */
+  paintChars();
+  pendingNext = idx + 1;
   gapTimer = setTimeout(function(){
     if (my !== seq || state !== "playing") return;
+    pendingNext = -1;
     idx + 1 >= LINES.length ? finish() : playLine(idx + 1);
-  }, 380);
+  }, GAP_MS);
 });
 audio.addEventListener("error", function(){
   if (state === "playing") onAudioFail(seq, "这句音频加载失败，已自动跳到下一句");
@@ -318,13 +444,13 @@ function finish(){
   clearTimers(); seq++;
   state = "ended"; idx = LINES.length;
   try { audio.pause(); } catch (e) {}
-  setCam(null);
+  stopFlap();
   badge.classList.remove("show");
   subs.classList.add("hidden");
-  sceneImg.src = "img/scene-happy.webp";
+  stage.classList.add("ended");     /* 结尾图全幅替换舞台内容 */
   endVeil.classList.remove("gone");
   btnPlay.textContent = "▶";
-  paintDots();
+  paintDots(); paintChars();
 }
 function startOver(){
   idx = -1; playLine(0);
@@ -334,16 +460,19 @@ function togglePlay(){
   if (state === "ended") return startOver();
   if (state === "playing") {
     state = "paused"; seq++; clearTimers();
+    freezeFlap();                     /* 换帧定时器随暂停冻结 */
     try { audio.pause(); } catch (e) {}
     btnPlay.textContent = "▶";
   } else if (state === "paused") {
+    if (pendingNext >= 0) { var pn = pendingNext; pendingNext = -1; return playLine(pn); }
     state = "playing"; var my = ++seq;
     var p = audio.play();
+    resumeFlap();                     /* 恢复后换帧续跑 */
     if (p && p.catch) p.catch(function(){ if (my === seq) onAudioFail(my, "音频没播出来，已自动跳到下一句"); });
     armWatchdog(my);
     btnPlay.textContent = "⏸";
   }
-  paintDots();
+  paintDots(); paintChars();
 }
 function step(delta){
   if (state === "cover") return;
@@ -362,6 +491,10 @@ document.getElementById("btnNext").addEventListener("click", function(){ step(1)
 document.getElementById("tapPrev").addEventListener("click", function(){ step(-1); });
 document.getElementById("tapNext").addEventListener("click", function(){ step(1); });
 subs.addEventListener("click", function(){ if (idx >= 0 && idx < LINES.length) playLine(idx); });
+
+/* 自验探针（无副作用，仅暴露状态） */
+window.__anim = { flap: flap, chars: chars, audio: audio, playLine: playLine, togglePlay: togglePlay,
+                  getState: function(){ return state; }, getIdx: function(){ return idx; } };
 </script>
 </body>
 </html>
