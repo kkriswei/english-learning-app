@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610231753";
+var APP_BUILD = "v202610231948";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6972,7 +6972,7 @@ function paintBackupUI(){
    data 就是 buildBackup().data 原样（与 v3.14 手动备份同一序列化层）。
    防坑条款对应：①同步内容=两份本地数据原样+updatedAt（acctBuildData 复用 buildBackup）；
    ②云端空/旧永不覆盖本地新——合并只比 updatedAt，严格新者胜，远端不存在只上行
-   （acctSyncNow 三分支；v3.17 护栏：本地实质为空〔已学 0 词且打卡 0 天〕且云端有数据时无条件拉云端、忽略 updatedAt，防数据丢失后的空本地反覆盖云端）；③触发=登录后 acctLogin/acctRegister 末尾、本地保存防抖
+   （acctSyncNow 三分支；v3.17 护栏：本地实质为空〔已学 0 词且打卡 0 天〕且云端有数据时无条件拉云端、忽略 updatedAt，防数据丢失后的空本地反覆盖云端；v3.19 再加 pristine：已学 0 词且本地历史量〔打卡+servedNew 天数〕严格小于云端时同样只拉不上行——全新机打开即产生当天打卡/servedNew、时间戳又新，旧护栏曾漏判致空壳盖掉云端种子）；③触发=登录后 acctLogin/acctRegister 末尾、本地保存防抖
    （saveState/saveWordScore 尾部钩子 acctOnLocalSave→acctScheduleSync 5 秒）、
    切后台（acctBoot 的 visibilitychange）、手动「立即同步」；④状态行常驻账号卡
    （acctStatusText，未登录/同步中/已同步 HH:MM/失败稍后重试，失败只改状态不拦学习）；
@@ -7003,6 +7003,36 @@ function acctRemoteHasData(file){
   if (!d || typeof d !== "object" || Array.isArray(d)) return false;
   const main = d[LS_KEY];
   return !!(main && typeof main === "object" && !Array.isArray(main));
+}
+/* v3.19 历史量口径：打卡天数 + servedNew 天数（本地读内存态；云端读文件内主数据，checkins 为落盘数组形） */
+function acctLocalHistoryDays(){
+  try {
+    const ck = state.checkins ? state.checkins.size : 0;
+    const sn = (state.servedNew && typeof state.servedNew === "object" && !Array.isArray(state.servedNew)) ? Object.keys(state.servedNew).length : 0;
+    return ck + sn;
+  } catch(e){ return 0; }
+}
+function acctRemoteHistoryDays(file){
+  const d = file && file.data;
+  if (!d || typeof d !== "object" || Array.isArray(d)) return 0;
+  const main = d[LS_KEY];
+  if (!main || typeof main !== "object" || Array.isArray(main)) return 0;
+  let ck = 0;
+  if (Array.isArray(main.checkins)) ck = main.checkins.length;
+  else if (main.checkins && typeof main.checkins === "object") ck = Object.keys(main.checkins).length;
+  const sn = (main.servedNew && typeof main.servedNew === "object" && !Array.isArray(main.servedNew)) ? Object.keys(main.servedNew).length : 0;
+  return ck + sn;
+}
+/* v3.19 pristine（本地未真正开始学）：一词未学，且本地历史量严格小于云端历史量。
+   全新机光打开 App 就会产生当天打卡与跨天 servedNew、localUpdatedAt 又是新鲜的，
+   v3.17 的"打卡=0"护栏漏判、updatedAt 比较又本地更新，空壳进度曾上行盖掉云端种子；
+   pristine 命中时只许拉云端、绝不许上行。本地真学过 ≥1 词则恒假、旧规则不变。 */
+function acctLocalPristine(file){
+  try {
+    if (learnedCount() !== 0) return false;
+    if (!acctRemoteHasData(file)) return false;
+    return acctLocalHistoryDays() < acctRemoteHistoryDays(file);
+  } catch(e){ return false; }
 }
 
 /* ---- 编码与密码学小工具（WebCrypto；iOS Safari 在 https 安全上下文原生具备） ---- */
@@ -7112,7 +7142,9 @@ async function acctSyncNow(manual){
       const cu = remote ? (remote.file.updatedAt || 0) : 0;
       const lu = acctLocalUpdatedAt();
       /* v3.17 护栏：本地实质为空且云端有数据 → 无条件拉云端，忽略 updatedAt 比较 */
-      const forcePull = !!remote && cu !== lu && acctRemoteHasData(remote.file) && acctLocalEmpty();
+      /* v3.19：pristine（未真正开始学、历史量严格小于云端）与实质为空同权，一样无条件拉云端 */
+      const pristine = !!remote && acctLocalPristine(remote.file);
+      const forcePull = !!remote && cu !== lu && acctRemoteHasData(remote.file) && (acctLocalEmpty() || pristine);
       if (remote && (cu > lu || forcePull)){
         /* v3.18 熔断：同一用户同一份云端进度（updatedAt 相同）本会话已拉过 → 不许再拉、再刷新 */
         let pg = null;
@@ -7131,7 +7163,7 @@ async function acctSyncNow(manual){
         try { location.reload(); } catch(e){}
         break;
       }
-      if (!remote || lu > cu){
+      if (!remote || (lu > cu && !pristine)){   /* v3.19 双保险：pristine 时绝不许上行覆盖历史更丰富的云端 */
         const data = acctBuildData();
         if (!data) throw new Error("build-fail");
         const lu2 = acctLocalUpdatedAt();   /* 打包时 saveState 已刷新本地时间戳，以它为这次上行的时间戳 */
