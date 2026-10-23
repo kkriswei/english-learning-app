@@ -7,33 +7,96 @@
     <link rel="icon" href="data:," />
     <title>英语学习软件</title>
     <script>
-/* ===== 自动版本更新检查（v3.7）=====
+/* ===== 自动版本更新检查（v3.7；v3.14 扩展：应用内中途自检 + 忙碌延迟跳）=====
    APP_BUILD 是构建标记：源文件/工件里保持占位符（开发态，跳过检查）；
-   部署时主线把它替换成本次构建号，并 在仓库根放 version.json（格式 {"v": "构建号"}）。
-   启动后异步拉 version.json（no-store 防缓存）：版本不同就带 ?v=<新版> 跳转一次，
-   让长缓存旧页面的手机（iOS Safari/主屏幕图标）自动换到新版。
-   防循环：sessionStorage 键 english-app-verjump 记本次会话已为哪个目标版本跳过；
+   部署时主线把它替换成本次构建号，并在仓库根放 version.json（格式 {"v": "构建号"}）。
+   检查点：①页面加载即查（v3.7 原行为）；②visibilitychange 回到前台时查；
+   ③页面存活期间每 10 分钟查（页面隐藏时跳过这一轮）。任一检查发现版本不同，
+   就带 ?v=<新版> 跳转，让长缓存旧页面的手机（iOS Safari/主屏幕图标）自动换到新版。
+   v3.14 动因：桌面图标（standalone）长会话里页面实例可连续存活数小时不重载，
+   只在加载时检查的话，新版上线后学习者仍在旧页面上跑（2026-10-23 实锤：
+   新版上线 1 小时后截图里仍是已删除的旧面板）。学习数据在 localStorage，
+   跳转不丢进度，静默跳即可，不需要任何文案。
+   忙碌延迟：真要跳时若主 App 报告忙碌（window.__APP_BUSY：录音/打分/离线复核/
+   播放中，口径见主脚本），先把目标版本记在 pendingVer，不打断当前动作；
+   每 15 秒重试一次，空闲了立即补跳。
+   防循环（守卫语义）：sessionStorage 键 english-app-verjump 只记「本会话已经
+   实际跳过的目标版本」，且只在真正执行跳转的那一刻才写——待跳期间不写，
+   免得把正当跳转误杀。比对按目标版本：seen === 目标版本才拦。所以同一会话里
+   先跳到 A 版、之后又发布 B 版，B ≠ 已记的 A，不会被守卫误杀，照样跳；
+   反过来若跳过去后服务端仍回同一版本（缓存未刷新），seen 命中就不再跳，防死循环。
+   检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
+   （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610230905";
+var APP_BUILD = "v202610230938";
 (function () {
-  try {
-    if (!APP_BUILD || APP_BUILD === "__" + "BUILD__") return; /* 开发态/工件态不检查 */
+  var KEY = "english-app-verjump";
+  var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
+  var jumped = false;      /* 本文档已执行跳转（replace 后文档即将卸载，后续检查全停） */
+  function isDev() { return !APP_BUILD || APP_BUILD === "__" + "BUILD__"; }
+  function timing() {
+    var d = { midMs: 600000, retryMs: 15000 };
+    try {
+      var o = (typeof window !== "undefined" && window.__VERCHECK_TIMING) || {};
+      for (var k in d) if (typeof o[k] === "number" && o[k] > 0) d[k] = o[k];
+    } catch (e) {}
+    return d;
+  }
+  function doJump(v) {
+    jumped = true; pendingVer = null;
+    try { sessionStorage.setItem(KEY, v); } catch (e) {}   /* 守卫只在真正跳转这一刻写 */
+    var url = location.pathname + "?v=" + encodeURIComponent(v) + (location.hash || "");
+    if (typeof window !== "undefined" && window.__NAV_LOG) window.__NAV_LOG.push(url);
+    location.replace(url);
+  }
+  function tryJump(v) {
+    var seen = null;
+    try { seen = sessionStorage.getItem(KEY); } catch (e) {}
+    if (seen === v) { pendingVer = null; return; }   /* 已为这个版本跳过：防循环；版本再变（≠seen）不拦 */
+    var busy = false;
+    try { busy = !!(typeof window !== "undefined" && window.__APP_BUSY && window.__APP_BUSY()); } catch (e) { busy = false; }
+    if (busy) { pendingVer = v; return; }            /* 忙碌：只记目标，不打断、不写守卫 */
+    doJump(v);
+  }
+  function checkNow() {
+    if (isDev() || jumped) return;
     if (typeof fetch !== "function") return;
     fetch("version.json?ts=" + Date.now(), { cache: "no-store" }).then(function (r) {
       if (!r || !r.ok) return null;
       return r.json();
     }).then(function (j) {
       try {
-        if (!j || !j.v || j.v === APP_BUILD) return; /* 已是最新 */
-        var KEY = "english-app-verjump", seen = null;
-        try { seen = sessionStorage.getItem(KEY); } catch (e) {}
-        if (seen === j.v) return; /* 本会话已为这个版本跳过，不再跳（防死循环） */
-        try { sessionStorage.setItem(KEY, j.v); } catch (e) {}
-        var url = location.pathname + "?v=" + encodeURIComponent(j.v) + (location.hash || "");
-        if (typeof window !== "undefined" && window.__NAV_LOG) window.__NAV_LOG.push(url);
-        location.replace(url);
+        if (!j || !j.v) return;
+        if (j.v === APP_BUILD) { pendingVer = null; return; }   /* 已是最新 */
+        tryJump(j.v);
       } catch (e) {}
     }).catch(function () {}); /* 离线/拉不到就静默忽略，页面照常使用 */
+  }
+  try {
+    if (isDev()) return;                  /* 开发态/工件态：不检查、不设定时器（v3.7 冒烟口径不变） */
+    if (typeof fetch !== "function") return;
+    checkNow();                           /* ① 加载即查 */
+    var T = timing();
+    setInterval(function () {             /* ③ 存活期定时查；有待跳先补跳，不重复发请求 */
+      try {
+        if (jumped) return;
+        if (typeof document !== "undefined" && document.hidden) return;
+        if (pendingVer) { tryJump(pendingVer); return; }
+        checkNow();
+      } catch (e) {}
+    }, T.midMs);
+    setInterval(function () {             /* 待跳补跳：只看忙不忙，不发请求，空闲立即跳 */
+      try { if (!jumped && pendingVer) tryJump(pendingVer); } catch (e) {}
+    }, T.retryMs);
+    if (typeof document !== "undefined" && document.addEventListener) {
+      document.addEventListener("visibilitychange", function () {   /* ② 回到前台查 */
+        try {
+          if (jumped || document.hidden) return;
+          if (pendingVer) { tryJump(pendingVer); return; }
+          checkNow();
+        } catch (e) {}
+      });
+    }
   } catch (e) {}
 })();
     </script>
@@ -1195,6 +1258,7 @@ figure.wfig{margin:0 0 8px;}
 
       <!-- VIEW: today -->
       <section id="view-today">
+        <div id="backupRemind"></div>
         <div class="card goal-card">
           <div class="today-top">
             <div class="ring-wrap">
@@ -1235,6 +1299,7 @@ figure.wfig{margin:0 0 8px;}
 
         <div id="planList"></div>
         <div id="planDone"></div>
+        <div id="backupCard" style="margin-top:14px;"></div>
       </section>
 
       <!-- VIEW: vocabulary -->
@@ -6315,14 +6380,36 @@ function listenGrade(target, cb, opts){
 
 /* 取消进行中的判分会话：序号递增让迟到的回调全部作废，再彻底释放麦克风（「聆听中再点一次＝取消」用） */
 function cancelGrade(){ gradeSeq++; gradeDoneHook = null; meterStop(); releaseMic(); }
+/* 离线引擎在途计数（v3.14）：转写/双验复核/模型下载进行中 +1，完成 -1（见 ASR 段各入口） */
+let asrBusyCount = 0;
+/* 版本中途自检的忙碌判定（v3.14）：head 的自检发现新版、准备跳转前先问这里——
+   正在录音/打分/离线复核或转写/视频课或任何音频播放时返回 true，自检把跳转往后推，
+   空闲了再补跳（学习数据都在 localStorage，晚跳不丢任何进度）。只复用现成状态，
+   不新造第二套：curRec（识别实例在跑）、mrRecorder（累积判分录音中）、
+   gradeDoneHook（句子判分会话未收尾）、asrBusyCount（离线引擎在途）、
+   curAudio（共用单通道有音频在播——单词示范序列/逐词读/VL 播放都走它）、
+   VL.on && VL.playing（视频课播放中）、单词打分面板的 data-wsbusy 标记。 */
+window.__APP_BUSY = function(){
+  try {
+    if(curRec) return true;
+    if(mrRecorder && mrRecorder.state === "recording") return true;
+    if(gradeDoneHook) return true;
+    if(asrBusyCount > 0) return true;
+    if(curAudio && !curAudio.paused) return true;
+    if(typeof VL !== "undefined" && VL && VL.on && VL.playing) return true;
+    if(document.querySelector("[data-wsbusy='1']")) return true;
+  } catch(e){}
+  return false;
+};
 /* ---------- 离线 ASR 兜底打分（v3.10） ----------
    触发口径只有一条：一次判分以整场零结果收场（sa-fail / no-response）且这次有录音时，
    才提供离线识别。做法：把那段录音在本机用 whisper-tiny（多语 q8，transformers.js）转成
    文字，再喂 scoreFirst 判分。模型+运行时约 55MB；v3.12 起下载改由一次性设置卡
    触发（见 asrDownloadModel），打分流内不再询问、不再给按钮让她选：零结果时已下载
    就直接自动转写出分，没下载只留一行事实提示。转写为空/失败/引擎坏掉，一律回落
-   事实提示，绝不假打分、绝不卡死。原生识别正常出结果时，句子路径本段零调用；
-   单词路径仅在已下载时做双验复核（asrVerifyWord）。引擎可经 window.__ASR_ENGINE 注入（冒烟用），与 __SR_TIMING /
+   事实提示，绝不假打分、绝不卡死。v3.14 起离线引擎升为主判分：模型已下载时每次打分（发音句/角色扮演/单词）
+   原生出分后都再喂离线引擎复核取低（asrVerifyScore），原生只能拉低、不能单独
+   放行；未下载时行为与 v3.12 完全一致。引擎可经 window.__ASR_ENGINE 注入（冒烟用），与 __SR_TIMING /
    __REC_PEAK 同一种注入口径；生产不设该变量。资产在站点 asr/ 目录，坏掉不拖垮主 App。 */
 const ASR_FLAG_KEY = "english-asr-v1";
 const ASR_BASE = (() => { try { return new URL("asr/", document.baseURI).href; } catch(e){ return "asr/"; } })();
@@ -6422,7 +6509,7 @@ async function asrDoTranscribe(blob){
   if(!pcm || !pcm.length) return null;
   if(!asrWorkerDead){
     const r = await asrWorkerCall({ type: "transcribe", pcm: pcm });
-    if(r && r.type === "result"){ asrMarkCached(); return (r.text || "").trim() || null; }
+    if(r && r.type === "result"){ asrMarkCached(); return (r.text || "").trim(); }   /* v3.14：转写成功但为空 → 返回 ""（与失败的 null 区分，空转写按 0 分参与复核取低） */
     /* Worker 起不来或中途坏掉：标记后退主线程再试一次 */
     asrWorkerDead = true;
     if(asrWorker){ const w = asrWorker; asrWorker = null; try { w.terminate(); } catch(e){} }
@@ -6431,13 +6518,14 @@ async function asrDoTranscribe(blob){
   asrEmitProg(100);
   const r = await p(pcm, { chunk_length_s: 30, language: "english", task: "transcribe" });
   asrMarkCached();
-  return ((Array.isArray(r) ? (r[0] && r[0].text) : (r && r.text)) || "").trim() || null;
+  return ((Array.isArray(r) ? (r[0] && r[0].text) : (r && r.text)) || "").trim();   /* 同上：成功为空返回 ""；失败走异常/解码失败，由 realAsrEngine 归一成 null */
 }
 const realAsrEngine = {
   cached(){ try { return localStorage.getItem(ASR_FLAG_KEY) === "1"; } catch(e){ return false; } },
   transcribe(blob, prog, cb){
     asrProgSink = prog || null;
-    asrDoTranscribe(blob).then(t => { asrProgSink = null; cb(t || null); }, () => { asrProgSink = null; cb(null); });
+    /* 回调口径（v3.14）：null ＝ 引擎失败/不可用；"" ＝ 转写成功但没听出任何词（按 0 分参与复核取低）；非空字符串 ＝ 转写文本 */
+    asrDoTranscribe(blob).then(t => { asrProgSink = null; cb(t === null || t === undefined ? null : t); }, () => { asrProgSink = null; cb(null); });
   }
 };
 function asrEngine(){
@@ -6482,7 +6570,8 @@ function asrSetupDownload(host){
    preload 消息（模型进缓存、进度走同一条 progress 通道），Worker 不可用退主线程加载 */
 function asrDownloadModel(prog, cb){
   let finished = false;
-  const finish = ok => { if(finished) return; finished = true; asrProgSink = null; cb(!!ok); };
+  const finish = ok => { if(finished) return; finished = true; asrBusyCount--; asrProgSink = null; cb(!!ok); };
+  asrBusyCount++;   /* v3.14：模型下载中途被版本跳转打断等于白下，下载也算忙碌 */
   const eng = asrEngine();
   if(eng !== realAsrEngine && eng && typeof eng.download === "function"){
     try { eng.download(prog, finish); } catch(e){ finish(false); }
@@ -6500,29 +6589,40 @@ function asrDownloadModel(prog, cb){
     catch(e){ finish(false); }
   })();
 }
-/* 单词双验（v3.12，仅单词打分、仅模型已下载时）：原生 SR 出了分，也把这场录音喂离线
-   引擎复核，两个转写分别严判、取低者——堵识别引擎把含糊发音「猜」成正确词。
-   离线转写为空＝引擎没听出任何词，按 0 分裁决参与取低；引擎坏掉/超时＝复核不可用，
-   不拦原生分。重试轮（retried）的录音与转写不是同一轮，不做双验。 */
-function asrVerifyWord(target, out, cb){
+/* 双验复核（v3.12 单词先行；v3.14 推广到发音句与角色扮演——离线引擎升为主判分）：
+   模型已下载时，原生 SR 出了分，也把这场录音喂离线引擎再转写判分一次，
+   最终分取两者最低——堵识别引擎把含糊发音「猜」成正确词；原生 SR 在她环境
+   时好时坏，从此只能拉低、不能单独放行。最终分落定前不入账（调用方面板显示
+   「复核中…」，属直线流内状态）。口径（词句一致）：离线转写为空＝引擎没听出
+   任何词，按 0 分判分参与取低（scoreFirst → diffSentence 对空转写的判分＝
+   全部目标词漏读、earnedW=0 → 总分 0，封顶规则不改变这个结果）；引擎坏掉/
+   超时（25s）＝复核不可用，不拦原生分。重试轮（retried）的录音与转写不是
+   同一轮，不做双验（由调用方把关）。单词走严判（wordMode），句子走句面口径。
+   句子复核每次多数秒，属预期，不许为省时跳过。 */
+function asrVerifyScore(target, out, wordMode, cb){
   let finished = false;
-  const finish = o => { if(finished) return; finished = true; cb(o); };
+  const finish = o => { if(finished) return; finished = true; asrBusyCount--; cb(o); };
+  asrBusyCount++;
   const wd = setTimeout(() => finish(out), 25000);
   try {
     asrEngine().transcribe(out.blob, null, text => {
       clearTimeout(wd);
       if(text === null || text === undefined){ finish(out); return; }
-      const sc = scoreFirst(target, [text], true);
+      const sc = scoreFirst(target, [text], !!wordMode);
       if(sc && sc.res.score < out.res.score)
         finish({ text: sc.text, res: sc.res, url: out.url, recSilent: out.recSilent, offline: true });
       else finish(out);
     });
   } catch(e){ clearTimeout(wd); finish(out); }
 }
+function asrVerifyWord(target, out, cb){ asrVerifyScore(target, out, true, cb); }
+function asrVerifySentence(target, out, cb){ asrVerifyScore(target, out, false, cb); }
 /* 跑一次离线转写：progEl 是 ASR_PROG_HTML 的根元素（可为 null）；成功 onText(文字)，失败/空 onFail() */
 function asrRunOffline(out, progEl, onText, onFail){
   let finished = false;
-  const finish = t => { if(finished) return; finished = true; if(t) onText(t); else onFail(); };
+  const finish = t => { if(finished) return; finished = true; asrBusyCount--; clearTimeout(wd); if(t) onText(t); else onFail(); };
+  asrBusyCount++;   /* v3.14：离线转写进行中也算忙碌（版本自检不许这时把页面跳走） */
+  const wd = setTimeout(() => finish(null), 25000);   /* 与双验同口径：25s 不回就按失败收尾，绝不卡死 */
   try {
     asrEngine().transcribe(out.blob, pct => {
       if(!progEl) return;
@@ -6628,6 +6728,223 @@ function showView(name){
 document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => showView(t.dataset.view)));
 document.querySelectorAll("[data-goto]").forEach(b => b.addEventListener("click", () => showView(b.dataset.goto)));
 
+/* ================= 进度备份与恢复（v3.14 第三件） =================
+   背景（2026-10-23 实锤）：学习进度只存在这台手机的浏览器数据里，桌面新图标是
+   独立数据盒，看上去就像「进度消失」。备份 = 把 LS_KEY 主数据与单词打分
+   （WORD_SCORE_KEY）两份数据原样打包成一段 JSON（主 state 不加任何字段、
+   不改形状），她存到微信收藏/文件传输助手/备忘录里；恢复 = 粘回来恢复。
+   安全口径：先校验后写入；确认前不写任何东西；覆盖前把当前两份原始数据
+   暂存内存，写入后回读核对，任何异常立刻用暂存原样还原，绝不留半截数据。 */
+const BACKUP_KEY = "english-backup-v1";   /* 辅助 key：只记 { lastExport, dismissedAt }，与 english-asr-v1 同类，不进主 state */
+const BACKUP_KIND = "english-app-progress";
+const BK_UI = { draft: "", exportText: "", pending: null, msg: "", msgOk: false };
+function backupMeta(){ try { const m = JSON.parse(localStorage.getItem(BACKUP_KEY) || "null"); return (m && typeof m === "object" && !Array.isArray(m)) ? m : {}; } catch(e){ return {}; } }
+function backupMetaSave(m){ try { localStorage.setItem(BACKUP_KEY, JSON.stringify(m)); } catch(e){} }
+function learnedCount(){ return Object.keys(state.wordGrades || {}).length; }
+function streakOfDays(checkinsArr){
+  const s = new Set(checkinsArr || []);
+  let n = 0; const d = new Date();
+  if(!s.has(dayKey(d))) d.setDate(d.getDate() - 1);
+  while(s.has(dayKey(d))){ n++; d.setDate(d.getDate() - 1); }
+  return n;
+}
+/* 打包：先把内存里的最新进度落盘，再读两份原始数据原样嵌入（字段见 buildBackup 返回结构） */
+function buildBackup(){
+  try { saveState(); } catch(e){}
+  let main = null, ws = null;
+  try { main = JSON.parse(localStorage.getItem(LS_KEY) || "null"); } catch(e){ main = null; }
+  try { ws = JSON.parse(localStorage.getItem(WORD_SCORE_KEY) || "null"); } catch(e){ ws = null; }
+  if(!main || typeof main !== "object" || Array.isArray(main)) return null;
+  if(!ws || typeof ws !== "object" || Array.isArray(ws)) ws = {};
+  const data = {};
+  data[LS_KEY] = main;
+  data[WORD_SCORE_KEY] = ws;
+  return {
+    app: "english-learning-app", kind: BACKUP_KIND, v: 1,
+    exportedAt: new Date().toISOString(),
+    summary: { learned: learnedCount(), streak: streakDays(), checkinDays: state.checkins.size },
+    data: data
+  };
+}
+/* 只校验、不写任何东西。通过返回 { ok, main, ws, learned, streak, checkinDays, whenText }，不过返回 { err } */
+function parseBackup(text){
+  let o = null;
+  try { o = JSON.parse(String(text || "").trim()); } catch(e){ return { err: "这段文字不是备份（格式对不上）。请把导出的备份文字完整粘贴进来，一个字都不要改。" }; }
+  if(!o || typeof o !== "object" || Array.isArray(o)) return { err: "这段文字不是备份（格式对不上）。" };
+  if(o.kind !== BACKUP_KIND || !o.data || typeof o.data !== "object" || Array.isArray(o.data))
+    return { err: "这不是这个 App 的进度备份，认不出来。你现在的进度没有被改动。" };
+  const m = o.data[LS_KEY];
+  if(!m || typeof m !== "object" || Array.isArray(m))
+    return { err: "备份不完整（缺少主进度），不能恢复。你现在的进度没有被改动。" };
+  const miss = [];
+  if(!Array.isArray(m.checkins)) miss.push("打卡记录");
+  if(!m.wordGrades || typeof m.wordGrades !== "object" || Array.isArray(m.wordGrades)) miss.push("已学单词");
+  if(!m.wordReview || typeof m.wordReview !== "object" || Array.isArray(m.wordReview)) miss.push("复习记录");
+  if(typeof m.xp !== "number") miss.push("经验值");
+  if(miss.length) return { err: "备份不完整（缺：" + miss.join("、") + "），不能恢复。你现在的进度没有被改动。" };
+  let ws = o.data[WORD_SCORE_KEY];
+  if(ws === undefined || ws === null) ws = {};   /* 单词打分缺省为空：主数据完整即可恢复 */
+  if(typeof ws !== "object" || Array.isArray(ws)) return { err: "备份里的单词打分格式不对，不能恢复。你现在的进度没有被改动。" };
+  let whenText = "未知时间";
+  try { if(o.exportedAt){ const dt = new Date(o.exportedAt); if(!isNaN(dt.getTime())) whenText = dt.toLocaleString("zh-CN", { hour12: false }); } } catch(e){}
+  return { ok: true, main: m, ws: ws,
+    learned: Object.keys(m.wordGrades).length,
+    streak: streakOfDays(m.checkins),
+    checkinDays: (m.checkins || []).length,
+    whenText: whenText };
+}
+/* 覆盖写入 + 回读核对 + 失败回滚（回滚用写入前暂存的两份原始字符串，原样放回） */
+function applyBackup(p){
+  let prevMain = null, prevWs = null;
+  try { prevMain = localStorage.getItem(LS_KEY); prevWs = localStorage.getItem(WORD_SCORE_KEY); } catch(e){}
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(p.main));
+    localStorage.setItem(WORD_SCORE_KEY, JSON.stringify(p.ws));
+    const b1 = JSON.parse(localStorage.getItem(LS_KEY) || "null");
+    const b2 = JSON.parse(localStorage.getItem(WORD_SCORE_KEY) || "null");
+    if(!b1 || Object.keys(b1.wordGrades || {}).length !== p.learned) throw new Error("verify-main");
+    if(!b2 || typeof b2 !== "object" || Array.isArray(b2)) throw new Error("verify-ws");
+    return true;
+  } catch(e){
+    try { if(prevMain === null) localStorage.removeItem(LS_KEY); else localStorage.setItem(LS_KEY, prevMain); } catch(e2){}
+    try { if(prevWs === null) localStorage.removeItem(WORD_SCORE_KEY); else localStorage.setItem(WORD_SCORE_KEY, prevWs); } catch(e2){}
+    return false;
+  }
+}
+function bkMarkExported(){
+  const m = backupMeta(); m.lastExport = Date.now(); backupMetaSave(m);
+}
+/* 提醒口径：已学 ≥50 词、距上次导出超过 7 天（从没导出也算）、且本周期没被关过。
+   「周期」在每次导出后重新计——关掉后直到下次导出满 7 天才会再出现，频率克制。 */
+function backupShouldRemind(){
+  if(learnedCount() < 50) return false;
+  const m = backupMeta();
+  const last = m.lastExport || 0;
+  if(Date.now() - last < 7 * 86400000) return false;
+  if((m.dismissedAt || 0) > last) return false;
+  return true;
+}
+async function bkExport(){
+  const bk = buildBackup();
+  if(!bk){ toast("暂时读不到进度数据，没法导出"); return; }
+  const text = JSON.stringify(bk);
+  const fname = "英语进度备份-" + dayKey() + ".json";
+  try {
+    if(typeof navigator !== "undefined" && navigator.share && typeof navigator.canShare === "function" && typeof File !== "undefined"){
+      const f = new File([text], fname, { type: "application/json" });
+      if(navigator.canShare({ files: [f] })){
+        await navigator.share({ files: [f], title: "英语学习进度备份" });
+        bkMarkExported();
+        BK_UI.exportText = ""; BK_UI.msg = "备份已导出，存好就行。万一进度丢了，回到这里粘贴备份就能恢复。"; BK_UI.msgOk = true;
+        paintBackupUI();
+        return;
+      }
+    }
+  } catch(e){
+    if(e && e.name === "AbortError") return;   /* 她自己取消了分享：什么都不做、不算导出 */
+    /* 其它分享错误：落到下面的复制方案 */
+  }
+  BK_UI.exportText = text; BK_UI.msg = ""; BK_UI.msgOk = false;
+  paintBackupUI();
+  toast("这个设备没法直接分享文件：备份文字已经准备好，点「复制备份文本」存起来");
+}
+function bkCopyExport(){
+  const text = BK_UI.exportText;
+  if(!text) return;
+  const done = () => { bkMarkExported(); BK_UI.msg = "已复制。去微信收藏、文件传输助手或备忘录里粘贴存好就行。"; BK_UI.msgOk = true; paintBackupUI(); };
+  const fail = () => { toast("自动复制没成功：长按上面框里的文字，全选后手动复制"); };
+  try {
+    if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(done, fail); return; }
+  } catch(e){}
+  try {
+    const ta = document.querySelector("#backupCard [data-bk-export-text]");
+    if(ta){ ta.focus(); ta.select(); if(document.execCommand && document.execCommand("copy")){ done(); return; } }
+  } catch(e){}
+  fail();
+}
+function bkCheck(){
+  const r = parseBackup(BK_UI.draft);
+  if(!r.ok){ BK_UI.pending = null; BK_UI.msg = r.err; BK_UI.msgOk = false; }
+  else { BK_UI.pending = r; BK_UI.msg = ""; BK_UI.msgOk = false; }
+  paintBackupUI();
+}
+function bkConfirm(){
+  const p = BK_UI.pending;
+  if(!p) return;
+  if(applyBackup(p)){
+    BK_UI.pending = null; BK_UI.draft = ""; BK_UI.exportText = "";
+    toast("恢复成功，正在重新打开 App…");
+    try { location.reload(); } catch(e){}
+  } else {
+    BK_UI.pending = null;
+    BK_UI.msg = "恢复失败了，你现在的进度没有被改动。可以再试一次。"; BK_UI.msgOk = false;
+    paintBackupUI();
+  }
+}
+function paintBackupUI(){
+  const rem = $("#backupRemind"), card = $("#backupCard");
+  if(rem){
+    if(backupShouldRemind()){
+      rem.innerHTML = '<div class="card" data-bk-remind style="border:1.5px solid #c2a14d;background:rgba(194,161,77,.08);display:flex;align-items:center;gap:10px;">' +
+        '<button data-bk-go type="button" style="flex:1;text-align:left;background:none;border:none;font:inherit;color:inherit;cursor:pointer;padding:0;">记得备份一下进度（点这里）——进度只存在这台手机里，导出存一份更安心。</button>' +
+        '<button data-bk-dismiss type="button" aria-label="关闭提醒" style="background:none;border:none;font-size:17px;color:var(--ink-faint);cursor:pointer;padding:2px 6px;">✕</button></div>';
+      const go = rem.querySelector("[data-bk-go]");
+      if(go) go.addEventListener("click", () => { const c = $("#backupCard"); if(c) c.scrollIntoView({ behavior: "smooth", block: "start" }); });
+      const x = rem.querySelector("[data-bk-dismiss]");
+      if(x) x.addEventListener("click", () => { const m = backupMeta(); m.dismissedAt = Date.now(); backupMetaSave(m); paintBackupUI(); });
+    } else rem.innerHTML = "";
+  }
+  if(!card) return;
+  const meta = backupMeta();
+  const lastTxt = meta.lastExport ? new Date(meta.lastExport).toLocaleDateString("zh-CN") : "还没备份过";
+  let h = '<div class="card" data-bkcard>' +
+    '<div style="font-weight:700;font-size:16px;">备份与恢复进度</div>' +
+    '<p class="sec-sub" style="margin-top:6px;">你的学习进度只存在这台手机里。换手机、清掉浏览器数据，进度就找不回来了。把进度导出一份存好（发到微信文件传输助手、存进备忘录都行），万一丢了，回来粘贴就能恢复。</p>' +
+    '<div style="font-size:13.5px;color:var(--ink-soft);margin-top:6px;">现在：已学 <b>' + learnedCount() + '</b> 个词 · 连续学习 <b>' + streakDays() + '</b> 天 · 上次备份：' + esc(lastTxt) + '</div>' +
+    '<div style="margin-top:10px;"><button class="btn blue" data-bk-export type="button">导出备份</button></div>';
+  if(BK_UI.exportText){
+    h += '<div style="margin-top:10px;"><div style="font-size:13px;color:var(--ink-soft);margin-bottom:6px;">备份文字已经准备好（下面这一大段就是），复制下来存好：</div>' +
+      '<textarea class="say-input" data-bk-export-text rows="4" readonly>' + esc(BK_UI.exportText) + '</textarea>' +
+      '<div style="margin-top:8px;"><button class="btn" data-bk-copy type="button">复制备份文本</button></div></div>';
+  }
+  h += '<div style="border-top:1px solid var(--line);margin:16px 0 12px;"></div>' +
+    '<div style="font-weight:700;">恢复进度</div>' +
+    '<p class="sec-sub" style="margin-top:6px;">把之前导出的备份文字完整粘贴到下面，或者选一个备份文件。点「检查备份」后，会先告诉你这是哪天的备份、学了多少词，你确认了才会覆盖现在的进度——确认之前什么都不会改。</p>' +
+    '<textarea class="say-input" data-bk-draft rows="4" placeholder="把备份文字粘贴到这里…">' + esc(BK_UI.draft) + '</textarea>' +
+    '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn" data-bk-check type="button">检查备份</button>' +
+    '<button class="btn ghost" data-bk-pickfile type="button">选备份文件</button>' +
+    '<input type="file" data-bk-file accept=".json,.txt,application/json,text/plain" style="display:none;"></div>';
+  if(BK_UI.pending){
+    const p = BK_UI.pending;
+    h += '<div data-bk-confirmbox style="margin-top:12px;border:1.5px solid #c2a14d;border-radius:12px;padding:12px;background:rgba(194,161,77,.07);">' +
+      '<div style="font-weight:700;">这是 ' + esc(p.whenText) + ' 的备份</div>' +
+      '<div style="font-size:13.5px;color:var(--ink-soft);margin-top:4px;">已学 ' + p.learned + ' 个词 · 连续学习 ' + p.streak + ' 天 · 累计打卡 ' + p.checkinDays + ' 天</div>' +
+      '<div style="font-size:13.5px;margin-top:6px;">恢复后，这台手机现在的进度会被这份备份替换。确定要恢复吗？</div>' +
+      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn blue" data-bk-confirm type="button">确认恢复</button>' +
+      '<button class="btn ghost" data-bk-cancel type="button">先不恢复</button></div></div>';
+  }
+  if(BK_UI.msg) h += '<div data-bk-msg style="margin-top:10px;font-size:13.5px;color:' + (BK_UI.msgOk ? "var(--ok)" : "var(--bad)") + ';">' + esc(BK_UI.msg) + '</div>';
+  h += '</div>';
+  card.innerHTML = h;
+  const q = s => card.querySelector(s);
+  const ex = q("[data-bk-export]"); if(ex) ex.addEventListener("click", bkExport);
+  const cp = q("[data-bk-copy]"); if(cp) cp.addEventListener("click", bkCopyExport);
+  const ta = q("[data-bk-draft]"); if(ta) ta.addEventListener("input", () => { BK_UI.draft = ta.value; });
+  const ck = q("[data-bk-check]"); if(ck) ck.addEventListener("click", () => { const t = q("[data-bk-draft]"); if(t) BK_UI.draft = t.value; bkCheck(); });
+  const pf = q("[data-bk-pickfile]"), fi = q("[data-bk-file]");
+  if(pf && fi) pf.addEventListener("click", () => fi.click());
+  if(fi) fi.addEventListener("change", () => {
+    const f = fi.files && fi.files[0];
+    if(!f) return;
+    const rd = new FileReader();
+    rd.onload = () => { BK_UI.draft = String(rd.result || ""); bkCheck(); };
+    rd.onerror = () => { BK_UI.pending = null; BK_UI.msg = "这个文件没读出来。换个方式：打开文件，把里面的文字复制下来粘贴到上面。"; BK_UI.msgOk = false; paintBackupUI(); };
+    try { rd.readAsText(f); } catch(e){ BK_UI.msg = "这个文件没读出来。换个方式：打开文件，把里面的文字复制下来粘贴到上面。"; BK_UI.msgOk = false; paintBackupUI(); }
+  });
+  const cf = q("[data-bk-confirm]"); if(cf) cf.addEventListener("click", bkConfirm);
+  const cc = q("[data-bk-cancel]"); if(cc) cc.addEventListener("click", () => { BK_UI.pending = null; BK_UI.msg = ""; paintBackupUI(); });
+}
+
 /* ================= 顶部 HUD ================= */
 function renderHUD(){
   const p = planProgress();
@@ -6641,6 +6958,7 @@ function renderToday(){
   const { plan, c, done, total, allDone } = planProgress();
   if(allDone && !state.checkins.has(dayKey())){ markStudied(); saveState(); }
   renderHUD();
+  paintBackupUI();
   $("#tWords").textContent = c.words.done + "/" + c.words.total;
   $("#tGrammar").textContent = c.grammar.done + "/" + c.grammar.total;
   $("#tDialogue").textContent = c.dialogue.done + "/" + c.dialogue.total;
@@ -8099,6 +8417,21 @@ function drawRole(zone, ls){
           }
           return;
         }
+        /* v3.14 句子双验（与发音页同一口径）：模型已下载时先复核、取低者才走 rpAnswer 入账 */
+        if(out.blob && !out.retried && asrEngine().cached()){
+          const rzv = zone.querySelector("#rpResult");
+          if(rzv) rzv.innerHTML = '<div class="card corr-card"><div class="comment-line">复核中…</div></div>';
+          asrVerifySentence(cur.d[1], out, fin => {
+            if(!zone.isConnected) return;
+            rpAnswer(zone, ls, fin.text, fin.url);
+            const rz3 = zone.querySelector("#rpResult");
+            if(rz3){
+              if(fin.offline) rz3.insertAdjacentHTML("beforeend", '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>');
+              if(fin.recSilent) rz3.insertAdjacentHTML("beforeend", '<div class="mic-warn">' + MIC_HINT + '</div>');
+            }
+          });
+          return;
+        }
         rpAnswer(zone, ls, out.text, out.url);
         if(out.recSilent){
           const rz2 = zone.querySelector("#rpResult");
@@ -8342,6 +8675,7 @@ function pronCard(ls, i){
     setTimeout(() => { if(myRecorder && myRecorder.state === "recording") myRecorder.stop(); }, 20000);
   });
   let checkBusy = false;
+  let gradeToken = 0;   /* v3.14：本卡判分代次——开始新一轮聆听/取消时递增，让迟到的双验回调作废，不许把上一轮的分数入账 */
   const doneBtn = card.querySelector('[data-act="done"]');
   if(doneBtn) doneBtn.addEventListener("click", () => endGradeNow());
   /* 判分结果统一处理：语音判分与无识别环境下的打字纠错共用（判分/入账/最好分/错句记录同一口径；
@@ -8374,6 +8708,19 @@ function pronCard(ls, i){
       renderZeroFail();
       return;
     }
+    /* v3.14 句子双验：模型已下载时原生出分先不落定——本场录音再喂离线引擎复核，
+       取低者才入账渲染（与单词双验同一口径，见 asrVerifyScore）；复核不可用
+       （引擎故障/超时）则原生分直接落定。打字纠错（typed）与零结果离线已出分
+       （offline）的结果不再复核；重试轮（retried）录音与转写不是同一轮，跳过。 */
+    if(!out.offline && !out.typed && out.blob && !out.retried && asrEngine().cached()){
+      const tk = gradeToken;
+      result.innerHTML = '<div class="comment-line">复核中…</div>';
+      asrVerifySentence(d[1], out, fin => { if(tk === gradeToken && card.isConnected) renderScored(fin); });
+      return;
+    }
+    renderScored(out);
+  };
+  const renderScored = out => {
     const text = out.text, res = out.res;
     pracLine(lid);
     state.stats.pronAttempts++;
@@ -8421,6 +8768,7 @@ function pronCard(ls, i){
     if(checkBusy){
       /* 聆听中再点一次：取消并复位。聆听指示只用按钮本身，不再借用🎙录音的状态行（避免同卡两个聆听指示） */
       checkBusy = false;
+      gradeToken++;
       cancelGrade();
       if(doneBtn) doneBtn.style.display = "none";
       checkBtn.textContent = "跟读打分";
@@ -8428,6 +8776,7 @@ function pronCard(ls, i){
       return;
     }
     checkBusy = true;
+    gradeToken++;
     checkBtn.textContent = "正在听你说…（再点一次取消）";
     if(doneBtn) doneBtn.style.display = "";
     listenGrade(d[1], gradeOut, { meterEl: card.querySelector(".mic-meter") });
