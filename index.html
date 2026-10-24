@@ -24,6 +24,12 @@
           animation:ld 1.6s ease-in-out infinite; }
   @keyframes ld{ 0%{ transform:translateX(-110%);} 100%{ transform:translateX(280%);} }
   .pct{ font-size:13px; color:var(--faint); letter-spacing:.14em; }
+  .seal{ font-size:46px; line-height:1; margin-top:20px; animation:swim 3.4s ease-in-out infinite alternate; }
+  @keyframes swim{
+    0%{ transform:translateX(-72px) translateY(0) rotate(-5deg); }
+    50%{ transform:translateX(0) translateY(-7px) rotate(4deg); }
+    100%{ transform:translateX(72px) translateY(0) rotate(-5deg); }
+  }
 </style>
 </head>
 <body>
@@ -32,12 +38,13 @@
     <div class="spin"></div>
     <h1>正在更新</h1>
     <p>App 正在更新中，暂时不能学习，请稍后再来。</p>
+    <div class="seal">🦭</div>
     <div class="bar"><i></i></div>
     <div class="pct">更新中…</div>
     <p class="sub">你的学习进度已经保存在云端，不会丢失。<br>更新完成后，这个页面会自动打开新版本，你什么都不用做。</p>
   </div>
 <script>
-  var MY_STAMP = "v202610240745";
+  var MY_STAMP = "v202610240748";
   function check(){
     fetch("version.json?ts=" + Date.now(), { cache: "no-store" })
       .then(function(r){ return r.json(); })
