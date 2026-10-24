@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610232123";
+var APP_BUILD = "v202610232156";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -492,7 +492,7 @@ var APP_BUILD = "v202610232123";
       .flash .cn-big{font-size:27px;font-weight:700;}
       .flash .ex{font-size:16px;}
       .flash .excn{color:var(--ink-soft);font-size:13.5px;}
-      .flash .tap-hint{position:absolute;bottom:14px;font-size:12px;color:var(--ink-faint);}
+      .flash .tap-hint{position:static;display:block;margin-top:9px;font-size:12px;color:var(--ink-faint);}
       .flash-nav{display:flex;align-items:center;justify-content:space-between;margin-top:14px;gap:8px;flex-wrap:wrap;}
       .flash-count{color:var(--ink-faint);font-size:13px;}
       .grade-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px;}
@@ -1012,7 +1012,7 @@ var APP_BUILD = "v202610232123";
       .wscore audio{width:100%;margin-top:10px;}
       .ws-listening{display:inline-block;animation:recPulse 1.1s ease-in-out infinite;}
       @keyframes recPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.14);opacity:.7}}
-      .ws-chip{display:block;margin:9px auto 0;font-size:12.5px;font-weight:700;color:var(--accent-deep);background:var(--accent-soft);border:1px solid #e8dcbc;border-radius:99px;padding:3px 11px;}
+      .ws-chip{position:static;display:block;margin:9px auto 0;font-size:12.5px;font-weight:700;color:var(--accent-deep);background:var(--accent-soft);border:1px solid #e8dcbc;border-radius:99px;padding:3px 11px;}
       /* ---- VL 播放器动效 ---- */
       .vl-overlay{animation:vlFade .28s ease both;}
       @keyframes vlFade{from{opacity:0}to{opacity:1}}
@@ -6044,28 +6044,31 @@ function meterStop(){
 /* 只认第一候选判分（v3.3 评分大修）：旧口径在最多 5 个候选转写里挑分最高的判——
    识别的语言模型会把标准句作为候选「猜」出来，用户读得含糊也能被某个候选命中 → 虚高。
    新口径：只按识别自认最佳的第一候选（alts[0]）判分；其它候选不许整句替判。
-   个别词被识别写成同音/近音词的，由 diffSentence 内部的同音/音素等价判定在第一候选上逐词救回。 */
+   个别词被识别写成同音/近音词的，由 diffSentence 内部的同音/音素等价判定在第一候选上逐词救回。
+   （v3.22 修订：本段只管句子模式；单词模式的候选合并改为多路取最优，见函数内注。） */
 function scoreFirst(target, alts, wordMode){
   if(!alts || !alts.length) return null;
-  const res = diffSentence(target, alts[0]);
-  if(wordMode){
-    strictWordRes(target, res);
-    /* v3.21 单词口径修正（用户实测「读对却 0 分」）：识别引擎的第一候选经常把读对的
-       词写成别的词形（playing 读对、首候选却是变形词），旧口径只认第一候选 →
-       严判直接 0 分。单词模式改为：任一候选与目标确切一致即按确切命中判 100；
-       「确切一致」不新造标准——复用严判本身（strictWordRes 后满分＝完全相同 /
-       同音·音素全等 / 只多读填充词）。没有任何候选确切命中时，维持第一候选
-       口径与全部严判规则（近音 35、读错 0）不变。句子模式完全不受影响；
-       多词条目不套严判（strictWordRes 自行跳过），同样维持第一候选口径。 */
-    const tgt = String(target || "").trim();
-    if(res.score < 100 && tgt && !/\s/.test(tgt)){
-      for(let k = 1; k < alts.length; k++){
-        const r2 = diffSentence(target, alts[k]);
-        strictWordRes(target, r2);
-        if(r2.score >= 100) return { text: alts[k], res: r2 };
-      }
+  const tgt = String(target || "").trim();
+  if(wordMode && tgt && !/\s/.test(tgt)){
+    /* v3.22 单词判分改「多路取最优」（Chris 实测事故：目标词 plane，他读对了、系统
+       识别也听到 plane，离线 whisper 却把单个词幻听成「Please.」，旧双验取低让最弱
+       的一路一票否决成 0 分）：单单词目标在严判下，把每个候选都按严判档位评级
+       （确切一致/同音＝100、音素近音＝35、读错＝0），取最高档的候选定分，其文本即
+       「你读的是」；同档取最早出现的候选（alts[0] 优先）。v3.21「任一候选确切命中
+       即 100」是本规则的子集；近音 35、读错 0 的严判边界一字未动。
+       多词条目不套严判（strictWordRes 自行跳过），不走本分支、维持第一候选口径；
+       句子模式（wordMode=false）完全不受影响。 */
+    let best = null;
+    for(let k = 0; k < alts.length; k++){
+      const r = diffSentence(target, alts[k]);
+      strictWordRes(target, r);
+      if(!best || r.score > best.res.score) best = { text: alts[k], res: r };
+      if(best.res.score >= 100) break;
     }
+    return best;
   }
+  const res = diffSentence(target, alts[0]);
+  if(wordMode) strictWordRes(target, res);
   return { text: alts[0], res };
 }
 /* 单词严判（v3.12，用户点名「再苛刻」）：单单词条目不按权重折算——转写与目标一致
@@ -6633,6 +6636,10 @@ function asrDownloadModel(prog, cb){
    超时（25s）＝复核不可用，不拦原生分。重试轮（retried）的录音与转写不是
    同一轮，不做双验（由调用方把关）。单词走严判（wordMode），句子走句面口径。
    句子复核每次多数秒，属预期，不许为省时跳过。 */
+/* v3.22 修订（仅单词模式、且仅限单单词目标）：合并判法由「取低」改为「多路取最优」——
+   离线转写与原生全部候选同为证据，按严判档位取最高档定分、同档优先原生（见函数内注）；
+   句子与多词条目仍按上文取低口径，一字未动。改因：whisper 对单词短音频会幻听
+   （plane→「Please.」），取低等于让最弱的一路当主判，读对了也给 0 分。 */
 function asrVerifyScore(target, out, wordMode, cb){
   let finished = false;
   const finish = o => { if(finished) return; finished = true; asrBusyCount--; cb(o); };
@@ -6649,6 +6656,18 @@ function asrVerifyScore(target, out, wordMode, cb){
          空转写同样不再把句子分打成 0。 */
       if(!String(text).trim()){ finish(out); return; }
       const sc = scoreFirst(target, [text], !!wordMode);
+      /* v3.22 单词合并（单单词目标）：离线转写只是多路证据之一——只有它评出的档位
+         严格高于原生全部候选的最高档时，才由它定分（文本与「离线识别」来源标注随之
+         切换）；同档或更低一律原生落定（同档优先系统识别）。旧取低口径会让 whisper
+         对单词的幻听（plane→Please.）一票否决读对的词，用户实测中招，此路废除。
+         多词条目维持原取低不变；句子模式（wordMode=false）完全维持原取低不变。 */
+      const tgtW = String(target || "").trim();
+      if(wordMode && tgtW && !/\s/.test(tgtW)){
+        if(sc && sc.res.score > out.res.score)
+          finish({ text: sc.text, res: sc.res, url: out.url, recSilent: out.recSilent, offline: true });
+        else finish(out);
+        return;
+      }
       if(sc && sc.res.score < out.res.score)
         finish({ text: sc.text, res: sc.res, url: out.url, recSilent: out.recSilent, offline: true });
       else finish(out);
@@ -7935,6 +7954,10 @@ function startLessonDeck(lid, idx){
 /* ================= 单词版块 ================= */
 function flashHTML(v, id){
   const best = id ? wordScoreBest(id) : null;
+  /* v3.22：「跟读最好」牌子与 tap-hint 提示行都是普通文档流内的独立块级行（牌子在前、
+     提示行在后，见下方拼接顺序；CSS 两者均为 position:static 的 block）——v3.21 只把牌子
+     设成 block，但提示行仍是 absolute 贴底，卡面内容一高牌子就压住提示行（用户截图实锤），
+     这次从结构上根除：文档流里的兄弟块永远不可能互相重叠。 */
   return '<div class="flash-zone"><div class="flash" data-flash>' +
     '<div class="flash-face">' + wordFigureHTML(v, id) +
     '<button class="w en word-tap" data-speakword type="button" aria-label="点单词听发音">' + esc(v[0]) + '</button><div class="phon">' + esc(v[1]) + '</div>' +
