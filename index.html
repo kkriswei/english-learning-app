@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610231948";
+var APP_BUILD = "v202610232012";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -7518,11 +7518,16 @@ function renderPastReview(){
   });
   const dates = Object.keys(byDate).sort().reverse();
   const hasKey = weakWords.length > 0 || lowPron.length > 0 || corrKeyHtml.length > 0;
-  if(!hasKey && !dates.length){
+  /* v3.20：待补新词也展示在本区（她只看今日页，复习页入口太深）——待补与已学历史都空才算无记录 */
+  const bkItems = backlogItems();
+  if(!hasKey && !dates.length && !bkItems.length){
     host.innerHTML = '<div class="xsec" data-sec="pr-empty" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">复习以前学过的</span><span class="xsec-count">暂无记录</span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner"><p class="sec-sub" style="margin:0;">学过的东西会按日期出现在这里</p></div></div></div>';
     return;
   }
   let h = "";
+  if(bkItems.length){
+    h += prSection("pr-backlog", true, "复习以前学过的", "前几天发过、还没学的词，点开就能学", backlogGroupsHTML(bkItems, "tbk"), bkItems.length + " 个待补");
+  }
   if(hasKey){
     let inner = "";
     if(weakWords.length) inner += '<div class="pr-group">单词 · 还没掌握（' + weakWords.length + ')</div>' + weakWords.map(w => prItemWord(w, state.wordGrades[w.id])).join("");
@@ -7539,6 +7544,7 @@ function renderPastReview(){
     h += prSection("pr-" + dk, false, (dt.getMonth() + 1) + " 月 " + dt.getDate() + " 日", parts.join(" · "), g.word.join("") + g.pron.join("") + g.corr.join(""), "共 " + (g.word.length + g.pron.length + g.corr.length) + " 条");
   });
   host.innerHTML = h;
+  if(bkItems.length) wireBacklogRows(host);
 }
 document.addEventListener("click", e => {
   const el = e.target.closest ? e.target.closest("[data-prkind]") : null;
@@ -8266,23 +8272,31 @@ function renderBacklog(){
     host.innerHTML = '<p class="sec-sub" style="margin:0;">没有待补的词——之前发过的新词都学完了。</p>';
     return;
   }
+  host.innerHTML = '<p class="sec-sub" style="margin-top:0;">这些词是前几天发给你、但还没学的。点开任意一个就能学；学会后会照常进入复习队列。它们不会再出现在每天的新词里，也不占新词名额。</p>' +
+    backlogGroupsHTML(items, "rbk");
+  wireBacklogRows(host);
+}
+/* 「待补新词」按日期分组的条目 HTML：复习页（rbk-）与今日页（tbk-）共用，prefix 防 data-sec 撞名 */
+function backlogGroupsHTML(items, prefix){
   const groups = [], byDate = {};
   items.forEach(x => {
     if(!byDate[x.date]){ byDate[x.date] = { date: x.date, items: [] }; groups.push(byDate[x.date]); }
     byDate[x.date].items.push(x);
   });
   groups.sort((a, b) => a.date < b.date ? 1 : -1);
-  host.innerHTML = '<p class="sec-sub" style="margin-top:0;">这些词是前几天发给你、但还没学的。点开任意一个就能学；学会后会照常进入复习队列。它们不会再出现在每天的新词里，也不占新词名额。</p>' +
-    groups.map((gr, gi) => {
-      const sid = "rbk-" + gr.date;
-      const label = gr.date.slice(5).replace("-", "月") + "日发的";
-      return '<div class="xsec xsub" data-sec="' + sid + '"' + secOpenAttr(sid, gi === 0) + '>' +
-        '<div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">' + label + '</span>' +
-        '<span class="xsec-count">' + gr.items.length + ' 个</span><span class="xsec-arrow">▾</span></div>' +
-        '<div class="xsec-body"><div class="xsec-inner">' +
-        gr.items.map(x => { const w = wordById(x.id); return w ? planWordRow(w, ' data-bkword="' + w.id + '" style="cursor:pointer;"') : ""; }).join("") +
-        '</div></div></div>';
-    }).join("");
+  return groups.map((gr, gi) => {
+    const sid = prefix + "-" + gr.date;
+    const label = gr.date.slice(5).replace("-", "月") + "日发的";
+    return '<div class="xsec xsub" data-sec="' + sid + '"' + secOpenAttr(sid, gi === 0) + '>' +
+      '<div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">' + label + '</span>' +
+      '<span class="xsec-count">' + gr.items.length + ' 个</span><span class="xsec-arrow">▾</span></div>' +
+      '<div class="xsec-body"><div class="xsec-inner">' +
+      gr.items.map(x => { const w = wordById(x.id); return w ? planWordRow(w, ' data-bkword="' + w.id + '" style="cursor:pointer;"') : ""; }).join("") +
+      '</div></div></div>';
+  }).join("");
+}
+/* 待补词条接线（发音钮 + 点开去单词页学）：复习页与今日页共用 */
+function wireBacklogRows(host){
   host.querySelectorAll("[data-wspeak]").forEach(b => b.addEventListener("click", e => { e.stopPropagation(); speak(b.dataset.wspeak, 1); }));
   host.querySelectorAll("[data-bkword]").forEach(el => el.addEventListener("click", () => {
     const w = wordById(el.dataset.bkword);
