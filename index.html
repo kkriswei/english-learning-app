@@ -19,11 +19,11 @@
          border:4px solid rgba(194,161,77,.25); border-top-color:var(--gold);
          animation:sp 1s linear infinite; }
   @keyframes sp{ to{ transform:rotate(360deg); } }
-  .bar{ height:8px; border-radius:99px; background:rgba(194,161,77,.18); overflow:hidden; margin:26px auto 6px; max-width:280px; }
-  .bar i{ display:block; height:100%; width:40%; border-radius:99px; background:var(--gold);
-          animation:ld 1.6s ease-in-out infinite; }
-  @keyframes ld{ 0%{ transform:translateX(-110%);} 100%{ transform:translateX(280%);} }
-  .pct{ font-size:13px; color:var(--faint); letter-spacing:.14em; }
+  .bar{ height:10px; border-radius:99px; background:rgba(194,161,77,.18); overflow:hidden; margin:26px auto 8px; max-width:300px; }
+  .bar i{ display:block; height:100%; width:0%; border-radius:99px; background:var(--gold);
+          transition:width .8s ease; }
+  .pct{ font-size:15px; color:#3d382c; letter-spacing:.06em; }
+  .pct b{ font-size:19px; color:var(--ink); }
   .seal{ font-size:46px; line-height:1; margin-top:20px; animation:swim 3.4s ease-in-out infinite alternate; }
   @keyframes swim{
     0%{ transform:translateX(-72px) translateY(0) rotate(-5deg); }
@@ -39,12 +39,14 @@
     <h1>正在更新</h1>
     <p>App 正在更新中，暂时不能学习，请稍后再来。</p>
     <div class="seal">🦭</div>
-    <div class="bar"><i></i></div>
-    <div class="pct">更新中…</div>
+    <div class="bar"><i id="barFill"></i></div>
+    <div class="pct"><b id="pctNum">0%</b></div>
+    <div class="sub" id="cntLine" style="margin-top:6px;">已更新 0 / 17,912 个音频</div>
+    <div class="sub" id="phaseLine" style="margin-top:2px;">正在准备录音</div>
     <p class="sub">你的学习进度已经保存在云端，不会丢失。<br>更新完成后，这个页面会自动打开新版本，你什么都不用做。</p>
   </div>
 <script>
-  var MY_STAMP = "v202610240748";
+  var MY_STAMP = "v202610240815";
   function check(){
     fetch("version.json?ts=" + Date.now(), { cache: "no-store" })
       .then(function(r){ return r.json(); })
@@ -53,8 +55,23 @@
       })
       .catch(function(){});
   }
+  function prog(){
+    fetch("progress.json?ts=" + Date.now(), { cache: "no-store" })
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j || typeof j.done !== "number" || !j.total) return;
+        var pct = Math.floor(j.done * 100 / j.total);
+        document.getElementById("barFill").style.width = pct + "%";
+        document.getElementById("pctNum").textContent = pct + "%";
+        document.getElementById("cntLine").textContent = "已更新 " + j.done.toLocaleString() + " / " + j.total.toLocaleString() + " 个音频";
+        if(j.phase) document.getElementById("phaseLine").textContent = j.phase;
+      })
+      .catch(function(){});
+  }
   setInterval(check, 45000);
-  document.addEventListener("visibilitychange", function(){ if(!document.hidden) check(); });
+  setInterval(prog, 30000);
+  prog();
+  document.addEventListener("visibilitychange", function(){ if(!document.hidden){ check(); prog(); } });
 </script>
 </body>
 </html>
