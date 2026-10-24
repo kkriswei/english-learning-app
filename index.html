@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610232012";
+var APP_BUILD = "v202610232123";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -485,7 +485,7 @@ var APP_BUILD = "v202610232012";
         position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;
         border-radius:var(--r-lg);border:1px solid var(--line);background:var(--surface);
         box-shadow:var(--shadow);display:flex;flex-direction:column;align-items:center;justify-content:center;
-        padding:22px;text-align:center;gap:6px;
+        padding:22px 22px 46px;text-align:center;gap:6px;
       }
       .flash-back{transform:rotateY(180deg);background:var(--surface-2);border-color:transparent;}
       .flash .w{font-size:42px;font-weight:600;line-height:1.15;}
@@ -1012,7 +1012,7 @@ var APP_BUILD = "v202610232012";
       .wscore audio{width:100%;margin-top:10px;}
       .ws-listening{display:inline-block;animation:recPulse 1.1s ease-in-out infinite;}
       @keyframes recPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.14);opacity:.7}}
-      .ws-chip{display:inline-block;margin-top:9px;font-size:12.5px;font-weight:700;color:var(--accent-deep);background:var(--accent-soft);border:1px solid #e8dcbc;border-radius:99px;padding:3px 11px;}
+      .ws-chip{display:block;margin:9px auto 0;font-size:12.5px;font-weight:700;color:var(--accent-deep);background:var(--accent-soft);border:1px solid #e8dcbc;border-radius:99px;padding:3px 11px;}
       /* ---- VL 播放器动效 ---- */
       .vl-overlay{animation:vlFade .28s ease both;}
       @keyframes vlFade{from{opacity:0}to{opacity:1}}
@@ -1313,6 +1313,7 @@ figure.wfig{margin:0 0 8px;}
 
         <div id="planList"></div>
         <div id="planDone"></div>
+        <div id="asrSetupToday" class="asr-setup-host" style="display:none;margin-top:14px;"></div>
         <div id="backupCard" style="margin-top:14px;"></div>
       </section>
 
@@ -1404,7 +1405,6 @@ figure.wfig{margin:0 0 8px;}
 
       <!-- VIEW: pronunciation -->
       <section id="view-pron" class="hidden">
-        <div id="asrSetupPron" class="asr-setup-host" style="display:none;"></div>
         <div class="hero"><div class="hero-kick">PRONUNCIATION</div><div class="hero-title">发音 · Pronunciation</div><p class="hero-sub">逐句跟读打分：读错标红、漏读标金，给 0–100 分和中文点评。</p></div>
         <div class="xsec" data-sec="p-today" data-open="1"><div class="xsec-head" data-sechead role="button" tabindex="0"><span class="xt">今日发音<small>和「今日」页同一份清单</small></span><span class="xsec-count" id="cntPronToday"></span><span class="xsec-arrow">▾</span></div><div class="xsec-body"><div class="xsec-inner">
           <div id="pronToday"></div>
@@ -6048,7 +6048,24 @@ function meterStop(){
 function scoreFirst(target, alts, wordMode){
   if(!alts || !alts.length) return null;
   const res = diffSentence(target, alts[0]);
-  if(wordMode) strictWordRes(target, res);
+  if(wordMode){
+    strictWordRes(target, res);
+    /* v3.21 单词口径修正（用户实测「读对却 0 分」）：识别引擎的第一候选经常把读对的
+       词写成别的词形（playing 读对、首候选却是变形词），旧口径只认第一候选 →
+       严判直接 0 分。单词模式改为：任一候选与目标确切一致即按确切命中判 100；
+       「确切一致」不新造标准——复用严判本身（strictWordRes 后满分＝完全相同 /
+       同音·音素全等 / 只多读填充词）。没有任何候选确切命中时，维持第一候选
+       口径与全部严判规则（近音 35、读错 0）不变。句子模式完全不受影响；
+       多词条目不套严判（strictWordRes 自行跳过），同样维持第一候选口径。 */
+    const tgt = String(target || "").trim();
+    if(res.score < 100 && tgt && !/\s/.test(tgt)){
+      for(let k = 1; k < alts.length; k++){
+        const r2 = diffSentence(target, alts[k]);
+        strictWordRes(target, r2);
+        if(r2.score >= 100) return { text: alts[k], res: r2 };
+      }
+    }
+  }
   return { text: alts[0], res };
 }
 /* 单词严判（v3.12，用户点名「再苛刻」）：单单词条目不按权重折算——转写与目标一致
@@ -6524,7 +6541,7 @@ async function asrDoTranscribe(blob){
   if(!pcm || !pcm.length) return null;
   if(!asrWorkerDead){
     const r = await asrWorkerCall({ type: "transcribe", pcm: pcm });
-    if(r && r.type === "result"){ asrMarkCached(); return (r.text || "").trim(); }   /* v3.14：转写成功但为空 → 返回 ""（与失败的 null 区分，空转写按 0 分参与复核取低） */
+    if(r && r.type === "result"){ asrMarkCached(); return (r.text || "").trim(); }   /* v3.14：转写成功但为空 → 返回 ""（与失败的 null 区分；v3.21 起空转写在复核里不作判分依据） */
     /* Worker 起不来或中途坏掉：标记后退主线程再试一次 */
     asrWorkerDead = true;
     if(asrWorker){ const w = asrWorker; asrWorker = null; try { w.terminate(); } catch(e){} }
@@ -6539,7 +6556,7 @@ const realAsrEngine = {
   cached(){ try { return localStorage.getItem(ASR_FLAG_KEY) === "1"; } catch(e){ return false; } },
   transcribe(blob, prog, cb){
     asrProgSink = prog || null;
-    /* 回调口径（v3.14）：null ＝ 引擎失败/不可用；"" ＝ 转写成功但没听出任何词（按 0 分参与复核取低）；非空字符串 ＝ 转写文本 */
+    /* 回调口径（v3.14，v3.21 修订）：null ＝ 引擎失败/不可用；"" ＝ 转写成功但没听出任何词（复核时不作判分依据，见 asrVerifyScore）；非空字符串 ＝ 转写文本 */
     asrDoTranscribe(blob).then(t => { asrProgSink = null; cb(t === null || t === undefined ? null : t); }, () => { asrProgSink = null; cb(null); });
   }
 };
@@ -6549,8 +6566,10 @@ function asrEngine(){
 /* ---------- v3.12：一次性离线组件设置卡 + 单词双验 ----------
    口径（用户定）：打分只许一条直线——读完→原生出分；原生零结果→已下载就自动离线
    出分、没下载就只留一行事实提示，全程不出现让她做选择的面板。下载从失败流里摘
-   出来做成设置卡：发音页顶部、对话页顶部、单词打分面板上方各一份（未下载常驻、
-   下载完永久消失，全站同步刷新）。 */
+   出来做成设置卡（未下载常驻、下载完永久消失，全站同步刷新）。放置口径
+   v3.21 修订：设置卡只保留今日页一份——单词卡、发音页、对话页等学习界面内
+   不再出现（用户实测发火：学词时被下载卡挡路）；这些界面零结果时只给一行
+   指向今日页的事实提示（单词卡走失败口径，连提示里的下载字样都不出现）。 */
 const ASR_SETUP_HTML = '<div class="card" data-asrsetup style="border:1.5px solid #c2a14d;background:rgba(194,161,77,.08);">' +
   '<div style="font-weight:700;">跟读打分，先装一个离线组件（只装一次）</div>' +
   '<div style="margin-top:4px;">跟读打分先下载一个离线组件（约 55MB，只下一次），之后读完直接出分，不依赖苹果的识别。</div>' +
@@ -6609,8 +6628,8 @@ function asrDownloadModel(prog, cb){
    最终分取两者最低——堵识别引擎把含糊发音「猜」成正确词；原生 SR 在她环境
    时好时坏，从此只能拉低、不能单独放行。最终分落定前不入账（调用方面板显示
    「复核中…」，属直线流内状态）。口径（词句一致）：离线转写为空＝引擎没听出
-   任何词，按 0 分判分参与取低（scoreFirst → diffSentence 对空转写的判分＝
-   全部目标词漏读、earnedW=0 → 总分 0，封顶规则不改变这个结果）；引擎坏掉/
+   任何词，不作判分依据、原生分直接落定（v3.21 修正，旧口径按 0 分取低会把
+   读对的词否决成 0 分）；离线转写非空且与目标不符才参与取低。引擎坏掉/
    超时（25s）＝复核不可用，不拦原生分。重试轮（retried）的录音与转写不是
    同一轮，不做双验（由调用方把关）。单词走严判（wordMode），句子走句面口径。
    句子复核每次多数秒，属预期，不许为省时跳过。 */
@@ -6623,6 +6642,12 @@ function asrVerifyScore(target, out, wordMode, cb){
     asrEngine().transcribe(out.blob, null, text => {
       clearTimeout(wd);
       if(text === null || text === undefined){ finish(out); return; }
+      /* v3.21：离线转写为空＝引擎没听出任何词（单词录音太短/太轻、引擎没听清），
+         不等于读错——不再按 0 分判分参与取低（v3.12–v3.20 的旧口径会把原生已判
+         对的词一票否决成 0 分，用户实测中招）。空转写时原生分直接落定；非空
+         转写维持原取低逻辑不变。本函数词句共用，句子/角色扮演同受此修正：
+         空转写同样不再把句子分打成 0。 */
+      if(!String(text).trim()){ finish(out); return; }
       const sc = scoreFirst(target, [text], !!wordMode);
       if(sc && sc.res.score < out.res.score)
         finish({ text: sc.text, res: sc.res, url: out.url, recSilent: out.recSilent, offline: true });
@@ -7320,6 +7345,7 @@ function renderToday(){
   if(allDone && !state.checkins.has(dayKey())){ markStudied(); saveState(); }
   renderHUD();
   paintBackupUI();
+  refreshAsrSetup();   /* v3.21：离线组件设置卡只在今日页一份，这里刷新它的显隐 */
   $("#tWords").textContent = c.words.done + "/" + c.words.total;
   $("#tGrammar").textContent = c.grammar.done + "/" + c.grammar.total;
   $("#tDialogue").textContent = c.dialogue.done + "/" + c.dialogue.total;
@@ -7687,30 +7713,31 @@ function feedbackForWord(res, word){
   if(res.score >= 50) return "有点像，但还不准：先点单词听原音，再跟着慢读两遍。";
   return "先别急：点单词听原音，一个音一个音跟着读，读顺了再把整词读出来。";
 }
+/* 停掉词卡面板里「听我的录音」的回放（切状态/取消时调用，防旧录音继续出声） */
+function wsStopMine(panel){
+  const au = panel && panel._wsAudio;
+  if(au){ try { au.pause(); } catch(e){} }
+}
 function startWordScore(host, v, uid){
   if(!host || !v || !uid) return;
   const panel = host.querySelector("[data-wscore]");
   if(!panel) return;
   if(panel.dataset.wsbusy === "1"){
-    /* 正在播原音/聆听中再点一次：取消并复位，绝不让界面停在聆听态 */
+    /* 正在播原音/等她点开始/聆听中再点一次：取消并复位，绝不让界面停在聆听态 */
     panel.dataset.wsbusy = "";
     panel._wsTok = (panel._wsTok || 0) + 1;
     cancelGrade();
     try { stopRec(); } catch(e){}
+    wsStopMine(panel);
     panel.hidden = false;
     panel.innerHTML = '<div class="ws-state">已取消。准备好了，再点一次🎤跟读打分。</div>';
     return;
   }
   stopWordInline();
   panel.hidden = false;
-  let wsSetupHost = host.querySelector(".asr-setup-host");
-  if(!wsSetupHost){
-    wsSetupHost = document.createElement("div");
-    wsSetupHost.className = "asr-setup-host";
-    wsSetupHost.style.display = "none";
-    if(panel.parentNode) panel.parentNode.insertBefore(wsSetupHost, panel);
-  }
-  paintAsrSetup(wsSetupHost);
+  /* v3.21：单词卡内不再放离线组件设置卡（全站只保留今日页一份）。组件没装时
+     点跟读直接走系统识别打分；系统识别也出不了结果时走既有失败口径给事实
+     提示，绝不弹卡挡路、绝不静默。 */
   if(!SR){
     panel.innerHTML = '<div class="ws-state">这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的），没法自动打分。<br>现在可以点单词听原音，自己大声跟读几遍。</div>';
     return;
@@ -7718,36 +7745,23 @@ function startWordScore(host, v, uid){
   panel.dataset.wsbusy = "1";
   const wsTok = (panel._wsTok = (panel._wsTok || 0) + 1);
   panel.innerHTML = '<div class="ws-state">先听一遍原音，注意听清楚…</div>';
-  let began = false;
-  const begin = () => {
-    if(began) return; began = true;
-    if(panel._wsTok !== wsTok) return;   /* 已被取消/取代：迟到的原音回调不再启动识别 */
-    if(!panel.isConnected) return;
+  /* v3.21 跟读改全手动（用户实测发火点）：示范（快 1 遍＋慢 2 遍）播完只停在
+     「待录」状态，她点了「🎤 开始跟读」才开麦录音/识别；出分后的「再读一次」
+     也只回到待录状态等她再点。旧流程示范一停就自动开录，她还没准备好就被
+     录了判分。出分只写本面板：不跳页、不翻词、不重渲染整卡。 */
+  const wsShowReady = () => {
+    if(panel._wsTok !== wsTok || !panel.isConnected) return;
+    wsStopMine(panel);
+    panel.innerHTML = '<div class="ws-state">原音听完了。准备好就点按钮，自己把这个词读出来：</div>' +
+      '<div class="ws-state" style="margin-top:6px;"><b class="en" style="font-size:21px;">' + esc(v[0]) + '</b></div>' +
+      '<div class="ws-row" style="margin-top:12px;"><button class="btn main" data-wsstart type="button" style="font-size:16.5px;padding:12px 30px;">🎤 开始跟读</button></div>' +
+      '<div class="ws-state" style="margin-top:8px;font-size:13px;">点按钮才会开始录音；读完停一下，马上出分</div>';
+    const sb = panel.querySelector("[data-wsstart]");
+    if(sb) sb.addEventListener("click", wsRecord);
+  };
+  const wsRecord = () => {
+    if(panel._wsTok !== wsTok || !panel.isConnected) return;
     panel.innerHTML = '<div class="ws-state"><span class="ws-listening">🎤</span> 听着呢，照着读：<b class="en" style="font-size:19px;">' + esc(v[0]) + '</b><br><span style="font-size:13px;">读完停一下，马上出分</span></div>' + '<div class="mic-meter"></div>';
-    const wsWire = () => {
-      const rt = panel.querySelector("[data-wsretry]");
-      if(rt) rt.addEventListener("click", () => startWordScore(host, v, uid));
-      const og = panel.querySelector("[data-wsorig]");
-      if(og) og.addEventListener("click", () => { if(!playWordDemo(v[0])) speak(v[0], 1); });
-    };
-    const wsShowScore = out2 => {
-      const sc = out2.res.score;
-      saveWordScore(uid, sc, out2.text);
-      panel.innerHTML = '<div class="ws-big ' + scoreClass(sc) + '">' + sc + ' 分</div>' +
-        '<div class="ws-heard">你读的是：<b class="en">' + esc(out2.text || "") + '</b></div>' +
-        '<div class="ws-fb">' + esc(feedbackForWord(out2.res, v[0])) + '</div>' +
-        (out2.offline ? '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>' : '') +
-        (out2.url ? '<audio controls src="' + out2.url + '"></audio>' : '') +
-        (out2.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
-        '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">🎤 再读一次</button>' +
-        '<button class="btn ghost small" data-wsorig type="button">▶ 再听原音</button></div>';
-      wsWire();
-    };
-    const wsShowFail = out => {
-      const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
-      panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>';
-      wsWire();
-    };
     listenGrade(v[0], out => {
       panel.dataset.wsbusy = "";
       if(!panel.isConnected) return;
@@ -7763,7 +7777,8 @@ function startWordScore(host, v, uid){
             panel.innerHTML = '<div class="ws-state">离线识别中…</div>' + ASR_PROG_HTML;
             asrRunOffline(out, panel.querySelector("[data-asrprog]"), asrScoredW, () => wsShowFail(out));
           } else {
-            panel.innerHTML = '<div class="ws-state">先完成上面的离线组件下载，就能打分了。</div>';
+            /* v3.21：组件没装不在词卡里弹下载卡，走既有失败口径给事实提示 */
+            wsShowFail(out);
           }
           return;
         }
@@ -7779,6 +7794,45 @@ function startWordScore(host, v, uid){
       wsShowScore(out);
     }, { word: true, meterEl: panel.querySelector(".mic-meter") });
   };
+  const wsWire = () => {
+    const rt = panel.querySelector("[data-wsretry]");
+    if(rt) rt.addEventListener("click", wsShowReady);   /* v3.21：再读一次只回到待录状态，不自动开录 */
+    const og = panel.querySelector("[data-wsorig]");
+    if(og) og.addEventListener("click", () => { if(!playWordDemo(v[0])) speak(v[0], 1); });
+  };
+  const wsShowScore = out2 => {
+    const sc = out2.res.score;
+    saveWordScore(uid, sc, out2.text);
+    panel.innerHTML = '<div class="ws-big ' + scoreClass(sc) + '">' + sc + ' 分</div>' +
+      '<div class="ws-heard">你读的是：<b class="en">' + esc(out2.text || "") + '</b></div>' +
+      '<div class="ws-fb">' + esc(feedbackForWord(out2.res, v[0])) + '</div>' +
+      (out2.offline ? '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>' : '') +
+      (out2.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '') +
+      '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">🎤 再读一次</button>' +
+      (out2.url ? '<button class="btn soft small" data-wsmine type="button">▶ 听我的录音</button>' : '') +
+      '<button class="btn ghost small" data-wsorig type="button">▶ 再听原音</button></div>';
+    wsWire();
+    /* v3.21：回放自己的录音用自有按钮（与全站黑金按钮同款），不再用系统
+       默认样式的原生音频播放条。 */
+    const mb = panel.querySelector("[data-wsmine]");
+    if(mb && out2.url){
+      if(!panel._wsAudio) panel._wsAudio = new Audio();
+      const au = panel._wsAudio;
+      try { au.pause(); } catch(e){}
+      au.src = out2.url;
+      mb.addEventListener("click", () => {
+        if(au.paused){ const pr = au.play(); if(pr && pr.catch) pr.catch(() => {}); mb.textContent = "⏸ 暂停我的录音"; }
+        else { au.pause(); mb.textContent = "▶ 听我的录音"; }
+      });
+      au.onended = () => { mb.textContent = "▶ 听我的录音"; };
+    }
+  };
+  const wsShowFail = out => {
+    const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
+    panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>' +
+      '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">🎤 再读一次</button></div>';
+    wsWire();
+  };
   const demoFail = () => {
     if(panel._wsTok !== wsTok || !panel.isConnected) return;
     /* 原音彻底没加载出来：停在示范步让她自己选，不再默默轮到她读——她还没听过这个词怎么读 */
@@ -7788,12 +7842,13 @@ function startWordScore(host, v, uid){
     const rb = panel.querySelector("[data-wsdemo]");
     if(rb) rb.addEventListener("click", () => { panel.dataset.wsbusy = ""; startWordScore(host, v, uid); });
     const sk = panel.querySelector("[data-wsskip]");
-    if(sk) sk.addEventListener("click", () => begin());
+    if(sk) sk.addEventListener("click", wsShowReady);
   };
   let ok = false;
-  try { ok = playWordDemo(v[0], { onDone: begin, onFail: demoFail, onAbort: demoFail }); } catch(e){ ok = false; }
+  try { ok = playWordDemo(v[0], { onDone: wsShowReady, onFail: demoFail, onAbort: demoFail }); } catch(e){ ok = false; }
   if(!ok) demoFail();
 }
+
 /* ---- 单词视频：全屏 VL 播放器，只装一个词的瘦身干货流程 ---- */
 function wvWordStage1(ls, v, uid){
   return '<div class="vl-kicker">视频课 · 单词 · 《' + esc(ls.t) + '》</div>' +
@@ -8591,7 +8646,6 @@ function renderDlgBrowse(){
       '</div>' +
       '<div class="ctl-prog"><i id="ctlBar" style="width:0%"></i></div>' +
       '<div class="ctl-info" id="ctlInfo">点「整段跟读」开始；播放中点任意一句，可直接跳到那句跟读。</div>' +
-      '<div id="ctlAsrSetup" class="asr-setup-host" style="display:none;margin-top:8px;"></div>' +
       '<div id="ctlFail" style="display:none;margin-top:8px;"></div>' +
       '<div class="mic-meter" id="ctlMeter"></div>' +
     '</div>' +
@@ -8784,7 +8838,7 @@ function drawRole(zone, ls){
                   rz.innerHTML = '<div class="card corr-card"><div class="comment-line">离线识别中…</div>' + ASR_PROG_HTML + '</div>';
                   asrRunOffline(out, rz.querySelector("[data-asrprog]"), asrScoredR, renderRpZero);
                 } else {
-                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">先完成上面的离线组件下载，就能打分了。</div></div>';
+                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">先去「今日」页完成离线组件下载，就能离线打分了。</div></div>';
                 }
               } else renderRpZero();
             } else toast(srErrText(out.err));
@@ -9077,7 +9131,7 @@ function pronCard(ls, i){
           result.innerHTML = '<div class="comment-line">离线识别中…</div>' + ASR_PROG_HTML;
           asrRunOffline(out, result.querySelector("[data-asrprog]"), asrScored, renderZeroFail);
         } else {
-          result.innerHTML = '<div class="comment-line">先完成上面的离线组件下载，就能打分了。</div>';
+          result.innerHTML = '<div class="comment-line">先去「今日」页完成离线组件下载，就能离线打分了。</div>';
         }
         return;
       }
