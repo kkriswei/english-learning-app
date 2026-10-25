@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610241050";
+var APP_BUILD = "v202610242104";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6589,6 +6589,29 @@ function paintAsrSetup(host){
   if(b) b.addEventListener("click", () => asrSetupDownload(host));
 }
 function refreshAsrSetup(){ document.querySelectorAll(".asr-setup-host").forEach(h => paintAsrSetup(h)); }
+/* v3.24：词卡跟读失败时的出路——带她去今日页装离线组件。v3.21 口径不变：词卡内
+   绝不放下载卡，这里只做导航：先把词卡跟读状态收尾干净（清 wsbusy、作废本场
+   判分、停录音，免得残留忙碌标记把同步/版本检查的延后刷新卡死），再切到今日页，
+   把那张一次性安装卡滚到可见并高亮一下。安装卡本体是今日页既有的，不新做。 */
+function wsGotoAsrSetup(panel){
+  try {
+    if(panel){
+      panel.dataset.wsbusy = "";
+      panel._wsTok = (panel._wsTok || 0) + 1;   /* 作废本场未完的回调 */
+    }
+  } catch(e){}
+  try { cancelGrade(); } catch(e){}
+  try { stopRec(); } catch(e){}
+  showView("today");
+  const host = document.getElementById("asrSetupToday");
+  if(host){
+    try { host.scrollIntoView({ behavior: "smooth", block: "center" }); } catch(e){ try { host.scrollIntoView(); } catch(e2){} }
+    const card = host.querySelector("[data-asrsetup]") || host;
+    const oldShadow = card.style.boxShadow;
+    card.style.boxShadow = "0 0 0 3px #c2a14d, 0 0 22px rgba(194,161,77,.55)";
+    setTimeout(() => { try { card.style.boxShadow = oldShadow || ""; } catch(e){} }, 2400);
+  }
+}
 function asrSetupDownload(host){
   const btn = host.querySelector("[data-asrdl]");
   if(btn){ btn.disabled = true; btn.textContent = "正在下载…"; }
@@ -7175,6 +7198,34 @@ function acctApplyRemote(file){
   return applyBackup({ main: main, ws: ws, learned: Object.keys(main.wordGrades || {}).length });
 }
 
+/* ---- v3.24：自动同步拉取后的刷新——忙碌延后 ----
+   拉到的进度照常落盘＋loadState 进内存（acctSyncNow 拉取分支原样），变的只是
+   最后那一下 reload 不再无条件执行：她两个容器（Safari／桌面图标）轮流上行时，
+   自动拉取一刷新就会把正在跟读/判分的人直接弹出去。忙碌判定与版本自检完全
+   同口径（window.__APP_BUSY：跟读面板 wsbusy／音频播放／录音／判分／离线引擎
+   在途），不另造一套。忙碌就挂起待刷标记：每 2 秒轮询，空闲立刻刷；页面在
+   后台不刷，回到前台（visibilitychange）且空闲再刷；不设死线——宁可晚刷，
+   不打断人。手动「立即同步」是她主动点的，走原路立即刷新，不进这条延后链。 */
+let acctReloadPending = false, acctReloadTimer = 0;
+function acctAppBusy(){
+  try { return !!(typeof window !== "undefined" && window.__APP_BUSY && window.__APP_BUSY()); } catch(e){ return false; }
+}
+function acctTryPendingReload(){
+  if (!acctReloadPending) return;
+  if (typeof document !== "undefined" && document.hidden) return;   /* 后台不刷；回前台时再试 */
+  if (acctAppBusy()) return;
+  acctReloadPending = false;
+  if (acctReloadTimer){ clearTimeout(acctReloadTimer); acctReloadTimer = 0; }
+  try { location.reload(); } catch(e){}
+}
+function acctDeferReload(){
+  if (acctReloadPending) return;
+  acctReloadPending = true;
+  const tick = () => { acctReloadTimer = 0; acctTryPendingReload(); if (acctReloadPending) acctReloadTimer = setTimeout(tick, 2000); };
+  acctReloadTimer = setTimeout(tick, 2000);
+}
+try { document.addEventListener("visibilitychange", () => { if (!document.hidden) acctTryPendingReload(); }); } catch(e){}
+
 /* ---- 同步引擎：三分支合并（云端新→拉下；本地新/云端无→上行；相同→不动） ---- */
 async function acctSyncNow(manual){
   if (!ACCT.username || ACCT.syncing) return;
@@ -7204,8 +7255,16 @@ async function acctSyncNow(manual){
         try { loadState(); } catch(e){}   /* v3.18：拉到的进度同步进内存态，本页后续判定不再误判为空 */
         const m = acctMeta(); m.username = ACCT.username; m.localUpdatedAt = cu; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
         ACCT.cloudUpdatedAt = cu; ACCT.status = "ok"; done = true;
-        toast("已同步云端的最新进度，正在重新打开 App…");
-        try { location.reload(); } catch(e){}
+        /* v3.24：数据已落盘＋进内存，刷新时机分三路——手动同步（她主动点的）与
+           当前空闲照旧立即刷新；正在跟读/判分/播放就只挂起待刷，学完这一下再刷，
+           绝不把人从跟读里弹出去。 */
+        if (manual || !acctAppBusy()){
+          toast("已同步云端的最新进度，正在重新打开 App…");
+          try { location.reload(); } catch(e){}
+        } else {
+          toast("已同步云端进度，等你学完这一下再更新页面");
+          acctDeferReload();
+        }
         break;
       }
       if (!remote || (lu > cu && !pristine)){   /* v3.19 双保险：pristine 时绝不许上行覆盖历史更丰富的云端 */
@@ -7759,7 +7818,11 @@ function startWordScore(host, v, uid){
      点跟读直接走系统识别打分；系统识别也出不了结果时走既有失败口径给事实
      提示，绝不弹卡挡路、绝不静默。 */
   if(!SR){
-    panel.innerHTML = '<div class="ws-state">这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的），没法自动打分。<br>现在可以点单词听原音，自己大声跟读几遍。</div>';
+    panel.innerHTML = '<div class="ws-state">这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的），没法自动打分。<br>现在可以点单词听原音，自己大声跟读几遍。</div>' +
+      /* v3.24：离线组件没装时同样给出路——去今日页装一次（只给导航，词卡内不放卡） */
+      (asrSetupNeeded() ? '<div class="ws-row" style="margin-top:10px;"><button class="btn ghost small" data-wsasr type="button">去装离线组件（装一次，没网也能跟读）</button></div>' : '');
+    const ab0 = panel.querySelector("[data-wsasr]");
+    if(ab0) ab0.addEventListener("click", () => wsGotoAsrSetup(panel));
     return;
   }
   panel.dataset.wsbusy = "1";
@@ -7850,8 +7913,14 @@ function startWordScore(host, v, uid){
   const wsShowFail = out => {
     const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
     panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>' +
-      '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">🎤 再读一次</button></div>';
+      '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">🎤 再读一次</button>' +
+      /* v3.24：苹果识别在这边常连不上，只给「再读一次」是死胡同——离线组件没装时
+         多给一个次级导航按钮，去今日页装一次，以后没网也能跟读；已装则不显示
+         （已装还失败是别的原因，不拿这个按钮误导她）。 */
+      (asrSetupNeeded() ? '<button class="btn ghost small" data-wsasr type="button">去装离线组件（装一次，没网也能跟读）</button>' : '') + '</div>';
     wsWire();
+    const ab = panel.querySelector("[data-wsasr]");
+    if(ab) ab.addEventListener("click", () => wsGotoAsrSetup(panel));
   };
   const demoFail = () => {
     if(panel._wsTok !== wsTok || !panel.isConnected) return;
