@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610242104";
+var APP_BUILD = "v202610242158";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6716,6 +6716,68 @@ function asrRunOffline(out, progEl, onText, onFail){
     }, finish);
   } catch(e){ finish(null); }
 }
+/* ---------- v3.25：零结果兜底统一收口——没装离线组件时打分面当场自装 ----------
+   旧口径（v3.12–v3.24）：零结果＋有录音才兜底，且模型没装就直接落失败面板（词卡
+   失败面留了个「去今日页装」的导航按钮，句子面只留一行提示）。学员在国内苹果
+   识别经常直接没响应（sa-fail/no-response），她现在用的容器里又没装过组件 →
+   单词、句子跟读全灭（主线有截图实证）。本版把三个打分面（单词 wsRecord／角色
+   扮演／发音句）的零结果兜底统一走 asrEngageOrInstall：
+   · 已装 → 与旧口径一字不差：面板显示「离线识别中…」+ 进度条 → 转写 → 出分。
+   · 没装 → 面板内当场下载/初始化（asrEnsureModel 单飞：同一时刻只跑一个下载，
+     后到的打分面搭车等同一个结果），文案是打分语境；装好立刻拿手头这遍录音
+     （out.blob）转写出分，她不用重读。
+   · 下载失败 → 回调各自的 onFail 落回原失败面板（词卡保留 v3.24 导航按钮；
+     句子面失败 UI 同口径补了导航按钮，见各面 renderZero 类函数）。
+   忙碌口径：下载走 asrDownloadModel、转写走 asrRunOffline，两边都计
+   asrBusyCount，window.__APP_BUSY 认得出——v3.24 的同步延后刷新与版本自检
+   在下载/转写中途不会把页面刷掉。alive() 为假（她中途切卡/关面板/另开一场）
+   时不回调 UI：下载照样在后台装完并标 cached，只是这遍不往旧面板写。 */
+let asrDlFlight = null;   /* 下载单飞状态：{ waiters: [{prog, done}] }；null＝没有下载在跑 */
+function asrEnsureModel(prog, done){
+  if(asrEngine().cached()){ done(true); return; }
+  if(asrDlFlight){ asrDlFlight.waiters.push({ prog: prog, done: done }); return; }
+  const flight = { waiters: [{ prog: prog, done: done }] };
+  asrDlFlight = flight;
+  asrDownloadModel(pct => {
+    flight.waiters.forEach(w => { if(w.prog){ try { w.prog(pct); } catch(e){} } });
+  }, ok => {
+    if(asrDlFlight === flight) asrDlFlight = null;
+    flight.waiters.forEach(w => { try { w.done(ok); } catch(e){} });
+  });
+}
+/* opt: { render(text)->progEl（把状态文案 + ASR_PROG_HTML 写进本面容器、返回进度根元素）,
+        onText(转写文字), onFail(), alive()->bool（可选，缺省恒真） } */
+function asrEngageOrInstall(out, opt){
+  const alive = () => { try { return !opt.alive || opt.alive(); } catch(e){ return false; } };
+  if(asrEngine().cached()){
+    const progEl = opt.render("离线识别中…");
+    asrRunOffline(out, progEl, t => { if(alive()) opt.onText(t); }, () => { if(alive()) opt.onFail(); });
+    return;
+  }
+  const progEl = opt.render("苹果的识别连不上，正在装离线识别（约55MB，装一次以后没网也能打分）…");
+  const showProg = pct => {
+    if(!progEl || !progEl.isConnected) return;
+    progEl.hidden = false;
+    const bar = progEl.querySelector("i"), tx = progEl.querySelector("[data-asrpt]");
+    if(bar) bar.style.width = pct + "%";
+    if(tx) tx.textContent = pct >= 100 ? "装好了，正在识别你刚才读的…" : "正在装离线识别… " + pct + "%";
+  };
+  showProg(0);
+  asrEnsureModel(showProg, ok => {
+    if(!ok){ if(alive()) opt.onFail(); return; }
+    if(!alive()) return;   /* 她已离开这个面板：组件装好留着下次用，这遍不写 UI */
+    asrRunOffline(out, (progEl && progEl.isConnected) ? progEl : null,
+      t => { if(alive()) opt.onText(t); }, () => { if(alive()) opt.onFail(); });
+  });
+}
+/* 句子面（角色扮演/发音句）失败 UI 的导航按钮：与词卡 v3.24 同口径——组件没装
+   时才出现，点击去今日页那张一次性安装卡。句子面没有词卡面板要收尾，走
+   wsGotoAsrSetup(null)：其内部对空 panel 有防护，只做切页 + 滚动 + 高亮。 */
+const ASR_NAV_BTN_HTML = '<button class="btn ghost small" data-asrnav type="button">去装离线组件（装一次，没网也能跟读）</button>';
+function asrWireNavBtn(root){
+  const b = root && root.querySelector ? root.querySelector("[data-asrnav]") : null;
+  if(b) b.addEventListener("click", () => wsGotoAsrSetup(null));
+}
 
 
 const FREE_RULES = [
@@ -7856,13 +7918,16 @@ function startWordScore(host, v, uid){
             if(scw) wsShowScore({ text: scw.text, res: scw.res, url: out.url, recSilent: out.recSilent, offline: true });
             else wsShowFail(out);
           };
-          if(asrEngine().cached()){
-            panel.innerHTML = '<div class="ws-state">离线识别中…</div>' + ASR_PROG_HTML;
-            asrRunOffline(out, panel.querySelector("[data-asrprog]"), asrScoredW, () => wsShowFail(out));
-          } else {
-            /* v3.21：组件没装不在词卡里弹下载卡，走既有失败口径给事实提示 */
-            wsShowFail(out);
-          }
+          /* v3.25：统一走 asrEngageOrInstall——已装直接离线转写出分（旧口径）；
+             没装当场在面板内把组件装上、装好拿这遍录音出分；下载失败才落
+             wsShowFail（保留 v3.24 的导航按钮）。词卡内仍不放下载设置卡：这里
+             只是打分流内的状态文案 + 进度条，不是设置卡。 */
+          asrEngageOrInstall(out, {
+            render: t => { panel.innerHTML = '<div class="ws-state">' + t + '</div>' + ASR_PROG_HTML; return panel.querySelector("[data-asrprog]"); },
+            onText: asrScoredW,
+            onFail: () => wsShowFail(out),
+            alive: () => panel.isConnected && panel._wsTok === wsTok
+          });
           return;
         }
         wsShowFail(out);
@@ -8918,7 +8983,10 @@ function drawRole(zone, ls){
             const rz = zone.querySelector("#rpResult");
             if(rz){
               const renderRpZero = () => {
-                rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div></div>';
+                rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div>' +
+                  /* v3.25：与词卡 v3.24 同口径——组件没装时失败面补一个导航按钮，去今日页装 */
+                  (asrSetupNeeded() ? '<div style="margin-top:8px;">' + ASR_NAV_BTN_HTML + '</div>' : '') + '</div>';
+                asrWireNavBtn(rz);
               };
               /* v3.10 离线 ASR 兜底：与发音页共用判分收口，零结果且有录音时顺带覆盖；出分走 rpAnswer 原口径 */
               if(asrZeroApplies(out)){
@@ -8927,12 +8995,13 @@ function drawRole(zone, ls){
                   const rz4 = zone.querySelector("#rpResult");
                   if(rz4) rz4.insertAdjacentHTML("beforeend", '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>');
                 };
-                if(asrEngine().cached()){
-                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">离线识别中…</div>' + ASR_PROG_HTML + '</div>';
-                  asrRunOffline(out, rz.querySelector("[data-asrprog]"), asrScoredR, renderRpZero);
-                } else {
-                  rz.innerHTML = '<div class="card corr-card"><div class="comment-line">先去「今日」页完成离线组件下载，就能离线打分了。</div></div>';
-                }
+                /* v3.25：统一走 asrEngageOrInstall（没装当场装、装好拿这遍录音出分；下载失败落 renderRpZero） */
+                asrEngageOrInstall(out, {
+                  render: t => { rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + t + '</div>' + ASR_PROG_HTML + '</div>'; return rz.querySelector("[data-asrprog]"); },
+                  onText: asrScoredR,
+                  onFail: renderRpZero,
+                  alive: () => zone.isConnected
+                });
               } else renderRpZero();
             } else toast(srErrText(out.err));
           } else {
@@ -9211,7 +9280,10 @@ function pronCard(ls, i){
     if(!out.res){
       const renderZeroFail = () => {
         const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
-        result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>';
+        result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>' +
+          /* v3.25：与词卡 v3.24 同口径——组件没装时失败面补一个导航按钮，去今日页装 */
+          (asrSetupNeeded() ? '<div style="margin-top:8px;">' + ASR_NAV_BTN_HTML + '</div>' : '');
+        asrWireNavBtn(result);
       };
       /* v3.10 离线 ASR 兜底：零结果（sa-fail/no-response）且有录音时才接管本卡 */
       if(asrZeroApplies(out)){
@@ -9220,12 +9292,13 @@ function pronCard(ls, i){
           if(sc) gradeOut({ text: sc.text, res: sc.res, url: out.url, retried: false, err: null, offline: true });
           else renderZeroFail();
         };
-        if(asrEngine().cached()){
-          result.innerHTML = '<div class="comment-line">离线识别中…</div>' + ASR_PROG_HTML;
-          asrRunOffline(out, result.querySelector("[data-asrprog]"), asrScored, renderZeroFail);
-        } else {
-          result.innerHTML = '<div class="comment-line">先去「今日」页完成离线组件下载，就能离线打分了。</div>';
-        }
+        /* v3.25：统一走 asrEngageOrInstall（没装当场装、装好拿这遍录音出分；下载失败落 renderZeroFail） */
+        asrEngageOrInstall(out, {
+          render: t => { result.innerHTML = '<div class="comment-line">' + t + '</div>' + ASR_PROG_HTML; return result.querySelector("[data-asrprog]"); },
+          onText: asrScored,
+          onFail: renderZeroFail,
+          alive: () => card.isConnected
+        });
         return;
       }
       renderZeroFail();
