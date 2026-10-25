@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610242158";
+var APP_BUILD = "v202610251026";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -5203,7 +5203,7 @@ function speakTTS(text, base, speaker){
   const chunks = chunkText(text);
   let i = 0;
   const step = () => {
-    if(i >= chunks.length) return;
+    if(i >= chunks.length){ clearTimeout(speakTimer); return; }   /* v3.26：正常播完就撤掉兜底 cancel 定时器，别让它几秒后误杀随后开始的别的朗读（speakLines/跟读的 TTS 段） */
     const u = makeUtter(chunks[i], base, speaker);
     if(chunks.length > 1) u.pitch += (i % 2 ? -0.02 : 0.015);
     utterWatchdog(u, chunks[i].length * 460 / base, () => { i++; chunkTimer = setTimeout(step, 120); });
@@ -5219,6 +5219,7 @@ function speakLines(lines, rate, done){
   stopRec();
   if("speechSynthesis" in window) speechSynthesis.cancel();
   clearTimeout(chunkTimer);
+  clearTimeout(speakTimer);   /* v3.26：上一场 speakTTS 的兜底 cancel 别在本场中途触发 */
   const base = (typeof rate === "number") ? rate : 0.95 * (state.speed || 1);
   let i = 0;
   const ttsLine = (ln, advance) => {
@@ -5254,6 +5255,7 @@ function pickZhVoice(){
 let SH = null;
 function shadowRead(pairs, enRate, done){
   stopShadow();
+  clearTimeout(speakTimer);   /* v3.26：同 speakLines——上一场朗读的兜底 cancel 别误杀本场跟读的 TTS 回退段 */
   shadowGen++;
   const list = (pairs || []).filter(p => p && p.en);
   if(!list.length){ if(done) done(); return; }
@@ -5911,7 +5913,12 @@ function startCapture(){
   navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
     if(gen !== micGen){ stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); return; }
     mrStream = stream; mrChunks = []; mrLastBlob = null;
-    mrRecorder = new MediaRecorder(stream);
+    try { mrRecorder = new MediaRecorder(stream); }
+    catch(e){ /* v3.26：构造抛错别把活流留在 mrStream 里没人停（麦克风会被一直占住） */
+      mrStream = null;
+      stream.getTracks().forEach(t => { try { t.stop(); } catch(e2){} });
+      return;
+    }
     mrRecorder.ondataavailable = e => { if(e.data.size) mrChunks.push(e.data); };
     mrRecorder.start();
   }).catch(() => { if(gen === micGen) mrRecorder = null; });
@@ -5922,14 +5929,25 @@ function stopCapture(cb){
   if(mrRecorder && mrRecorder.state === "recording"){
     const rec = mrRecorder, stream = mrStream;
     mrRecorder = null; mrStream = null;
-    rec.onstop = () => {
+    /* v3.26：统一收尾 finishRec（停流＋拼 Blob＋回调，只执行一次）——旧版只靠
+       rec.onstop 一条路：stop() 抛错时 tracks 不停就直接 cb(null)（麦克风漏放）；
+       onstop 在 iOS 独立模式下可能永不触发（单词路径注释早有实证），那时 tracks
+       永不停、cb 永不回——判分结算吊死（界面一直「等待」上一场）、麦克风被占住
+       让后续播放没声音。现加与单词路径同口径的 1.4s onstop 看门狗强制收尾。 */
+    let finDone = false, stopWd = null;
+    const finishRec = () => {
+      if(finDone) return; finDone = true;
+      if(stopWd){ clearTimeout(stopWd); stopWd = null; }
+      try { rec.onstop = null; } catch(e){}
       if(stream) stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} });
       mrLastBlob = mrChunks.length ? new Blob(mrChunks, { type: mrChunks[0].type || "audio/webm" }) : null;
       const url = mrLastBlob ? URL.createObjectURL(mrLastBlob) : null;
       mrChunks = [];
       cb(url);
     };
-    try { rec.stop(); } catch(e){ cb(null); }
+    rec.onstop = finishRec;
+    stopWd = setTimeout(finishRec, 1400);
+    try { rec.stop(); } catch(e){ finishRec(); }
   } else {
     if(mrStream){ mrStream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); mrStream = null; }
     cb(null);
@@ -6321,7 +6339,7 @@ function listenGrade(target, cb, opts){
   let wStream = null, wRec = null, wChunks = [], wBlob = null, wUrl = null;
   let capState = 0;             /* 0 未启动 1 等 getUserMedia 2 录音中 3 已收尾 */
   let capStartAt = 0, capStopWanted = false, capStopCb = null, capDoneFlag = false;
-  let capTimer = null, capGraceTimer = null, capBackstop = null, capStopWd = null;
+  let capTimer = null, capGraceTimer = null, capBackstop = null, capStopWd = null, capSeqGuard = null;
   const capClearTimers = () => { if(capTimer){ clearTimeout(capTimer); capTimer = null; } if(capGraceTimer){ clearTimeout(capGraceTimer); capGraceTimer = null; } if(capBackstop){ clearTimeout(capBackstop); capBackstop = null; } if(capStopWd){ clearTimeout(capStopWd); capStopWd = null; } };
   const capKillStream = () => {
     const st = wStream; wStream = null;
@@ -6331,6 +6349,7 @@ function listenGrade(target, cb, opts){
     if(capDoneFlag) return; capDoneFlag = true;
     capState = 3;
     capClearTimers();
+    if(capSeqGuard){ clearInterval(capSeqGuard); capSeqGuard = null; }
     if(capStopCb){ const f = capStopCb; capStopCb = null; f(url); }
   };
   const capHarvest = () => {   /* onstop 不来/getUserMedia 吊死时：用已录 chunks 直接拼 Blob 收尾 */
@@ -6411,6 +6430,14 @@ function listenGrade(target, cb, opts){
       else proceed();
     }, { maxMs: maxMs });
   };
+  /* v3.26：会话被取消/被新会话取代（gradeSeq 变化）时，自有录音别陪等 listenOnce
+     的看门狗（单词最长 8s）才收尾——400ms 巡检一次，序号一变立刻 stopWordCapture
+     停流（幂等；正常结算走 capFinish 时本巡检已自清）。这段时间麦克风一直被占，
+     iOS 上紧接着的播放会被掐声。 */
+  capSeqGuard = setInterval(() => {
+    if(capDoneFlag){ clearInterval(capSeqGuard); capSeqGuard = null; return; }
+    if(seq !== gradeSeq) stopWordCapture(() => {});
+  }, 400);
   attempt(true, false);
 }
 
@@ -6475,25 +6502,65 @@ function asrDecodePcm(blob){
 }
 /* ---- 真实引擎：优先模块 Worker（asr/asr-worker.js），起不来/中途坏掉退主线程动态 import ---- */
 let asrWorker = null, asrWorkerDead = false, asrSeq = 0;
-const asrWaiters = new Map();
+const asrWaiters = new Map();   /* id -> { resolve, timer } */
 let asrProgSink = null;
 function asrEmitProg(p){ if(asrProgSink){ try { asrProgSink(p); } catch(e){} } }
+/* Worker 无响应超时（v3.26）：旧版 asrWorkerCall 没有任何超时——Worker 卡死时
+   （不报错、不回消息，iOS 上 WASM/transformers 已知会这样）Promise 永不落定，
+   虽然上层有 25s 看门狗兜底失败，但卡死的 Worker 不被终止、死亡标记不置位，
+   此后每一次转写都要陪等满 25s 再失败、永远自愈不了，直到重开页面（学员实测：
+   第一个发音句出分正常，之后一直等待）。现给每个在途调用装无响应看门狗：
+   静默满 ASR_WORKER_TIMEOUT_DEFAULT 仍无任何回音 → 判 Worker 已死（terminate +
+   置 asrWorkerDead，见 asrKillWorker），全部在途调用按 error 落定，上层
+   asrDoTranscribe 随即 spawn 全新 Worker 自动重试一次。Worker 的任何消息
+   （progress 也算活着——加载模型时进度不断就不许误杀）都给全部在途调用续命；
+   推理期 Worker 全程静默，靠固定上限判死。15s 必须短于上层 25s 看门狗，
+   保证重试有时间在上层收尾前跑完。冒烟可经 window.__ASR_TIMING.workerMs
+   注入更短值（与 __SR_TIMING 同口径）；生产不设该变量。 */
+const ASR_WORKER_TIMEOUT_DEFAULT = 15000;
+function asrWorkerTimeoutMs(){
+  const o = (typeof window !== "undefined" && window.__ASR_TIMING) || {};
+  return (typeof o.workerMs === "number" && o.workerMs > 0) ? o.workerMs : ASR_WORKER_TIMEOUT_DEFAULT;
+}
+function asrFailAllWaiters(errMsg){
+  const pend = Array.from(asrWaiters.values());
+  asrWaiters.clear();
+  pend.forEach(en => {
+    if(en.timer) clearTimeout(en.timer);
+    try { en.resolve({ type: "error", error: errMsg }); } catch(e){}
+  });
+}
+function asrKillWorker(){
+  const w = asrWorker; asrWorker = null; asrWorkerDead = true;
+  if(w){ try { w.terminate(); } catch(e){} }
+}
+function asrArmWaiter(id){
+  const en = asrWaiters.get(id);
+  if(!en) return;
+  if(en.timer) clearTimeout(en.timer);
+  en.timer = setTimeout(() => {
+    if(!asrWaiters.has(id)) return;
+    asrKillWorker();
+    asrFailAllWaiters("worker timeout");
+  }, asrWorkerTimeoutMs());
+}
+function asrTouchWaiters(){ asrWaiters.forEach((en, id) => asrArmWaiter(id)); }   /* Worker 有回音＝活着，给全部在途调用续命 */
 function asrSpawn(){
   if(asrWorker || asrWorkerDead) return asrWorker;
   try {
     const w = new Worker(ASR_BASE + "asr-worker.js", { type: "module" });
     w.addEventListener("message", e => {
       const m = (e && e.data) || {};
+      asrTouchWaiters();
       if(m.type === "progress"){ asrEmitProg(m.pct); return; }
-      const fn = asrWaiters.get(m.id);
-      if(fn){ asrWaiters.delete(m.id); fn(m); }
+      const en = asrWaiters.get(m.id);
+      if(en){ asrWaiters.delete(m.id); if(en.timer) clearTimeout(en.timer); en.resolve(m); }
     });
     w.addEventListener("error", () => {
       asrWorkerDead = true;
       try { w.terminate(); } catch(e){}
       if(asrWorker === w) asrWorker = null;
-      asrWaiters.forEach(fn => { try { fn({ type: "error", error: "worker error" }); } catch(e){} });
-      asrWaiters.clear();
+      asrFailAllWaiters("worker error");
     });
     asrWorker = w;
   } catch(e){ asrWorkerDead = true; asrWorker = null; }
@@ -6504,11 +6571,16 @@ function asrWorkerCall(msg){
     const w = asrSpawn();
     if(!w){ resolve({ type: "error", error: "no worker" }); return; }
     const id = ++asrSeq;
-    asrWaiters.set(id, resolve);
+    asrWaiters.set(id, { resolve: resolve, timer: null });
+    asrArmWaiter(id);
     try {
       if(msg.pcm) w.postMessage({ type: msg.type, id: id, pcm: msg.pcm }, [msg.pcm.buffer]);
       else w.postMessage({ type: msg.type, id: id });
-    } catch(e){ asrWaiters.delete(id); resolve({ type: "error", error: String(e) }); }
+    } catch(e){
+      const en = asrWaiters.get(id);
+      if(en){ asrWaiters.delete(id); if(en.timer) clearTimeout(en.timer); }
+      resolve({ type: "error", error: String(e) });
+    }
   });
 }
 function asrProgAgg(){
@@ -6543,12 +6615,18 @@ function asrMainLoad(){
 async function asrDoTranscribe(blob){
   const pcm = await asrDecodePcm(blob);
   if(!pcm || !pcm.length) return null;
-  if(!asrWorkerDead){
-    const r = await asrWorkerCall({ type: "transcribe", pcm: pcm });
+  /* v3.26：Worker 路最多走两轮——首轮失败/无响应超时（asrWorkerCall 已把卡死的
+     Worker 判死并 terminate）后，清掉死亡标记、spawn 全新 Worker 自动重试一次，
+     对上层透明（上层仍只收到一次最终结果）；入口时 Worker 已是死亡标记（上次
+     失败判死的）同样先试着重生——iOS 把 Worker 杀掉是一次性事件，不该让引擎
+     此后整场都退主线程。两轮都败才退主线程动态 import（原有回退口径不变）。
+     pcm 每轮传副本：postMessage 转移 buffer 会把原 buffer detach，重试与主线程
+     回退都要用未被转移的原件。 */
+  for(let round = 0; round < 2; round++){
+    asrWorkerDead = false;   /* 允许 asrSpawn 重生（spawn 本身起不来会立刻再置死并按 error 落定，不会空转） */
+    const r = await asrWorkerCall({ type: "transcribe", pcm: pcm.slice(0) });
     if(r && r.type === "result"){ asrMarkCached(); return (r.text || "").trim(); }   /* v3.14：转写成功但为空 → 返回 ""（与失败的 null 区分；v3.21 起空转写在复核里不作判分依据） */
-    /* Worker 起不来或中途坏掉：标记后退主线程再试一次 */
-    asrWorkerDead = true;
-    if(asrWorker){ const w = asrWorker; asrWorker = null; try { w.terminate(); } catch(e){} }
+    asrKillWorker();   /* 本轮失败：确保旧 Worker 已 terminate、死亡标记就位，再进下一轮/主线程回退 */
   }
   const p = await asrMainLoad();
   asrEmitProg(100);
