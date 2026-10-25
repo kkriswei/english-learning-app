@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610251026";
+var APP_BUILD = "v202610251210";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6481,6 +6481,38 @@ const ASR_OFFLINE_NOTE = "离线识别打分：这分是手机在本机把你的
 function asrZeroApplies(out){
   return !!out && (out.err === "sa-fail" || out.err === "no-response") && !!out.blob && !!out.blob.size;
 }
+/* 离线转写垃圾守卫（v3.27）：whisper-tiny 在她手机上对她的口音会大量幻听——
+   整段括号标签（(coughs) 之类非语音标记）、同一个词无限循环（目标字母句转出
+   满屏 B）、长度离谱的胡话。这类转写不是「读错」，是引擎根本没听出人话：喂给
+   scoreFirst 只会产出 0 分/个位数分入账，既冤枉她又污染记录。守卫只作用于
+   离线兜底转写（SR 转写是大引擎、另有既有口径，不碰）：命中任一条判无效 →
+   调用方走既有「没听清」失败口径（录音保留可回放），绝不产生分数。
+   规则：①剥掉 (...) / [...] 非语音标签后为空；②同一 token 连续重复 ≥4 次，
+   或全文 ≥5 个 token 时单个 token 占比 ≥60%（循环幻听）；③句子模式长度
+   离谱：转写词数 < 目标词数的 25%（目标极短、下限放宽到至少容忍 1 个词）
+   或 > 目标词数的 250%。单词模式（wordMode）只套 ①②：单词转写带填充词
+   属正常（如「the plane」），长度比例对 1 词的目标没意义，不套 ③ 免误杀。 */
+function asrTextSane(text, targetEn, wordMode){
+  const toksOf = x => String(x == null ? "" : x).toLowerCase().replace(/[^a-z0-9' ]+/g, " ").split(/\s+/).filter(Boolean);
+  const stripped = String(text == null ? "" : text).replace(/\([^)]*\)|\[[^\]]*\]/g, " ");
+  const toks = toksOf(stripped);
+  if(!toks.length) return false;
+  let run = 1;
+  for(let i = 1; i < toks.length; i++){
+    run = toks[i] === toks[i - 1] ? run + 1 : 1;
+    if(run >= 4) return false;
+  }
+  if(toks.length >= 5){
+    const freq = {}; let top = 0;
+    for(const t of toks){ freq[t] = (freq[t] || 0) + 1; if(freq[t] > top) top = freq[t]; }
+    if(top / toks.length >= 0.6) return false;
+  }
+  if(!wordMode){
+    const tn = toksOf(targetEn).length;
+    if(tn > 0 && (toks.length < Math.max(1, tn * 0.25) || toks.length > tn * 2.5)) return false;
+  }
+  return true;
+}
 function asrMarkCached(){ try { localStorage.setItem(ASR_FLAG_KEY, "1"); } catch(e){} }
 /* 录音 Blob → 16kHz 单声道 Float32Array（报告实测链：AudioContext({sampleRate:16000}).decodeAudioData → getChannelData(0)） */
 function asrDecodePcm(blob){
@@ -6742,6 +6774,13 @@ function asrDownloadModel(prog, cb){
    离线转写与原生全部候选同为证据，按严判档位取最高档定分、同档优先原生（见函数内注）；
    句子与多词条目仍按上文取低口径，一字未动。改因：whisper 对单词短音频会幻听
    （plane→「Please.」），取低等于让最弱的一路当主判，读对了也给 0 分。 */
+/* v3.27 修订：句子模式退出本函数——发音句/角色扮演不再调用 asrVerifySentence，
+   SR 给出转写直接判分（SR 优先），离线只作 SR 零结果时的兜底且转写先过
+   asrTextSane 垃圾守卫。改因：她真实 pron 记录实证 whisper-tiny 对她的口音大量
+   幻听（字母句转出满屏 B、"(coughs)" 之类），双验取低把能用的 SR 分数也拖烂，
+   且每句多跑一遍本地推理拖慢出分（她反馈「更迟钝」）。本函数现仅单词模式在用
+   （asrVerifyWord 的 v3.22 多路取最优，口径不动）；句子分支与 asrVerifySentence
+   保留备查，无调用方。 */
 function asrVerifyScore(target, out, wordMode, cb){
   let finished = false;
   const finish = o => { if(finished) return; finished = true; asrBusyCount--; cb(o); };
@@ -7992,6 +8031,8 @@ function startWordScore(host, v, uid){
         /* v3.10 离线 ASR 兜底：单词判分零结果（sa-fail/no-response）且有录音时才接管本面板 */
         if(out && asrZeroApplies(out)){
           const asrScoredW = text => {
+            /* v3.27：单词兜底转写也过守卫的标签/循环两条（长度比例不套，见 asrTextSane） */
+            if(!asrTextSane(text, v[0], true)){ wsShowFail(out); return; }
             const scw = scoreFirst(v[0], [text], true);
             if(scw) wsShowScore({ text: scw.text, res: scw.res, url: out.url, recSilent: out.recSilent, offline: true });
             else wsShowFail(out);
@@ -9069,6 +9110,8 @@ function drawRole(zone, ls){
               /* v3.10 离线 ASR 兜底：与发音页共用判分收口，零结果且有录音时顺带覆盖；出分走 rpAnswer 原口径 */
               if(asrZeroApplies(out)){
                 const asrScoredR = text => {
+                  /* v3.27：离线转写先过垃圾守卫——幻听不打分，走没听清口径 */
+                  if(!asrTextSane(text, cur.d[1], false)){ renderRpZero(); return; }
                   rpAnswer(zone, ls, text, out.url);
                   const rz4 = zone.querySelector("#rpResult");
                   if(rz4) rz4.insertAdjacentHTML("beforeend", '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>');
@@ -9087,21 +9130,7 @@ function drawRole(zone, ls){
           }
           return;
         }
-        /* v3.14 句子双验（与发音页同一口径）：模型已下载时先复核、取低者才走 rpAnswer 入账 */
-        if(out.blob && !out.retried && asrEngine().cached()){
-          const rzv = zone.querySelector("#rpResult");
-          if(rzv) rzv.innerHTML = '<div class="card corr-card"><div class="comment-line">复核中…</div></div>';
-          asrVerifySentence(cur.d[1], out, fin => {
-            if(!zone.isConnected) return;
-            rpAnswer(zone, ls, fin.text, fin.url);
-            const rz3 = zone.querySelector("#rpResult");
-            if(rz3){
-              if(fin.offline) rz3.insertAdjacentHTML("beforeend", '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>');
-              if(fin.recSilent) rz3.insertAdjacentHTML("beforeend", '<div class="mic-warn">' + MIC_HINT + '</div>');
-            }
-          });
-          return;
-        }
+        /* v3.27：SR 优先——原生转写直接走 rpAnswer 入账，不再离线双验取低（理由同发音页） */
         rpAnswer(zone, ls, out.text, out.url);
         if(out.recSilent){
           const rz2 = zone.querySelector("#rpResult");
@@ -9345,7 +9374,7 @@ function pronCard(ls, i){
     setTimeout(() => { if(myRecorder && myRecorder.state === "recording") myRecorder.stop(); }, 20000);
   });
   let checkBusy = false;
-  let gradeToken = 0;   /* v3.14：本卡判分代次——开始新一轮聆听/取消时递增，让迟到的双验回调作废，不许把上一轮的分数入账 */
+  let gradeToken = 0;   /* v3.14：本卡判分代次——开始新一轮聆听/取消时递增作废上一轮（v3.27 起句子不再双验，代次仍作会话标记保留） */
   const doneBtn = card.querySelector('[data-act="done"]');
   if(doneBtn) doneBtn.addEventListener("click", () => endGradeNow());
   /* 判分结果统一处理：语音判分与无识别环境下的打字纠错共用（判分/入账/最好分/错句记录同一口径；
@@ -9366,6 +9395,8 @@ function pronCard(ls, i){
       /* v3.10 离线 ASR 兜底：零结果（sa-fail/no-response）且有录音时才接管本卡 */
       if(asrZeroApplies(out)){
         const asrScored = text => {
+          /* v3.27：离线转写先过垃圾守卫——幻听（标签/循环/长度离谱）不打分，走没听清口径 */
+          if(!asrTextSane(text, d[1], false)){ renderZeroFail(); return; }
           const sc = scoreFirst(d[1], [text]);
           if(sc) gradeOut({ text: sc.text, res: sc.res, url: out.url, retried: false, err: null, offline: true });
           else renderZeroFail();
@@ -9382,16 +9413,11 @@ function pronCard(ls, i){
       renderZeroFail();
       return;
     }
-    /* v3.14 句子双验：模型已下载时原生出分先不落定——本场录音再喂离线引擎复核，
-       取低者才入账渲染（与单词双验同一口径，见 asrVerifyScore）；复核不可用
-       （引擎故障/超时）则原生分直接落定。打字纠错（typed）与零结果离线已出分
-       （offline）的结果不再复核；重试轮（retried）录音与转写不是同一轮，跳过。 */
-    if(!out.offline && !out.typed && out.blob && !out.retried && asrEngine().cached()){
-      const tk = gradeToken;
-      result.innerHTML = '<div class="comment-line">复核中…</div>';
-      asrVerifySentence(d[1], out, fin => { if(tk === gradeToken && card.isConnected) renderScored(fin); });
-      return;
-    }
+    /* v3.27 句子判分改 SR 优先（与单词 v3.22「离线不得一票否决」对齐）：原生 SR
+       给出转写就直接判分入账，不再喂离线引擎双验取低——whisper-tiny 在她手机上
+       幻听太多（主线有她真实 pron 记录实证），既当主审又当否决票把能用的分数
+       拖烂，还每次多跑一遍本地推理拖慢出分。离线只在 SR 零结果时作兜底
+       （上面的 asrEngageOrInstall 路径），且转写先过 asrTextSane 垃圾守卫。 */
     renderScored(out);
   };
   const renderScored = out => {
