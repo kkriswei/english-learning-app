@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610251416";
+var APP_BUILD = "v202610251713";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -5847,15 +5847,7 @@ function srTiming(){
   for(const k in SR_TIMING_DEFAULTS) t[k] = (typeof o[k] === "number" && o[k] > 0) ? o[k] : SR_TIMING_DEFAULTS[k];
   return t;
 }
-/* 累积聆听时限（句子判分专用）：最后一次出声后静默 silenceMs 收尾、整场硬上限 hardMs。
-   与 SR_TIMING_DEFAULTS 分开，保证 v3 的生产默认值断言不受影响；冒烟同样可经 window.__SR_TIMING 注入。 */
-const SR_ACC_DEFAULTS = { silenceMs: 4000, hardMs: 30000 };
-function srAccTiming(){
-  const o = (typeof window !== "undefined" && window.__SR_TIMING) || {};
-  const t = {};
-  for(const k in SR_ACC_DEFAULTS) t[k] = (typeof o[k] === "number" && o[k] > 0) ? o[k] : SR_ACC_DEFAULTS[k];
-  return t;
-}
+/* （v4.1 删除）句子累积聆听时限 srAccTiming/SR_ACC_DEFAULTS：仅判分阶段 A 用，随阶段 A 一并退役；srTiming 保留给 listenOnce。 */
 /* 单次识别：回调 onDone(候选转写数组 | null, 错误码 | null)；错误码只作内部判断，绝不直接展示给用户 */
 function listenOnce(onDone, opts){
   opts = opts || {};
@@ -6120,82 +6112,56 @@ function srErrText(err){
     return "没听清你说什么，靠近麦克风、周围安静一点再试一次";
   return "识别没成功，再试一次。";
 }
-const SR_RETRYABLE = ["audio-capture", "network", "aborted", "end", "error", "start", "timeout"];
 /* 「我说完了」钩子：指向当前累积判分会话的立即收尾函数；无会话时为 null */
 let gradeDoneHook = null;
 function endGradeNow(){ if(gradeDoneHook) gradeDoneHook(); }
-/* ═══════════════════════ v4.0 判分会话状态机 gradeSession ═══════════════════════
-   Chris 口径：正常的录音录进去，打分，然后退出来；想再录又可以重新再录、重新打分再退出来。
-   旧版 listenGrade 是「SR 实时识别＋并行 MediaRecorder＋重试＋双验＋多路取优」层层叠加，
-   在真实 iPhone 上互相卡死（识别与录音抢麦、SR 僵尸回调、渲染只出一半分数）。
-   本版不再叠补丁：四个打分面（单词卡 wsRecord、发音句 pronCard、角色扮演 drawRole、
-   对话课逐句跟读=pronCard）统一改走下面这一个直线状态机。
-
-   状态只有四态：IDLE → LISTEN_SR（阶段 A）→ RECORDING（阶段 B）→ SCORING → IDLE。
-   任何出口（出分、失败、取消、超时、异常）都经同一个 gsTeardown() 回 IDLE；
-   会话对象 S 持有全部资源（SR 实例、MediaRecorder、stream、全部 timer、错误钩子），
-   teardown 逐项释放/作废。已在会话中又开新会话 → 先 teardown 旧会话（回调其
-   ui.cancelled 让旧面复位壳子）再开新的，不排队、不等待。
-
-   阶段 A（SR 单独听，限时）：仅当 SR 可用时进入。此阶段绝不开 MediaRecorder——
-   识别与录音永不并发（与旧版最大的区别）。句子模式沿用「分段累积＋静默收尾」，
-   但总硬上限压到 min(srAccTiming.hardMs, 20s)；单词模式单次聆听、上限 wordMs。
-   判死规则：实例 onstart 未在 srTiming.startMs 内到达 → 判死（句子续接一次、再死转 B）；
-   onstart 后全静默（无任何事件）≥ __SR_TIMING.deadMs（默认 6000ms）判死转 B；
-   onerror/onend 无结果 → 阶段失败转 B；not-allowed/service-not-allowed 是终局失败
-   （麦克风权限问题，录音也救不了），直接交付失败不进 B。
-   阶段 A 出了转写 → 直接 scoreFirst 出分（v3.27 口径：SR 优先、无双验），永不进 B。
-   SR 的了结必须真：置空全部回调、stop/abort 包 try、实例 dead 标记＋会话指针双重
-   作废迟到的 onresult（iOS 上 SR 是有名的僵尸回调源）。
-
-   阶段 B（录音＋离线打分，阶段 A 失败/不可用时）：先经 ui.recordPrompt 给明确提示行
-   （"苹果识别没响应，改用录音打分"），录音只由用户点「🎤 开始录音」启动（保 iOS
-   手势链），仅 MediaRecorder；自动上限单词 8s／句子 20s 到点自动停，「我说完了」
-   随时可停。停录走 gsFinishRecording（v3.26 的 finishRec 口径：onstop＋1.4s
-   看门狗双保险、stop tracks 必达、只执行一次）→ SCORING：离线转写（未装 → 沿用
-   v3.25 面板内自装 asrEngageOrInstall，自装也计入本阶段总超时 GS_SCORING_MS）→
-   asrTextSane 守卫（v3.27，不动）→ scoreFirst 出分。引擎超时沿用 v3.26 的 15s
-   判死＋重试＋自愈（在 asrWorkerCall 内，本机不重复实现）。
-
-   单词 v3.22「多路取最优」的取舍：旧版靠「SR 与录音并行」，SR 出结果时手里还有一条
-   离线转写可参与取优（asrVerifyWord 双验）。新状态机禁止并发，取优语义收编为：
-   阶段 A 收集 SR 全部候选、逐条评档取最优（scoreFirst 本就如此）；阶段 A 整体失败
-   才进阶段 B、用录音转写评档——同一时刻只有一条证据源，永不互相拖拽。
-   asrVerifyWord 的双验调用点随之删除（函数本体保留备查，与 v3.27 保留
-   asrVerifySentence 同例）。
-
+/* ═══════════════════════ v4.1 判分会话状态机 gradeSession ═══════════════════════
+   Chris 实测 v4.0 后亲定口径（2026-10-25）：阶段 A 的系统识别（SR）在她那边基本
+   连不上，却让她先白读一遍、再被要求点「开始录音」重读一遍，体感就是卡死。
+   本版判分改纯录音流，四个打分面（单词卡 wsRecord、发音句 pronCard、角色扮演
+   drawRole、对话课逐句＝pronCard）统一走下面这一个直线状态机：
+   状态线：IDLE → READY（等她点「🎤 开始录音」）→ RECORDING（录音，只等她点
+   「✅ 我说完了」）→ SCORING → RESULT →（重新录 → 新会话回 READY）／（退出 → IDLE）。
+   不许有「猜她读完」的静默判定/自动出分：停录只由她点按钮触发，外加一个 30s
+   宽松安全上限（正常流程永不触发）。判分只有一条证据源：本场录音的离线转写
+   （whisper-tiny 本机转写；未装 → v3.25 面板内自装 asrEngageOrInstall）→
+   asrTextSane 守卫（v3.27，不动）→ scoreFirst 既有档位（单词严判 100/35/0、
+   句子音素三档＋封顶，全不动）。v3.22 单词「SR 候选多路取最优」与 v3.27 句子
+   「SR 优先」随阶段 A 一并退役：SR 不再参与任何判分（App 其它地方的 SR 用途
+   ——发音页 tipcheck 的 listenOnce、无 SR 环境的打字纠错——不在本版范围，
+   原样保留；listenGrade 本体按 v4.0 现状留置）。
+   v4.0 底盘纪律全部保留：任何出口（出分、失败、取消、超时、异常）都经同一个
+   gsTeardown() 回 IDLE；会话对象 S 持有全部资源（MediaRecorder、stream、全部
+   timer、错误钩子），teardown 逐项释放/作废；已在会话中又开新会话 → 先
+   teardown 旧会话（回调其 ui.cancelled 让旧面复位）再开新的，不排队、不等待。
+   停录走 gsFinishRecording（v3.26 的 finishRec 口径：onstop＋1.4s 看门狗双保险、
+   stop tracks 必达、只执行一次）。开录前留 MIC_SETTLE_MS 沉降（v3.21 口径，
+   示范刚播完不立刻抢麦）：点「开始录音」后先补足沉降再开麦；她手快先点了
+   「我说完了」则标记 stopWhenReady，录音器一起动就立即收尾，绝不丢这次操作。
+   失败错误码（各面落点口径与旧版一致）：没录到声音/转写过不了 asrTextSane
+   （垃圾转写）→ "no-speech"（各面落「没听清」；整段录音无声时各面再叠
+   MIC_HINT）；引擎/下载没给出结果 → "no-response"；麦克风被拒 →
+   "not-allowed"；打分总超时 → "timeout"；会话异常 → "error"。旧版把 SR 错误码
+   归一的 gsNormErr 随阶段 A 删除。out 契约不变：{ text, res, alts, url, blob,
+   err, offline, phaseB, retried, recSilent, recPeak }；v4.1 起出分恒 offline:true、
+   phaseB 恒 true（全程即录音流）。
    渲染纪律：各面结果区按块渲染（分数块/"识别到你读的是"块/逐词对比块/点评块），
    每块 safeBlock() 独立 try/catch，任一块抛错只缺那一块，分数与转写必达。
    会话期间装 window error/unhandledrejection 钩子：捕获异常 → teardown＋交付
-   失败（各面落"这次没判成，再试一次"类文案；阶段 B 已有录音则随 out.url 可回放），
-   绝不静默卡死；钩子随会话结束在 teardown 内摘除。
-   忙碌口径：__APP_BUSY 读 GS（非 IDLE 即忙），v3.24 同步刷新延后/版本自检延后照常。 */
+   失败（各面落"这次没判成，再试一次"类文案；已有录音则随 out.url 可回放），
+   绝不静默卡死；钩子随会话结束在 teardown 内摘除（READY 态只是等她点按钮，
+   异常不打断）。忙碌口径：__APP_BUSY 认 GS 非空（任一非 IDLE 态即忙），
+   v3.24 同步刷新延后/版本自检延后照常。 */
 let GS = null;                 /* 当前判分会话；null = IDLE */
-const GS_SR_DEAD_MS = 6000;    /* 阶段 A 全静默判死线（__SR_TIMING.deadMs 可注入） */
-const GS_SCORING_MS = 90000;   /* 阶段 B 打分总超时，含自装下载（__GS_TIMING.scoringMs 可注入） */
+const GS_SCORING_MS = 90000;   /* SCORING 总超时，含自装下载（__GS_TIMING.scoringMs 可注入） */
+const GS_REC_CAP_MS = 30000;   /* 录音安全上限（防忘关）：正常流程永不触发，不做任何「读完」判定 */
 function gsTiming(){
-  const o = (typeof window !== "undefined" && window.__SR_TIMING) || {};
   const g = (typeof window !== "undefined" && window.__GS_TIMING) || {};
-  return {
-    deadMs: (typeof o.deadMs === "number" && o.deadMs > 0) ? o.deadMs : GS_SR_DEAD_MS,
-    scoringMs: (typeof g.scoringMs === "number" && g.scoringMs > 0) ? g.scoringMs : GS_SCORING_MS
-  };
+  return { scoringMs: (typeof g.scoringMs === "number" && g.scoringMs > 0) ? g.scoringMs : GS_SCORING_MS };
 }
 /* 结果区按块渲染：每块独立 try/catch，抛错只缺本块（fb 给必达块兜底） */
 function safeBlock(fn, fb){ try { const r = fn(); return (r === null || r === undefined) ? "" : String(r); } catch(e){ return fb || ""; } }
 function gsT(S, fn, ms){ const id = setTimeout(() => { S.tAll.delete(id); fn(); }, ms); S.tAll.add(id); return id; }
-function gsAT(S, fn, ms){ const id = setTimeout(() => { S.tAll.delete(id); S.aT.delete(id); fn(); }, ms); S.tAll.add(id); S.aT.add(id); return id; }
-function gsClearA(S){ S.aT.forEach(id => { try { clearTimeout(id); } catch(e){} S.tAll.delete(id); }); S.aT.clear(); if(S.silenceT){ S.silenceT = null; } }
-/* 真正了结当前 SR 实例：置空回调＋abort/stop 包 try＋dead 标记，迟到回调一律作废 */
-function gsKillInst(S){
-  const inst = S.inst; if(!inst) return; S.inst = null;
-  inst.dead = true;
-  const rec = inst.rec;
-  if(curRec === rec) curRec = null;
-  try { rec.onstart = null; rec.onresult = null; rec.onerror = null; rec.onend = null; } catch(e){}
-  try { rec.abort(); } catch(e){}
-  try { rec.stop(); } catch(e){}
-}
 /* 拆掉录音部分（不拼音频）：停 recorder、停 tracks、清音量条流 */
 function gsDropRec(S){
   const rec = S.mrec;
@@ -6208,8 +6174,7 @@ function gsTeardown(S, displaced){
   if(!S || S.tornDown) return; S.tornDown = true;
   if(GS === S) GS = null;
   S.tAll.forEach(id => { try { clearTimeout(id); } catch(e){} });
-  S.tAll.clear(); S.aT.clear();
-  gsKillInst(S);
+  S.tAll.clear();
   gsDropRec(S);
   if(gradeDoneHook && gradeDoneHook === S.hookRef) gradeDoneHook = null;
   try { window.removeEventListener("error", S.errHook); } catch(e){}
@@ -6225,181 +6190,49 @@ function gsDeliver(S, out){
 }
 function gsFailOut(S, err){
   return { text: null, res: null, alts: null, url: S.url || null, blob: S.blob || null,
-    err: err || "no-response", offline: false, phaseB: !!S.wentB, retried: false,
+    err: err || "no-response", offline: false, phaseB: true, retried: false,
     recSilent: !!S.recSilent, recPeak: (S.recPeak === undefined ? null : S.recPeak) };
 }
-/* 失败原因归一（沿用旧口径）：standalone 里没声/超时/被系统掐断统一报 sa-fail；
-   录音明明有声量却没识别到 → no-response（提示检查网络） */
-function gsNormErr(S){
-  let err = S.phaseAErr || "no-response";
-  if(IS_STANDALONE && (err === "no-speech" || err === "timeout" || err === "end")) err = "sa-fail";
-  else if(err === "no-speech" && S.recPeak !== null && S.recPeak !== undefined && !S.recSilent) err = "no-response";
-  return err;
-}
 function gsDeliverFail(S, err){ gsDeliver(S, gsFailOut(S, err)); }
-/* 会话期间的未捕获异常：teardown＋落可重试失败面，绝不静默卡死（prompt 态只是等用户点按钮，不打断） */
+/* 会话期间的未捕获异常：teardown＋落可重试失败面，绝不静默卡死（ready 态只是等用户点按钮，不打断） */
 function gsSessionError(S){
-  if(S.settled || GS !== S || S.state === "prompt") return;
+  if(S.settled || GS !== S || S.state === "ready") return;
   gsDeliver(S, gsFailOut(S, "error"));
 }
-/* ── 阶段 A：SR 单独听 ── */
-function gsPhaseA(S){
-  S.state = "sr";
-  S.segments = []; S.inst = null; S.lastEventAt = Date.now();
-  S.noSpeechCycles = 0; S.hardRetries = 0; S.zeroRestarts = 0; S.silenceT = null;
-  try { S.ui.listening(S.ctl); } catch(e){}
-  const T = srTiming(), A = srAccTiming();
-  const cap = S.word ? T.wordMs : Math.min(A.hardMs, 20000);
-  gsAT(S, () => gsPhaseAEnd(S), cap);                       /* 总硬上限 ≤20s */
-  if(!S.word){                                             /* 全静默判死巡检（onstart 后无任何事件） */
-    const iv = setInterval(() => {
-      if(GS !== S || S.state !== "sr") return;
-      if(!S.segments.length && Date.now() - S.lastEventAt >= gsTiming().deadMs) gsPhaseAFail(S, "timeout");
-    }, 400);
-    S.tAll.add(iv); S.aT.add(iv);
-  }
-  if(S.openWait > 0) gsAT(S, () => gsStartInst(S), S.openWait); else gsStartInst(S);
-}
-function gsStartInst(S){
-  if(GS !== S || S.state !== "sr" || S.settled) return;
-  let rec;
-  try { rec = new SR(); } catch(e){ gsPhaseAFail(S, "unsupported"); return; }
-  const inst = { rec, dead: false, fin: 0, started: false, startWd: null };
-  S.inst = inst; curRec = rec;
-  try { rec.lang = "en-US"; rec.interimResults = !S.word; rec.maxAlternatives = 5; } catch(e){}
-  const T = srTiming();
-  inst.startWd = gsAT(S, () => {          /* onstart 没在期限内来 = 这个实例判死 */
-    if(inst.dead) return; inst.dead = true;
-    if(S.inst === inst){ S.inst = null; if(curRec === rec) curRec = null; }
-    try { rec.onstart = null; rec.onresult = null; rec.onerror = null; rec.onend = null; } catch(e){}
-    try { rec.abort(); } catch(e){}
-    gsZeroEvent(S);
-  }, T.startMs);
-  rec.onstart = () => {
-    if(inst.dead || GS !== S) return;
-    inst.started = true; S.lastEventAt = Date.now();
-    if(inst.startWd){ try { clearTimeout(inst.startWd); } catch(e){} S.tAll.delete(inst.startWd); S.aT.delete(inst.startWd); inst.startWd = null; }
-  };
-  rec.onresult = e => { if(!inst.dead) gsSRResult(S, inst, e); };
-  rec.onerror = e => { if(!inst.dead) gsSRError(S, inst, (e && e.error) || "error"); };
-  rec.onend = () => {
-    if(inst.dead) return; inst.dead = true;
-    if(S.inst === inst){ S.inst = null; if(curRec === rec) curRec = null; }
-    if(GS !== S || S.state !== "sr" || S.settled) return;
-    S.lastEventAt = Date.now();
-    if(!S.word){
-      if(S.segments.length){ gsPhaseASettle(S); return; }   /* 已有转写且 SR 自然收尾：立即判分（旧 accum 同口径，不等静默计时） */
-      gsAT(S, () => gsStartInst(S), 250);   /* 一段都没说完就被系统停掉：续接下一段 */
-    }
-  };
-  try { rec.start(); } catch(e){ gsSRError(S, inst, "start"); }
-}
-function gsArmSettle(S){
-  if(S.silenceT){ try { clearTimeout(S.silenceT); } catch(e){} S.tAll.delete(S.silenceT); S.aT.delete(S.silenceT); S.silenceT = null; }
-  S.silenceT = gsAT(S, () => { S.silenceT = null; gsPhaseASettle(S); }, srAccTiming().silenceMs);
-}
-function gsSRResult(S, inst, e){
-  if(GS !== S || S.state !== "sr" || S.settled) return;
-  S.lastEventAt = Date.now();
-  if(S.word){
-    let alts = [];
-    try {
-      const r0 = e.results && e.results[0];
-      if(r0){ for(let i = 0; i < r0.length; i++){ const t = (r0[i] && r0[i].transcript || "").trim(); if(t) alts.push(t); } }
-    } catch(err){}
-    if(alts.length){
-      const sc = scoreFirst(S.target, alts, true);      /* v3.22 语义：全部候选逐条评档取最优 */
-      if(sc){ gsKillInst(S); gsDeliver(S, { text: sc.text, res: sc.res, alts, url: null, blob: null, err: null, offline: false, phaseB: false, retried: !!S.hardRetries, recSilent: false, recPeak: null }); return; }
-    }
-    gsKillInst(S); gsPhaseAFail(S, "end"); return;
-  }
-  /* 句子：分段累积（口径与旧 listenGradeAccum 相同，只搬不改） */
-  try {
-    if(e.resultIndex < inst.fin) inst.fin = e.resultIndex;
-    for(let i = inst.fin; i < e.results.length; i++){
-      const r = e.results[i];
-      const alts = [];
-      for(let j = 0; j < r.length; j++){ const t = (r[j] && r[j].transcript || "").trim(); if(t) alts.push(t); }
-      if(!alts.length) continue;
-      if(r.isFinal){ S.segments.push({ alts }); inst.fin = i + 1; gsArmSettle(S); }
-    }
-  } catch(err){}
-}
-function gsSRError(S, inst, err){
-  if(GS !== S || S.state !== "sr" || S.settled) return;
-  inst.dead = true;
-  if(S.inst === inst){ S.inst = null; if(curRec === inst.rec) curRec = null; }
-  S.lastEventAt = Date.now();
-  if(err === "not-allowed" || err === "service-not-allowed"){ gsDeliverFail(S, err); return; }  /* 终局失败，不进 B */
-  if(S.word){
-    if(!S.hardRetries && SR_RETRYABLE.indexOf(err) >= 0){ S.hardRetries = 1; gsAT(S, () => gsStartInst(S), 350); return; }
-    gsPhaseAFail(S, err); return;
-  }
-  if(err === "no-speech" || err === "aborted"){
-    if(err === "no-speech"){
-      S.noSpeechCycles++;
-      if(!S.segments.length && S.noSpeechCycles >= 2){ gsPhaseAFail(S, "no-speech"); return; }
-    }
-    gsAT(S, () => gsStartInst(S), 250); return;
-  }
-  /* network/audio-capture/error/start：已有段就按现状判分；没有就硬重试一次，再失败转 B */
-  if(S.segments.length){ gsPhaseASettle(S); return; }
-  if(!S.hardRetries){ S.hardRetries = 1; gsAT(S, () => gsStartInst(S), 400); return; }
-  gsPhaseAFail(S, err);
-}
-function gsZeroEvent(S){   /* 实例连 onstart 都没来 */
-  if(GS !== S || S.state !== "sr" || S.settled) return;
-  if(S.segments.length){ gsPhaseASettle(S); return; }
-  if(!S.word && !S.zeroRestarts){ S.zeroRestarts = 1; gsAT(S, () => gsStartInst(S), 300); return; }
-  if(S.word && !S.hardRetries){ S.hardRetries = 1; gsAT(S, () => gsStartInst(S), 350); return; }
-  gsPhaseAFail(S, "timeout");
-}
-function gsPhaseASettle(S){
-  if(GS !== S || S.state !== "sr" || S.settled) return;
-  let merged = "";
-  S.segments.forEach(sg => { const t = (sg.alts && sg.alts[0]) || ""; if(t) merged = merged ? mergeSegText(merged, t) : t; });
-  if(merged.trim()){
-    const res = diffSentence(S.target, merged);
-    gsKillInst(S);
-    gsDeliver(S, { text: merged, res, alts: null, url: null, blob: null, err: null, offline: false, phaseB: false, retried: !!S.hardRetries, recSilent: false, recPeak: null });
-  } else gsPhaseAFail(S, "no-speech");
-}
-function gsPhaseAEnd(S){   /* 总硬上限到点：有段判分、无段转 B */
-  if(GS !== S || S.state !== "sr" || S.settled) return;
-  if(!S.word && S.segments.length){ gsPhaseASettle(S); return; }
-  gsPhaseAFail(S, "timeout");
-}
-function gsPhaseAFail(S, err){
-  if(GS !== S || S.state !== "sr" || S.settled) return;
-  S.phaseAErr = err || "no-response";
-  gsKillInst(S);
-  gsClearA(S);
-  S.state = "prompt"; S.wentB = true;
-  try { S.ui.recordPrompt(S.ctl, S.phaseAErr); }
-  catch(e){ gsDeliverFail(S, gsNormErr(S)); }
-}
-/* ── 阶段 B：录音＋离线打分 ── */
+/* ── READY → RECORDING：只由用户点「开始录音」触发（保 iOS 手势链），仅 MediaRecorder ── */
 function gsBeginRecord(S){
-  if(GS !== S || S.state !== "prompt" || S.settled) return;
+  if(GS !== S || S.state !== "ready" || S.settled) return;
   S.state = "rec";
   try { S.ui.recording(S.ctl); } catch(e){}
-  if(S.meterElOf){ try { meterStart(S.meterElOf()); } catch(e){} }
+  let mel = S.meterEl || null;
+  if(S.meterElOf){ try { mel = S.meterElOf() || mel; } catch(e){} }
+  if(mel){ try { meterStart(mel); } catch(e){} }
+  S.recPending = true;
+  /* 示范刚播完不立刻抢麦：补足 MIC_SETTLE_MS 再真正开麦（基准是 gradeSessionStart 里的 stopRec 时刻） */
+  const wait = playSettleWait();
+  if(wait > 0){ gsT(S, () => gsBeginRecordNow(S), wait); return; }
+  gsBeginRecordNow(S);
+}
+function gsBeginRecordNow(S){
+  if(GS !== S || S.state !== "rec" || S.settled) return;
   const MR = window.MediaRecorder || null;
-  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !MR){ gsScoring(S); return; }
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !MR){ S.recPending = false; gsDeliverFail(S, "error"); return; }
   let gum;
-  try { gum = navigator.mediaDevices.getUserMedia({ audio: true }); } catch(e){ gsScoring(S); return; }
+  try { gum = navigator.mediaDevices.getUserMedia({ audio: true }); } catch(e){ S.recPending = false; gsDeliverFail(S, "error"); return; }
   Promise.resolve(gum).then(stream => {
     if(GS !== S || S.state !== "rec"){ try { stream.getTracks().forEach(t => { try { t.stop(); } catch(e){} }); } catch(e){} return; }
     S.mstream = stream;
     meterStreamOverride = stream;
     let rec = null;
     try { rec = new MR(stream); } catch(e){ rec = null; }
-    if(!rec){ gsScoring(S); return; }
+    if(!rec){ S.recPending = false; S.failErr = "error"; gsScoring(S); return; }
     S.mrec = rec; S.mchunks = [];
     rec.ondataavailable = e => { if(e && e.data && e.data.size) S.mchunks.push(e.data); };
-    try { rec.start(250); } catch(e){ try { rec.start(); } catch(e2){ gsScoring(S); return; } }
-    gsT(S, () => { if(GS === S && S.state === "rec" && !S.recStopping) gsFinishRecording(S); }, S.word ? 8000 : 20000);   /* 自动上限：单词 8s／句子 20s */
-  }).catch(() => { if(GS === S && S.state === "rec") gsDeliverFail(S, "not-allowed"); });
+    try { rec.start(250); } catch(e){ try { rec.start(); } catch(e2){ S.recPending = false; S.failErr = "error"; gsScoring(S); return; } }
+    S.recPending = false;
+    gsT(S, () => { if(GS === S && S.state === "rec" && !S.recStopping) gsFinishRecording(S); }, GS_REC_CAP_MS);   /* 30s 安全上限：仅防忘关 */
+    if(S.stopWhenReady){ S.stopWhenReady = false; gsFinishRecording(S); }   /* 她在开麦完成前就点了「我说完了」：立即收尾 */
+  }).catch(() => { S.recPending = false; if(GS === S && S.state === "rec") gsDeliverFail(S, "not-allowed"); });
 }
 /* 停录并收尾（v3.26 finishRec 口径：onstop＋1.4s 看门狗，只执行一次，tracks 必停） */
 function gsFinishRecording(S){
@@ -6433,47 +6266,48 @@ function gsScoring(S){
   const done = pk => {
     if(GS !== S || S.state !== "scoring") return;
     S.recPeak = pk; S.recSilent = recSilentOf(pk);
-    if(!S.blob || !S.blob.size){ gsDeliverFail(S, gsNormErr(S)); return; }
+    if(!S.blob || !S.blob.size){ gsDeliverFail(S, S.failErr || "no-speech"); return; }
     try {
       asrEngageOrInstall({ blob: S.blob }, {
         render: t => { try { return S.ui.scoring(S.ctl, t); } catch(e){ return null; } },
         onText: text => {
           if(GS !== S || S.state !== "scoring") return;
-          if(!asrTextSane(text, S.target, S.word)){ gsDeliverFail(S, gsNormErr(S)); return; }
+          if(!asrTextSane(text, S.target, S.word)){ gsDeliverFail(S, "no-speech"); return; }   /* 转写是垃圾＝没听清：不出分、不入账 */
           const sc = scoreFirst(S.target, [text], S.word);
           if(sc) gsDeliver(S, { text: sc.text, res: sc.res, alts: [text], url: S.url, blob: S.blob, err: null, offline: true, phaseB: true, retried: false, recSilent: S.recSilent, recPeak: pk });
-          else gsDeliverFail(S, gsNormErr(S));
+          else gsDeliverFail(S, "no-response");
         },
-        onFail: () => { if(GS === S && S.state === "scoring") gsDeliverFail(S, gsNormErr(S)); },
+        onFail: () => { if(GS === S && S.state === "scoring") gsDeliverFail(S, "no-response"); },
         alive: () => GS === S && S.state === "scoring"
       });
-    } catch(e){ gsDeliverFail(S, gsNormErr(S)); }
+    } catch(e){ gsDeliverFail(S, "no-response"); }
   };
   if(S.blob) measureBlobPeak(S.blob, done); else done(null);
 }
-/* 「我说完了」：聆听态=按现状收尾（有段判分、无段转 B）；录音态=停录打分；prompt/scoring 态忽略 */
+/* 「我说完了」：只在录音态有意义——停录打分；麦还没开起来（沉降/等权限）时先标记，录音器一起动就收尾；ready/scoring 态忽略 */
 function gsUserDone(S){
   if(GS !== S || S.settled) return;
-  if(S.state === "sr"){
-    if(!S.word && S.segments.length){ gsPhaseASettle(S); return; }
-    gsPhaseAFail(S, "no-speech"); return;
+  if(S.state === "rec"){
+    if(S.recPending){ S.stopWhenReady = true; return; }
+    gsFinishRecording(S);
   }
-  if(S.state === "rec") gsFinishRecording(S);
 }
 /* 开一个判分会话。opts = { target, word, meterEl|meterElOf, ui: {
-     listening(ctl), recordPrompt(ctl, err), recording(ctl), scoring(ctl, text)->progEl|null,
+     ready(ctl), recording(ctl), scoring(ctl, text)->progEl|null,
      result(out), cancelled() } }
-   out 契约与旧 listenGrade 相同：{ text, res, alts, url, blob, err, offline, phaseB, retried, recSilent, recPeak } */
+   会话一开就停在 READY（ui.ready 同步渲染「开始录音」），录音只由 ctl.beginRecord() 启动、
+   只由 ctl.done()（「我说完了」）停录打分——全程没有任何自动聆听/自动判定。 */
 function gradeSessionStart(opts){
   if(GS) gsTeardown(GS, true);                    /* 旧会话先拆（回调其 cancelled 复位旧面），不排队不等待 */
   gradeSeq++;
   const S = {
     id: gradeSeq, target: opts.target, word: !!opts.word, ui: opts.ui || {},
-    state: "idle", settled: false, tornDown: false, wentB: false,
-    tAll: new Set(), aT: new Set(), inst: null, segments: [], silenceT: null,
-    phaseAErr: null, recPeak: null, recSilent: false, hardRetries: 0,
-    mstream: null, mrec: null, mchunks: [], recStopping: false, blob: null, url: null,
-    meterElOf: opts.meterElOf || null, openWait: 0
+    state: "idle", settled: false, tornDown: false,
+    tAll: new Set(),
+    recPeak: null, recSilent: false, failErr: null,
+    mstream: null, mrec: null, mchunks: [], recStopping: false, recPending: false, stopWhenReady: false,
+    blob: null, url: null,
+    meterEl: opts.meterEl || null, meterElOf: opts.meterElOf || null
   };
   const ctl = {
     done: () => gsUserDone(S),
@@ -6489,18 +6323,16 @@ function gradeSessionStart(opts){
   S.hookRef = () => ctl.done();
   gradeDoneHook = S.hookRef;                       /* 「我说完了」按钮（pronCard/drawRole）照旧走 endGradeNow */
   GS = S;
-  S.openWait = playSettleWait();                   /* 先算等时（stopRec 会把基准刷成现在，必须在它之前算） */
   try { speechSynthesis.cancel(); } catch(e){}
   stopRec();
   releaseMic();
-  meterStart(opts.meterEl || (S.meterElOf ? S.meterElOf() : null));
-  if(SR) gsPhaseA(S);
-  else { S.phaseAErr = "unsupported"; S.state = "prompt"; S.wentB = true; try { S.ui.recordPrompt(ctl, "unsupported"); } catch(e){ gsDeliverFail(S, "unsupported"); } }
+  S.state = "ready";
+  try { S.ui.ready(ctl); } catch(e){ gsDeliverFail(S, "error"); }
   return ctl;
 }
 
-/* 取消进行中的判分会话（v4.0：状态机统一拆解）：代次递增作废在途回调、teardown 当前
-   gradeSession（停 SR/录音/tracks/timer/错误钩子，回调该面 cancelled 复位壳子）、摘 done 钩子、停音量条、松开全局麦克风句柄 */
+/* 取消进行中的判分会话（状态机统一拆解）：代次递增作废在途回调、teardown 当前
+   gradeSession（停录音/tracks/timer/错误钩子，回调该面 cancelled 复位壳子）、摘 done 钩子、停音量条、松开全局麦克风句柄 */
 function cancelGrade(){ gradeSeq++; if(GS) gsTeardown(GS, true); gradeDoneHook = null; meterStop(); releaseMic(); }
 /* 离线引擎在途计数（v3.14）：转写/双验复核/模型下载进行中 +1，完成 -1（见 ASR 段各入口） */
 let asrBusyCount = 0;
@@ -6513,7 +6345,7 @@ let asrBusyCount = 0;
    VL.on && VL.playing（视频课播放中）、单词打分面板的 data-wsbusy 标记。 */
 window.__APP_BUSY = function(){
   try {
-    if(GS) return true;   /* v4.0：判分会话任一非 IDLE 态（聆听/录音/打分中）即忙 */
+    if(GS) return true;   /* v4.1：判分会话任一非 IDLE 态（READY 待录/录音/打分中）即忙 */
     if(curRec) return true;
     if(mrRecorder && mrRecorder.state === "recording") return true;
     if(gradeDoneHook) return true;
@@ -6931,13 +6763,13 @@ function asrEngageOrInstall(out, opt){
     asrRunOffline(out, progEl, t => { if(alive()) opt.onText(t); }, () => { if(alive()) opt.onFail(); });
     return;
   }
-  const progEl = opt.render("苹果的识别连不上，正在装离线识别（约55MB，装一次以后没网也能打分）…");
+  const progEl = opt.render("正在装离线打分组件（约55MB，装一次，以后没网也能打分）…");
   const showProg = pct => {
     if(!progEl || !progEl.isConnected) return;
     progEl.hidden = false;
     const bar = progEl.querySelector("i"), tx = progEl.querySelector("[data-asrpt]");
     if(bar) bar.style.width = pct + "%";
-    if(tx) tx.textContent = pct >= 100 ? "装好了，正在识别你刚才读的…" : "正在装离线识别… " + pct + "%";
+    if(tx) tx.textContent = pct >= 100 ? "装好了，正在识别你刚才读的…" : "正在装离线打分组件… " + pct + "%";
   };
   showProg(0);
   asrEnsureModel(showProg, ok => {
@@ -8041,7 +7873,7 @@ function startWordScore(host, v, uid){
   const panel = host.querySelector("[data-wscore]");
   if(!panel) return;
   if(panel.dataset.wsbusy === "1"){
-    /* 正在播原音/等她点开始/聆听中再点一次：取消并复位，绝不让界面停在聆听态 */
+    /* 正在播原音/待录/录音中再点一次：取消并复位，绝不让界面停在录音态 */
     panel.dataset.wsbusy = "";
     panel._wsTok = (panel._wsTok || 0) + 1;
     cancelGrade();
@@ -8053,10 +7885,11 @@ function startWordScore(host, v, uid){
   }
   stopWordInline();
   panel.hidden = false;
-  /* v3.21：单词卡内不再放离线组件设置卡（全站只保留今日页一份）。组件没装时
-     点跟读直接走系统识别打分；系统识别也出不了结果时走既有失败口径给事实
-     提示，绝不弹卡挡路、绝不静默。 */
-  if(!SR){
+  /* v3.21：单词卡内不再放离线组件设置卡（全站只保留今日页一份），绝不弹卡挡路。
+     v4.1：判分改纯录音流（录音＋本机离线转写），不再需要系统识别——只有连录音
+     都不支持的环境（如微信内置浏览器）才进不了流程，给事实提示＋装组件导航。 */
+  const wsCanRec = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+  if(!wsCanRec){
     panel.innerHTML = '<div class="ws-state">这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的），没法自动打分。<br>现在可以点单词听原音，自己大声跟读几遍。</div>' +
       /* v3.24：离线组件没装时同样给出路——去今日页装一次（只给导航，词卡内不放卡） */
       (asrSetupNeeded() ? '<div class="ws-row" style="margin-top:10px;"><button class="btn ghost small" data-wsasr type="button">去装离线组件（装一次，没网也能跟读）</button></div>' : '');
@@ -8067,41 +7900,32 @@ function startWordScore(host, v, uid){
   panel.dataset.wsbusy = "1";
   const wsTok = (panel._wsTok = (panel._wsTok || 0) + 1);
   panel.innerHTML = '<div class="ws-state">先听一遍原音，注意听清楚…</div>';
-  /* v3.21 跟读改全手动（用户实测发火点）：示范（v3.23 起只放慢速 1 遍）播完只停在
-     「待录」状态，她点了「🎤 开始跟读」才开麦录音/识别；出分后的「再读一次」
-     也只回到待录状态等她再点。旧流程示范一停就自动开录，她还没准备好就被
-     录了判分。出分只写本面板：不跳页、不翻词、不重渲染整卡。 */
-  const wsShowReady = () => {
+  /* v4.1 跟读改纯录音流（Chris 实测 v4.0 后亲定）：示范（v3.23 起只放慢速 1 遍）
+     播完直接开判分会话，面板停在 READY——大按钮「🎤 开始录音」，她点了才开麦；
+     录音中只等她点「✅ 我说完了」才停录打分（不猜她读完、不自动出分）；出分后
+     「🎤 重新录」开新会话回 READY，想录几次录几次。出分只写本面板：不跳页、
+     不翻词、不重渲染整卡（v3.21 纪律不变）。 */
+  const wsStartSession = () => {
     if(panel._wsTok !== wsTok || !panel.isConnected) return;
     wsStopMine(panel);
-    panel.innerHTML = '<div class="ws-state">原音听完了。准备好就点按钮，自己把这个词读出来：</div>' +
-      '<div class="ws-state" style="margin-top:6px;"><b class="en" style="font-size:21px;">' + esc(v[0]) + '</b></div>' +
-      '<div class="ws-row" style="margin-top:12px;"><button class="btn main" data-wsstart type="button" style="font-size:16.5px;padding:12px 30px;">🎤 开始跟读</button></div>' +
-      '<div class="ws-state" style="margin-top:8px;font-size:13px;">点按钮才会开始录音；读完停一下，马上出分</div>';
-    const sb = panel.querySelector("[data-wsstart]");
-    if(sb) sb.addEventListener("click", wsRecord);
-  };
-  const wsRecord = () => {
-    if(panel._wsTok !== wsTok || !panel.isConnected) return;
-    panel.innerHTML = '<div class="ws-state"><span class="ws-listening">🎤</span> 听着呢，照着读：<b class="en" style="font-size:19px;">' + esc(v[0]) + '</b><br><span style="font-size:13px;color:var(--muted);">读完停一下，马上出分</span></div>' + '<div class="mic-meter" style="margin-top:10px;"><i></i></div>';
-    /* v4.0：判分走统一状态机 gradeSession（阶段 A SR 单独听→出分；失败→提示行→点「开始录音」→录音→离线打分）。
-       阶段 A 的 SR 全部候选由 scoreFirst 逐条评档取最优（v3.22 语义收编）；不再有并行录音与 asrVerifyWord 双验。 */
+    /* v4.1：判分走统一状态机 gradeSession（纯录音流：READY→点开始录音→录音→
+       点我说完了→离线转写打分；SR 不再参与判分，v3.22 多路取最优退役）。 */
     gradeSessionStart({
       target: v[0], word: true, meterElOf: () => panel.querySelector(".mic-meter"),
       ui: {
-        listening(){},
-        recordPrompt(ctl){
+        ready(ctl){
           if(panel._wsTok !== wsTok || !panel.isConnected) return;
-          panel.innerHTML = '<div class="ws-state">苹果的识别没响应，改用<b>录音打分</b>：点开始录音，把这个词读出来。</div>' +
-            '<div class="ws-state" style="margin-top:4px;"><b class="en" style="font-size:21px;">' + esc(v[0]) + '</b></div>' +
-            '<div class="ws-row" style="margin-top:12px;"><button class="btn main" data-gsrec type="button" style="font-size:16.5px;padding:12px 30px;">🎤 开始录音</button></div>';
+          panel.innerHTML = '<div class="ws-state">原音听完了。准备好就点开始录音，自己把这个词读出来：</div>' +
+            '<div class="ws-state" style="margin-top:6px;"><b class="en" style="font-size:21px;">' + esc(v[0]) + '</b></div>' +
+            '<div class="ws-row" style="margin-top:12px;"><button class="btn main" data-wsstart data-gsrec type="button" style="font-size:16.5px;padding:12px 30px;">🎤 开始录音</button></div>' +
+            '<div class="ws-state" style="margin-top:8px;font-size:13px;">点按钮才开始录音；读完点「✅ 我说完了」，马上打分</div>';
           const rb = panel.querySelector("[data-gsrec]");
           if(rb) rb.addEventListener("click", () => ctl.beginRecord());
         },
         recording(ctl){
           if(panel._wsTok !== wsTok || !panel.isConnected) return;
           panel.innerHTML = '<div class="ws-state"><span class="ws-listening">🎤</span> 录音中，读出这个词：<b class="en" style="font-size:19px;">' + esc(v[0]) + '</b></div>' + '<div class="mic-meter" style="margin-top:10px;"><i></i></div>' +
-            '<div class="ws-row" style="margin-top:12px;"><button class="btn main" data-gsdone type="button" style="font-size:16.5px;padding:12px 30px;">我说完了</button></div>';
+            '<div class="ws-row" style="margin-top:12px;"><button class="btn main" data-gsdone type="button" style="font-size:16.5px;padding:12px 30px;">✅ 我说完了</button></div>';
           const db = panel.querySelector("[data-gsdone]");
           if(db) db.addEventListener("click", () => ctl.done());
         },
@@ -8121,9 +7945,23 @@ function startWordScore(host, v, uid){
   };
   const wsWire = () => {
     const rt = panel.querySelector("[data-wsretry]");
-    if(rt) rt.addEventListener("click", wsShowReady);   /* v3.21：再读一次只回到待录状态，不自动开录 */
+    if(rt) rt.addEventListener("click", wsStartSession);   /* v4.1：重新录＝开新会话回 READY 态等她点开始录音，录几次都行 */
     const og = panel.querySelector("[data-wsorig]");
     if(og) og.addEventListener("click", () => { if(!playWordDemo(v[0])) speak(v[0], 1); });
+  };
+  /* 「▶ 听我的录音」接线（出分面/失败面共用）：播本场录音的 objectURL，再点暂停 */
+  const wsWireMine = url => {
+    const mine = panel.querySelector("[data-wsmine]");
+    if(!mine || !url) return;
+    if(panel._wsAudio){ try { panel._wsAudio.pause(); } catch(e){} panel._wsAudio = null; }
+    const au = new Audio(); au.preload = "auto"; au.src = url; panel._wsAudio = au;
+    mine.addEventListener("click", () => {
+      if(!panel._wsAudio) return;
+      if(!panel._wsAudio.paused){ panel._wsAudio.pause(); mine.textContent = "▶ 听我的录音"; return; }
+      mine.textContent = "⏸ 我的录音";
+      panel._wsAudio.onended = () => { mine.textContent = "▶ 听我的录音"; };
+      panel._wsAudio.play().catch(() => { mine.textContent = "▶ 听我的录音"; });
+    });
   };
   const wsShowScore = out2 => {
     try { saveWordScore(uid, out2.res.score, out2.text); } catch(e){}
@@ -8135,34 +7973,25 @@ function startWordScore(host, v, uid){
       safeBlock(() => '<div class="ws-fb">' + esc(feedbackForWord(out2.res, v[0])) + '</div>') +
       safeBlock(() => (out2.offline ? '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>' : '') + (out2.recSilent ? '<div class="mic-warn">' + MIC_HINT + '</div>' : '')) +
       '<div class="ws-row">' +
-        '<button class="btn ghost small" data-wsorig type="button">🔊 原音</button>' +
         (out2.url ? '<button class="btn ghost small" data-wsmine type="button">▶ 听我的录音</button>' : '') +
-        '<button class="btn ghost small" data-wsretry type="button">🎤 再读一次</button>' +
+        '<button class="btn ghost small" data-wsorig type="button">🔊 再听原音</button>' +
+        '<button class="btn ghost small" data-wsretry type="button">🎤 重新录</button>' +
       '</div>' +
       '<div class="bhs-edit">白话音 <input data-bhsedit value="' + esc(baihuaOf(v)) + '"><button class="btn ghost small" data-bhssave type="button">保存</button></div>';
     wsWire();
-    const mine = panel.querySelector("[data-wsmine]");
-    if(mine){
-      if(panel._wsAudio){ try { panel._wsAudio.pause(); } catch(e){} panel._wsAudio = null; }
-      const au = new Audio(); au.preload = "auto"; au.src = out2.url; panel._wsAudio = au;
-      mine.addEventListener("click", () => {
-        if(!panel._wsAudio) return;
-        if(!panel._wsAudio.paused){ panel._wsAudio.pause(); mine.textContent = "▶ 听我的录音"; return; }
-        mine.textContent = "⏸ 我的录音";
-        panel._wsAudio.onended = () => { mine.textContent = "▶ 听我的录音"; };
-        panel._wsAudio.play().catch(() => { mine.textContent = "▶ 听我的录音"; });
-      });
-    }
+    wsWireMine(out2.url);
   };
   const wsShowFail = out => {
     const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
     panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>' +
-      '<div class="ws-row"><button class="btn soft small" data-wsretry type="button">🎤 再读一次</button>' +
-      /* v3.24：苹果识别在这边常连不上，只给「再读一次」是死胡同——离线组件没装时
-         多给一个次级导航按钮，去今日页装一次，以后没网也能跟读；已装则不显示
-         （已装还失败是别的原因，不拿这个按钮误导她）。 */
+      '<div class="ws-row">' +
+      (out && out.url ? '<button class="btn ghost small" data-wsmine type="button">▶ 听我的录音</button>' : '') +
+      '<button class="btn soft small" data-wsretry type="button">🎤 重新录</button>' +
+      /* v3.24：只给「重新录」是死胡同——离线组件没装时多给一个次级导航按钮，
+         去今日页装一次，以后没网也能跟读；已装则不显示（已装还失败是别的原因）。 */
       (asrSetupNeeded() ? '<button class="btn ghost small" data-wsasr type="button">去装离线组件（装一次，没网也能跟读）</button>' : '') + '</div>';
     wsWire();
+    wsWireMine(out && out.url);
     const ab = panel.querySelector("[data-wsasr]");
     if(ab) ab.addEventListener("click", () => wsGotoAsrSetup(panel));
   };
@@ -8175,10 +8004,10 @@ function startWordScore(host, v, uid){
     const rb = panel.querySelector("[data-wsdemo]");
     if(rb) rb.addEventListener("click", () => { panel.dataset.wsbusy = ""; startWordScore(host, v, uid); });
     const sk = panel.querySelector("[data-wsskip]");
-    if(sk) sk.addEventListener("click", wsShowReady);
+    if(sk) sk.addEventListener("click", wsStartSession);
   };
   let ok = false;
-  try { ok = playWordDemo(v[0], { onDone: wsShowReady, onFail: demoFail, onAbort: demoFail }); } catch(e){ ok = false; }
+  try { ok = playWordDemo(v[0], { onDone: wsStartSession, onFail: demoFail, onAbort: demoFail }); } catch(e){ ok = false; }
   if(!ok) demoFail();
 }
 
@@ -9112,9 +8941,9 @@ function drawRole(zone, ls){
       '<div class="rp-tip">你要说的（中文意思）</div>' +
       '<div class="rp-cn">' + esc(cur.d[2]) + '</div>' +
       (rp.mode === "voice"
-        ? '<button class="btn blue" id="rpMic">点这里，开口说英文</button><span class="rec-status" id="rpRecStatus">● 正在听…慢慢说，停顿不会断</span>' +
-          '<div style="margin-top:10px;"><button class="btn" id="rpDone" style="display:none;">我说完了</button></div>' +
-          '<div class="mic-note">说完点「我说完了」马上纠错；不点的话，停 4 秒也会自动出分。听不清时也可以切换到「打字」。</div>' +
+        ? '<button class="btn blue" id="rpMic">点这里，开口说英文</button><span class="rec-status" id="rpRecStatus">● 点「开始录音」后慢慢读，读完点「我说完了」</span>' +
+          '<div style="margin-top:10px;"><button class="btn" id="rpDone" style="display:none;">✅ 我说完了</button></div>' +
+          '<div class="mic-note">点「开始录音」后慢慢读，读完点「✅ 我说完了」马上打分；不会自动停、不会替你判断读完。听不清时也可以切换到「打字」。</div>' +
           '<div class="mic-meter"></div>'
         : '<textarea class="say-input" id="rpInput" placeholder="把你想到的英文写在这里…"></textarea>' +
           '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn blue" id="rpSubmit">提交纠错</button>' +
@@ -9144,25 +8973,25 @@ function drawRole(zone, ls){
       }
       micBtn.dataset.busy = "1";
       st.classList.add("on");
-      micBtn.textContent = "正在听…（再点一次取消）";
-      if(rpDoneBtn) rpDoneBtn.style.display = "";
-      /* v4.0：统一走状态机 gradeSession（阶段 A SR 单独听；失败→提示行→点开始录音→阶段 B 录音＋离线打分）；
-         结果落点在 rpGradeResult（失败口径与旧版相同；离线兜底已收编进状态机阶段 B） */
+      micBtn.textContent = "准备录音…（再点一次取消）";
+      /* v4.1：统一走状态机 gradeSession（纯录音流：READY 等她点开始录音 → 录音 → 她点「✅ 我说完了」→ 离线转写打分）；
+         结果落点在 rpGradeResult（失败口径与旧版相同；离线兜底在状态机 SCORING 内） */
       gradeSessionStart({
         target: cur.d[1], word: false, meterEl: zone.querySelector(".mic-meter"),
         ui: {
-          listening(){},
-          recordPrompt(ctl){
+          ready(ctl){
             const rz = zone.querySelector("#rpResult"); if(!rz) return;
             if(rpDoneBtn) rpDoneBtn.style.display = "none";
-            rz.innerHTML = '<div class="card corr-card"><div class="comment-line">苹果的识别没响应，改用<b>录音打分</b>：点「开始录音」，把这句读出来，读完点「我说完了」。</div>' +
+            if(st) st.textContent = "● 准备好了，点「开始录音」";
+            rz.innerHTML = '<div class="card corr-card"><div class="comment-line">准备好了就点「开始录音」，把这句读出来，读完点「✅ 我说完了」。</div>' +
               '<div style="margin-top:8px;"><button class="btn main small" data-gsrec type="button">🎤 开始录音</button></div></div>';
             const rb = rz.querySelector("[data-gsrec]");
             if(rb) rb.addEventListener("click", () => ctl.beginRecord());
           },
           recording(){
             const rz = zone.querySelector("#rpResult");
-            if(rz) rz.innerHTML = '<div class="card corr-card"><div class="comment-line">🔴 录音中…把这句读出来，读完点「我说完了」。</div></div>';
+            if(rz) rz.innerHTML = '<div class="card corr-card"><div class="comment-line">🔴 录音中…把这句读出来，读完点「✅ 我说完了」。</div></div>';
+            if(st) st.textContent = "● 正在录音…慢慢说";
             if(rpDoneBtn) rpDoneBtn.style.display = "";
           },
           scoring(ctl, t){
@@ -9195,17 +9024,17 @@ function drawRole(zone, ls){
     zone.querySelector("#rpSkip").addEventListener("click", () => rpAnswer(zone, ls, ""));
   }
 }
-/* v4.0：角色扮演判分结果落点（状态机 gradeSession 交付的最终 out）。
-   失败口径与旧版一致；离线兜底（面板自装/转写/asrTextSane 守卫）已收编进状态机阶段 B，
-   这里只处理：没声提示 / 识别没响应（带去装离线组件的导航按钮）/ 其它错误 toast / 出分走 rpAnswer 原口径入账。 */
+/* v4.1：角色扮演判分结果落点（状态机 gradeSession 交付的最终 out）。
+   离线兜底（面板自装/转写/asrTextSane 守卫）在状态机 SCORING 内；这里只处理：
+   没声提示 / 没听清·识别没响应（内联卡，带去装离线组件的导航按钮）/ 其它错误 toast / 出分走 rpAnswer 原口径入账。 */
 function rpGradeResult(zone, ls, cur, out){
   if(!out.res){
     if(out.recSilent && (out.err === "no-speech" || out.err === "end")){
       const rz = zone.querySelector("#rpResult");
       if(rz) rz.innerHTML = '<div class="card corr-card"><div class="mic-warn" style="margin-top:0;">' + MIC_HINT + '</div></div>';
       else toast(MIC_HINT);
-    } else if(out.err === "no-response" || out.err === "sa-fail"){
-      /* 录到了声、识别没响应（或独立模式识别不稳）：把原因说破并给去装离线组件的入口，别只弹一句就让她对着空气再读 */
+    } else if(out.err === "no-response" || out.err === "sa-fail" || out.err === "no-speech"){
+      /* 录到了声但没听清/识别没给出结果：把原因说破并给去装离线组件的入口，别只弹一句就让她对着空气再读 */
       const rz = zone.querySelector("#rpResult");
       if(rz){
         rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div>' +
@@ -9270,9 +9099,9 @@ function rpAnswer(zone, ls, saidRaw, myUrl){
       safeBlock(() => (hints.length ? '<ul class="hint-list">' + hints.map(h => "<li>" + h + "</li>").join("") + '</ul>' : "")) +
       safeBlock(() => (ls.g && ls.g[4] ? '<div class="tip-box"><b>本课易错点：</b>' + esc(ls.g[4]) + '</div>' : "")) +
       '<div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">' +
-        '<button class="btn soft small" id="rpHear">▶ 听标准句</button>' +
-        (rp.mode === "voice" && SR ? '<button class="btn soft small" id="rpReread">↻ 重读这句</button>' : '') +
-        (myUrl ? '<button class="btn ghost small" id="rpMine">▶ 听我刚读的</button>' : '') +
+        '<button class="btn soft small" id="rpHear">🔊 再听原音</button>' +
+        (rp.mode === "voice" && SR ? '<button class="btn soft small" id="rpReread">🎤 重新录</button>' : '') +
+        (myUrl ? '<button class="btn ghost small" id="rpMine">▶ 听我的录音</button>' : '') +
         '<button class="btn" id="rpNextLine">' + (last ? "看结果" : "下一句 →") + '</button>' +
       '</div>' +
     '</div>';
@@ -9414,7 +9243,7 @@ function pronCard(ls, i){
       '<button class="btn soft small" data-act="slow">慢速播放</button>' +
       '<button class="btn soft small" data-act="shadow">跟读</button>' +
       '<button class="btn blue small" data-act="check">跟读打分</button>' +
-      '<button class="btn small" data-act="done" style="display:none;">我说完了</button>' +
+      '<button class="btn small" data-act="done" style="display:none;">✅ 我说完了</button>' +
       '<button class="icon-btn" data-act="rec" title="录音回放对比">' + ICON_MIC + '</button>' +
       '<span class="rec-status">● 录音中…再点一次麦克风结束</span>' +
     '</div>' +
@@ -9462,14 +9291,17 @@ function pronCard(ls, i){
   if(doneBtn) doneBtn.addEventListener("click", () => endGradeNow());
   /* 判分结果统一处理：语音判分与无识别环境下的打字纠错共用（判分/入账/最好分/错句记录同一口径；
      与角色扮演打字模式同口径：打字结果会计入，但注明是打字）。
-     v4.0：语音判分改由状态机 gradeSession 交付最终结果（阶段 A SR 优先出分；SR 零结果
-     自动走阶段 B 录音＋离线转写，含 v3.25 面板内自装与 v3.27 垃圾守卫）——本函数只做
-     落点渲染，不再自己接管离线兜底（旧 asrZeroApplies 分支删除）。 */
+     v4.1：语音判分由状态机 gradeSession 交付最终结果（纯录音流：录音→离线转写，
+     含 v3.25 面板内自装与 v3.27 垃圾守卫；SR 不再参与判分）——本函数只做落点渲染。 */
   const renderZeroFail = out => {
     const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
     result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>' +
+      /* v4.1：失败面也给「重新录」（回 READY 重录）＋录音回放（gradeOut 已 showMine 到 .mine-audio） */
+      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn soft small" data-reread type="button">🎤 重新录</button></div>' +
       /* 组件没装时失败面补一个导航按钮，去今日页装（与词卡同口径） */
       (asrSetupNeeded() ? '<div style="margin-top:8px;">' + ASR_NAV_BTN_HTML + '</div>' : '');
+    const rrb0 = result.querySelector("[data-reread]");
+    if(rrb0) rrb0.addEventListener("click", () => checkBtn.click());
     asrWireNavBtn(result);
   };
   const gradeOut = out => {
@@ -9502,12 +9334,15 @@ function pronCard(ls, i){
         (out.offline ? '<div class="mic-note">' + ASR_OFFLINE_NOTE + '</div>' : '')) +
       safeBlock(() => '<div class="comment-line"><b>点评：</b>' + esc(pronComment(res, d[1])) + '</div>') +
       '<div class="mic-note">红色词上面小字是识别到的你的读法；金色虚线是漏读的词；橙色是发音接近但还不准的词。这一句已算进今日发音进度。</div>' +
-      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn soft small" data-reread type="button">↻ 重读这句</button>' +
-      (out.url ? '<button class="btn ghost small" data-playmine type="button">▶ 听我刚读的</button>' : '') + '</div>';
+      '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn soft small" data-reread type="button">🎤 重新录</button>' +
+      (out.url ? '<button class="btn ghost small" data-playmine type="button">▶ 听我的录音</button>' : '') +
+      '<button class="btn ghost small" data-gsorig type="button">🔊 再听原音</button></div>';
     const rrb = result.querySelector("[data-reread]");
     if(rrb) rrb.addEventListener("click", () => checkBtn.click());
     const pmb = result.querySelector("[data-playmine]");
     if(pmb) pmb.addEventListener("click", () => { showMine(out.url); try { const pp3 = audio.play(); if(pp3 && pp3.catch) pp3.catch(() => {}); } catch(e){} });
+    const gob = result.querySelector("[data-gsorig]");
+    if(gob) gob.addEventListener("click", () => speak(d[1], 0.6, d[0]));   /* 再听原音：与卡上「原音」同口径 */
     try { renderHUD(); saveState(); renderPronExtras(); } catch(e){}
   };
   checkBtn.addEventListener("click", () => {
@@ -9538,22 +9373,20 @@ function pronCard(ls, i){
       return;
     }
     checkBusy = true;
-    checkBtn.textContent = "正在听你说…（再点一次取消）";
-    if(doneBtn) doneBtn.style.display = "";
-    /* v4.0：统一走状态机 gradeSession（阶段 A SR 单独听；失败→提示行→点开始录音→阶段 B 录音＋离线打分） */
+    checkBtn.textContent = "准备录音…（再点一次取消）";
+    /* v4.1：统一走状态机 gradeSession（纯录音流：READY 等她点开始录音 → 录音 → 她点「✅ 我说完了」→ 离线转写打分） */
     gradeSessionStart({
       target: d[1], word: false, meterEl: card.querySelector(".mic-meter"),
       ui: {
-        listening(){},
-        recordPrompt(ctl){
-          result.innerHTML = '<div class="comment-line">苹果的识别没响应，改用<b>录音打分</b>：点「开始录音」，把这句读出来，读完点「我说完了」。</div>' +
+        ready(ctl){
+          result.innerHTML = '<div class="comment-line">准备好了就点「开始录音」，把这句读出来，读完点「✅ 我说完了」。</div>' +
             '<div style="margin-top:8px;"><button class="btn main small" data-gsrec type="button">🎤 开始录音</button></div>';
           const rb = result.querySelector("[data-gsrec]");
           if(rb) rb.addEventListener("click", () => ctl.beginRecord());
           if(doneBtn) doneBtn.style.display = "none";
         },
         recording(){
-          result.innerHTML = '<div class="comment-line">🔴 录音中…把这句读出来，读完点「我说完了」。</div>';
+          result.innerHTML = '<div class="comment-line">🔴 录音中…把这句读出来，读完点「✅ 我说完了」。</div>';
           if(doneBtn) doneBtn.style.display = "";
         },
         scoring(ctl, t){
