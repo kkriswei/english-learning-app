@@ -1,6 +1,5 @@
 {
   "additional_special_tokens": [
-    "<|endoftext|>",
     "<|startoftranscript|>",
     "<|en|>",
     "<|zh|>",
@@ -22,7 +21,7 @@
     "<|hi|>",
     "<|fi|>",
     "<|vi|>",
-    "<|he|>",
+    "<|iw|>",
     "<|uk|>",
     "<|el|>",
     "<|ms|>",
@@ -108,32 +107,8 @@
     "<|nocaptions|>",
     "<|notimestamps|>"
   ],
-  "bos_token": {
-    "content": "<|endoftext|>",
-    "lstrip": false,
-    "normalized": false,
-    "rstrip": false,
-    "single_word": false
-  },
-  "eos_token": {
-    "content": "<|endoftext|>",
-    "lstrip": false,
-    "normalized": false,
-    "rstrip": false,
-    "single_word": false
-  },
-  "pad_token": {
-    "content": "<|endoftext|>",
-    "lstrip": false,
-    "normalized": false,
-    "rstrip": false,
-    "single_word": false
-  },
-  "unk_token": {
-    "content": "<|endoftext|>",
-    "lstrip": false,
-    "normalized": false,
-    "rstrip": false,
-    "single_word": false
-  }
+  "bos_token": "<|endoftext|>",
+  "eos_token": "<|endoftext|>",
+  "pad_token": "<|endoftext|>",
+  "unk_token": "<|endoftext|>"
 }

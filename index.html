@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610251713";
+var APP_BUILD = "v202610270931";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6124,7 +6124,7 @@ function endGradeNow(){ if(gradeDoneHook) gradeDoneHook(); }
    「✅ 我说完了」）→ SCORING → RESULT →（重新录 → 新会话回 READY）／（退出 → IDLE）。
    不许有「猜她读完」的静默判定/自动出分：停录只由她点按钮触发，外加一个 30s
    宽松安全上限（正常流程永不触发）。判分只有一条证据源：本场录音的离线转写
-   （whisper-tiny 本机转写；未装 → v3.25 面板内自装 asrEngageOrInstall）→
+   （whisper-base.en 本机转写，v4.2 换模型；未装 → v3.25 面板内自装 asrEngageOrInstall）→
    asrTextSane 守卫（v3.27，不动）→ scoreFirst 既有档位（单词严判 100/35/0、
    句子音素三档＋封顶，全不动）。v3.22 单词「SR 候选多路取最优」与 v3.27 句子
    「SR 优先」随阶段 A 一并退役：SR 不再参与任何判分（App 其它地方的 SR 用途
@@ -6358,8 +6358,9 @@ window.__APP_BUSY = function(){
 };
 /* ---------- 离线 ASR 兜底打分（v3.10） ----------
    触发口径只有一条：一次判分以整场零结果收场（sa-fail / no-response）且这次有录音时，
-   才提供离线识别。做法：把那段录音在本机用 whisper-tiny（多语 q8，transformers.js）转成
-   文字，再喂 scoreFirst 判分。模型+运行时约 55MB；v3.12 起下载改由一次性设置卡
+   才提供离线识别。做法：把那段录音在本机用 whisper-base.en（英文 q8，transformers.js；
+   v4.2 由 whisper-tiny 换上，基准实测见 asrb/：模拟手机录音单词 garbage 7→2/40）转成
+   文字，再喂 scoreFirst 判分。模型+运行时约 80MB；v3.12 起下载改由一次性设置卡
    触发（见 asrDownloadModel），打分流内不再询问、不再给按钮让她选：零结果时已下载
    就直接自动转写出分，没下载只留一行事实提示。转写为空/失败/引擎坏掉，一律回落
    事实提示，绝不假打分、绝不卡死。v3.14 起离线引擎升为主判分：模型已下载时每次打分（发音句/角色扮演/单词）
@@ -6441,7 +6442,7 @@ function asrEmitProg(p){ if(asrProgSink){ try { asrProgSink(p); } catch(e){} } }
    推理期 Worker 全程静默，靠固定上限判死。15s 必须短于上层 25s 看门狗，
    保证重试有时间在上层收尾前跑完。冒烟可经 window.__ASR_TIMING.workerMs
    注入更短值（与 __SR_TIMING 同口径）；生产不设该变量。 */
-const ASR_WORKER_TIMEOUT_DEFAULT = 15000;
+const ASR_WORKER_TIMEOUT_DEFAULT = 20000;   /* v4.2：15s→20s——引擎换 whisper-base.en 后单条推理更慢，推理期 Worker 全程静默，15s 会把「慢但活着」误判成死；仍 <上层 25s 看门狗，v3.26 的重试余量口径不变 */
 function asrWorkerTimeoutMs(){
   const o = (typeof window !== "undefined" && window.__ASR_TIMING) || {};
   return (typeof o.workerMs === "number" && o.workerMs > 0) ? o.workerMs : ASR_WORKER_TIMEOUT_DEFAULT;
@@ -6531,7 +6532,7 @@ function asrMainLoad(){
     env.remotePathTemplate = "model/";
     env.backends.onnx.wasm.numThreads = 1;
     env.backends.onnx.wasm.wasmPaths = { mjs: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.mjs", wasm: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.wasm" };
-    return await T.pipeline("automatic-speech-recognition", "whisper-tiny", { device: "wasm", dtype: "q8", progress_callback: asrProgAgg() });
+    return await T.pipeline("automatic-speech-recognition", "whisper-base.en", { device: "wasm", dtype: "q8", progress_callback: asrProgAgg() });
   })();
   asrMainPipeP.catch(() => { asrMainPipeP = null; });
   return asrMainPipeP;
@@ -6554,7 +6555,7 @@ async function asrDoTranscribe(blob){
   }
   const p = await asrMainLoad();
   asrEmitProg(100);
-  const r = await p(pcm, { chunk_length_s: 30, language: "english", task: "transcribe" });
+  const r = await p(pcm, { chunk_length_s: 30 });   /* v4.2：whisper-base.en 英文单语模型，传 language/task 会被库抛错，只带 chunk_length_s */
   asrMarkCached();
   return ((Array.isArray(r) ? (r[0] && r[0].text) : (r && r.text)) || "").trim();   /* 同上：成功为空返回 ""；失败走异常/解码失败，由 realAsrEngine 归一成 null */
 }
@@ -6578,8 +6579,8 @@ function asrEngine(){
    指向今日页的事实提示（单词卡走失败口径，连提示里的下载字样都不出现）。 */
 const ASR_SETUP_HTML = '<div class="card" data-asrsetup style="border:1.5px solid #c2a14d;background:rgba(194,161,77,.08);">' +
   '<div style="font-weight:700;">跟读打分，先装一个离线组件（只装一次）</div>' +
-  '<div style="margin-top:4px;">跟读打分先下载一个离线组件（约 55MB，只下一次），之后读完直接出分，不依赖苹果的识别。</div>' +
-  '<div style="margin-top:8px;"><button class="btn blue small" data-asrdl type="button">下载离线组件（约 55MB）</button></div>' +
+  '<div style="margin-top:4px;">跟读打分先下载一个离线组件（约 80MB，只下一次），之后读完直接出分，不依赖苹果的识别。</div>' +
+  '<div style="margin-top:8px;"><button class="btn blue small" data-asrdl type="button">下载离线组件（约 80MB）</button></div>' +
   ASR_PROG_HTML + '</div>';
 function asrSetupNeeded(){ try { return !asrEngine().cached(); } catch(e){ return false; } }
 function paintAsrSetup(host){
@@ -6763,7 +6764,7 @@ function asrEngageOrInstall(out, opt){
     asrRunOffline(out, progEl, t => { if(alive()) opt.onText(t); }, () => { if(alive()) opt.onFail(); });
     return;
   }
-  const progEl = opt.render("正在装离线打分组件（约55MB，装一次，以后没网也能打分）…");
+  const progEl = opt.render("正在装离线打分组件（约80MB，装一次，以后没网也能打分）…");
   const showProg = pct => {
     if(!progEl || !progEl.isConnected) return;
     progEl.hidden = false;

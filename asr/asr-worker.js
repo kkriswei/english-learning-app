@@ -1,4 +1,6 @@
-/* 离线 ASR worker（v3.10）：transformers.js 3.8.1 + Xenova/whisper-tiny 多语版 q8。
+/* 离线 ASR worker（v3.10；v4.2 换模型）：transformers.js 3.8.1 + Xenova/whisper-base.en 英文版 q8。
+   v4.2 基准实测（asrb/）：模拟手机录音口径单词 exact 30→34/40、garbage 7→2、句子 exact 10→11/15。
+   英文单语模型传 language/task 会被库抛错，转写只带 chunk_length_s。 */
    只做兜底转写：主线程把 16kHz 单声道 Float32Array PCM 传进来，这里跑推理后回文字。
    模型/运行时全部从本站 asr/ 目录加载（相对 worker 自身位置推导，不写死站点根路径）。
    生产配置：GitHub Pages 无跨源隔离 → numThreads=1；wasmPaths 只给 {mjs, wasm} 两键
@@ -39,7 +41,7 @@ function loadPipe(){
       mjs: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.mjs",
       wasm: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.wasm"
     };
-    const p = await T.pipeline("automatic-speech-recognition", "whisper-tiny", {
+    const p = await T.pipeline("automatic-speech-recognition", "whisper-base.en", {
       device: "wasm", dtype: "q8", progress_callback: makeProgAgg()
     });
     postProgress(100);
@@ -58,7 +60,7 @@ self.onmessage = async e => {
   if(m.type === "transcribe"){
     try {
       const p = await loadPipe();
-      const r = await p(m.pcm, { chunk_length_s: 30, language: "english", task: "transcribe" });
+      const r = await p(m.pcm, { chunk_length_s: 30 });
       const text = ((Array.isArray(r) ? (r[0] && r[0].text) : (r && r.text)) || "").trim();
       self.postMessage({ type: "result", id: m.id, text: text });
     } catch(err){
