@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610270931";
+var APP_BUILD = "v202610281503";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -5017,7 +5017,10 @@ function wbwWrap(el, text){
   });
   return spans;
 }
-/* opts: {el 高亮元素, shadow 跟读内部调用（不做停别人播放的礼仪）, isPaused 暂停探针}
+/* opts: {el 高亮元素, shadow 跟读内部调用（不做停别人播放的礼仪）, isPaused 暂停探针,
+   failStop 视频课严格口径（v4.3）：某词录音 error/卡顿看门狗判败 → 同一词带 ?retry=1 重拉
+   重试一次；再败 → 停在该词（高亮冻住、不清 spans）经 onWordFail 上报，绝不静默跳词；
+   无录音的词不高亮划过（高亮只跟真正出声的词同步）。非 failStop 调用方保持旧行为。}
    返回 false = 一个可播的词都没有，调用方走自己的回退（整句 TTS 等）。 */
 function playWordsSlow(text, opts, onDone, onFail){
   opts = opts || {};
@@ -5045,19 +5048,45 @@ function playWordsSlow(text, opts, onDone, onFail){
     const realOk = ok && playedOk > 0;
     if(realOk){ if(onDone) onDone(); } else if(onFail) onFail(); else if(onDone) onDone();
   };
-  let wi = -1;
+  let wi = -1, halted = false;
   const stepWord = () => {
-    if(gen !== wbwGen) return;
+    if(gen !== wbwGen || halted) return;
     if(opts.isPaused && opts.isPaused()){ wbwTimer = setTimeout(stepWord, 220); return; }
     wi++;
     if(wi >= items.length){ finishAll(true); return; }
+    const it = items[wi];
+    if(!it.file){
+      /* 无录音的词：旧口径高亮停留 130ms 后过；failStop 下不高亮（没出声不许高亮划过） */
+      if(!opts.failStop){ clearHl(); if(spans[wi]) spans[wi].classList.add("wbw-on"); }
+      wbwTimer = setTimeout(stepWord, 130); return;
+    }
     clearHl();
     if(spans[wi]) spans[wi].classList.add("wbw-on");
-    const it = items[wi];
-    if(!it.file){ wbwTimer = setTimeout(stepWord, 130); return; }
-    playFileOnce(it.file,
-      () => { playedOk++; if(gen === wbwGen) wbwTimer = setTimeout(stepWord, WBW_GAP_MS); },
-      () => { if(gen === wbwGen) wbwTimer = setTimeout(stepWord, 60); });
+    const playAttempt = retrying => {
+      playFileOnce(retrying ? it.file + "?retry=1" : it.file,
+        () => { playedOk++; if(gen === wbwGen && !halted) wbwTimer = setTimeout(stepWord, WBW_GAP_MS); },
+        () => {
+          if(gen !== wbwGen || halted) return;
+          if(opts.failStop && !retrying){
+            /* 第一败（多为冷拉网络被 playFileOnce 的 3.2s 卡顿看门狗误杀）：同一词重拉重试，不推进 */
+            const retryStep = () => {
+              if(gen !== wbwGen || halted) return;
+              if(opts.isPaused && opts.isPaused()){ wbwTimer = setTimeout(retryStep, 220); return; }
+              playAttempt(true);
+            };
+            wbwTimer = setTimeout(retryStep, 150); return;
+          }
+          if(opts.failStop){
+            /* 重试再败：停在该词——不清高亮、不复原文本、不推进，交调用方报错停步 */
+            halted = true;
+            if(wbwTimer){ clearTimeout(wbwTimer); wbwTimer = null; }
+            if(opts.onWordFail) opts.onWordFail({ index: wi, key: it.key });
+            return;
+          }
+          wbwTimer = setTimeout(stepWord, 60);
+        });
+    };
+    playAttempt(false);
   };
   stepWord();
   return true;
@@ -9865,10 +9894,41 @@ function vlSetPlayUI(){
   if(pv) pv.disabled = VL.idx <= 0;
   if(nx) nx.disabled = VL.idx >= VL.steps.length - 1;
 }
+/* v4.3 视频课整课预加载：VL 此前从不预加载，逐词链每个词点到才冷拉网络文件（国内拉
+   GitHub Pages 常 1~3s），是「老师发音前等约 3 秒」的主因。进课/切段时把本课旁白、
+   跟读例句的整句录音（常速+慢速）与逐词录音、单词课/对话课的全部录音一次性排进
+   preloadFiles 预热（preloadSet 去重，切段重复调用近乎零成本），旁白播放期间就拉完。 */
+function vlPreloadLesson(){
+  try {
+    if(!VL.id || typeof preloadFiles !== 'function') return;
+    const files = new Set();
+    const addSent = t => {
+      if(!t) return;
+      const sf = (typeof AUDIO_MAP !== 'undefined') ? AUDIO_MAP[t] : null;
+      if(sf){ files.add(sf); files.add(sf.replace(/\.mp3$/, '-ss.mp3')); }
+      wbwParse(t).forEach(sg => { if(sg.core){ const wf = wbwFile(sg.key); if(wf) files.add(wf); } });
+    };
+    (VL.steps || []).forEach(st => { if(st.k === 'nar' && st.f) files.add('nar/' + st.f + '.mp3'); });
+    files.add('nar/shared-listen.mp3');
+    const ls = (typeof LESSON_MAP !== 'undefined') ? LESSON_MAP[VL.id] : null;
+    if(ls){
+      if(ls.g && ls.g[3]) ls.g[3].forEach(ex => addSent(ex[0]));
+      if(ls.v) ls.v.forEach((v, vi) => {
+        const wf = AUDIO_MAP[v[0]]; if(wf){ files.add(wf); files.add(wf.replace(/\.mp3$/, '-ss.mp3')); }
+        addSent(v[3]);
+        const hf = (typeof HOOK_AUDIO !== 'undefined') ? HOOK_AUDIO[String(v[0]).toLowerCase()] : null; if(hf) files.add(hf);
+        const ef = (typeof EXCN_AUDIO !== 'undefined') ? EXCN_AUDIO[ls.id + '-w' + vi] : null; if(ef) files.add(ef);
+      });
+      if(ls.dl) lessonAudioFiles(ls).forEach(f => files.add(f));
+    }
+    preloadFiles([...files]);
+  } catch(e){}
+}
 function vlGo(i, autoplay){
   if(!VL.on) return;
   VL.gen++;
   vlStopAudio();
+  vlPreloadLesson();
   VL.idx = i; VL.playing = !!autoplay;
   const step = VL.steps[i], gen = VL.gen;
   const _stg = document.getElementById('vlStage');
@@ -10308,13 +10368,17 @@ function wvPlayRec2(text, rate, speaker, gen, done){
 function wvPlayWords(text, speaker, gen, el, next){
   wbwStop();
   const fallback = () => wvPlayRec2(text, 0.6, speaker, gen, ok2 => { if(gen !== VL.gen) return; if(ok2) next(); else vlDemoFail(gen); });
-  const ok = playWordsSlow(text, { shadow: true, el: el || null, isPaused: () => !(VL && VL.on && VL.playing) },
+  /* v4.3 failStop：逐词里某词重试仍没声 → 停在该词报错（vlDemoFail），不走整句回退、不静默跳词；
+     整句回退只保留给「整句一个可播词都没有」的旧情形（playWordsSlow 返回 false / onFail）。 */
+  const ok = playWordsSlow(text, { shadow: true, el: el || null, failStop: true,
+      isPaused: () => !(VL && VL.on && VL.playing),
+      onWordFail: info => { if(gen === VL.gen) vlDemoFail(gen, '「' + info.key + '」这个词的录音没加载出来（网络卡住了）。点重新加载，再听一遍。'); } },
     () => { if(gen === VL.gen) next(); },
     () => { if(gen === VL.gen) fallback(); });
   if(!ok) fallback();
 }
-/* VL 示范彻底没声：停在当前段，给可见提示 + 重新加载，不推进 */
-function vlDemoFail(gen){
+/* VL 示范彻底没声：停在当前段，给可见提示 + 重新加载，不推进。msg 可选（逐词卡词时点名是哪个词） */
+function vlDemoFail(gen, msg){
   if(!VL || gen !== VL.gen) return;
   VL.playing = false;
   vlSetPlayUI();
@@ -10323,7 +10387,7 @@ function vlDemoFail(gen){
     const box = document.createElement('div');
     box.className = 'vl-fail';
     box.style.cssText = 'margin:0 0 12px;';
-    box.innerHTML = '<div class="mic-warn" style="margin:0;">这句的示范朗读没加载出来（网络或浏览器的问题）。</div>' +
+    box.innerHTML = '<div class="mic-warn" style="margin:0;">' + esc(msg || '这句的示范朗读没加载出来（网络或浏览器的问题）。') + '</div>' +
       '<button class="btn soft small" id="vlRetryDemo" type="button" style="margin-top:8px;">↻ 重新加载</button>';
     stage.prepend(box);
     const b = box.querySelector('#vlRetryDemo');
