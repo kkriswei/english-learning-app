@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610281812";
+var APP_BUILD = "v202610290825";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -4844,37 +4844,71 @@ function baihuaChunk(chunk){
 /* 共享播放通道：全应用录音播放复用同一个 Audio 元素，避免每次点播新建连接；
    preloadFiles 把当前课的录音提前拉进浏览器缓存，点播直接命中缓存。
    playSeq 让旧的看门狗/回调用在新播放开始后自动失效。 */
-let playSeq = 0, chanEl = null;
+let playSeq = 0, chanEl = null, chanEvtOff = null;
 function chanAudio(){ if(!chanEl){ chanEl = new Audio(); chanEl.preload = "auto"; } return chanEl; }
+/* v4.4 看门狗分两段（Doki 实测：除单词外点播放都没声音）：旧看门狗只认 currentTime 进度，
+   而文件「加载期」currentTime 恒为 0——国内慢网下拉一个 30–200KB 的整句/旁白文件，从点击
+   到出声常超 3.2s，还没下完就被判死 → playRec 失败 → speak 静默退到 iOS 主屏幕模式下常哑的
+   TTS，表现为没声音且无任何提示；单词文件才 ~7KB、下得快所以没事。两段口径：
+   - 加载期（currentTime 尚未推进过）：吃网络进度——progress/canplay/loadeddata/
+     canplaythrough 事件＋buffered 增长轮询刷新 lastProg；只要数据在流入就不许判死，
+     无进度判死线放宽到 CHAN_LOAD_DEAD_MS = 20s（与慢网相称）；
+   - 播放期（已出声）：维持 CHAN_PLAY_DEAD_MS = 3.2s 无进度判死，中途卡死快速失败走回退。
+   总 cap：出声后 = 出声时刻 + duration + 9s（duration 未知按 25s）；未出声 = 起播 +
+   20s 加载宽限 + duration（未知按 25s）+ 9s——慢网下 cap 不得先于加载宽限误杀长文件。 */
+const CHAN_LOAD_DEAD_MS = 20000;
+const CHAN_PLAY_DEAD_MS = 3200;
 function playFileOnce(file, onOk, onErr){
   ensureAudioData();
   const a = chanAudio();
   const mySeq = ++playSeq;
+  /* 共享单元素：上一场挂的网络进度监听先摘干净，别泄漏串到下一场 */
+  if(chanEvtOff){ try { chanEvtOff(); } catch(e){} chanEvtOff = null; }
   a.onended = null; a.onerror = null;
   curAudio = a;
-  let settled = false, lastCt = -1, lastProg = Date.now();
+  let settled = false, lastCt = 0, lastProg = Date.now(), lastBuf = 0, startedAt = 0;   /* lastCt 从 0 起：currentTime 必须真推进过（>0.03）才算「已出声」，否则加载期会被误判进播放期 */
   const t0 = Date.now();
+  const onNetProg = () => { if(!settled && mySeq === playSeq) lastProg = Date.now(); };
+  const PROG_EVTS = ["progress", "canplay", "loadeddata", "canplaythrough"];
+  PROG_EVTS.forEach(evName => { try { a.addEventListener(evName, onNetProg); } catch(e){} });
+  const offEvts = () => {
+    PROG_EVTS.forEach(evName => { try { a.removeEventListener(evName, onNetProg); } catch(e){} });
+    if(chanEvtOff === offEvts) chanEvtOff = null;
+  };
+  chanEvtOff = offEvts;
   const done = ok => {
     if(settled) return; settled = true;
     lastPlayEndAt = Date.now();
     clearInterval(iv);
+    offEvts();
     a.onended = null; a.onerror = null;
     if(curAudio === a) curAudio = null;
     if(ok){ if(onOk) onOk(); } else if(onErr) onErr();
   };
   const iv = setInterval(() => {
     if(settled) return;
-    if(mySeq !== playSeq){ clearInterval(iv); return; }
+    if(mySeq !== playSeq){ offEvts(); clearInterval(iv); return; }
     try {
       if(a.ended){ done(true); return; }
+      const now = Date.now();
       const ct = a.currentTime || 0;
-      if(ct > lastCt + 0.03){ lastCt = ct; lastProg = Date.now(); }
+      if(ct > lastCt + 0.03){ lastCt = ct; lastProg = now; if(!startedAt) startedAt = now; }
+      /* 加载期兜底轮询：个别浏览器 progress 事件稀疏，buffered 在涨也算有进度 */
+      if(!startedAt && a.buffered && a.buffered.length){
+        try { const be = a.buffered.end(a.buffered.length - 1); if(be > lastBuf + 0.05){ lastBuf = be; lastProg = now; } } catch(e){}
+      }
       const dur = a.duration;
-      const cap = (isFinite(dur) && dur > 0) ? dur * 1000 + 9000 : 25000;
-      /* 卡顿看门狗：播放中长时间没进度、且数据没准备好（网络拉不到）→ 判失败走回退，
-         不再像以前只有 onended/onerror、网络一卡就静默冻住 */
-      if(Date.now() - lastProg > 3200 && a.readyState < 3 && !a.paused){ done(false); return; }
-      if(Date.now() - t0 > cap){ done(false); return; }
+      const durMs = (isFinite(dur) && dur > 0) ? dur * 1000 : 25000;
+      const cap = startedAt ? (startedAt + durMs + 9000) : (t0 + CHAN_LOAD_DEAD_MS + durMs + 9000);
+      if(!startedAt){
+        /* 加载期：数据还在流入就不许判死；20s 一点进度都没有才判死走回退 */
+        if(now - lastProg > CHAN_LOAD_DEAD_MS && a.readyState < 3){ done(false); return; }
+      } else {
+        /* 播放期：卡顿看门狗——长时间没进度、且数据没准备好（网络拉不到）→ 判失败走回退，
+           不再像以前只有 onended/onerror、网络一卡就静默冻住 */
+        if(now - lastProg > CHAN_PLAY_DEAD_MS && a.readyState < 3 && !a.paused){ done(false); return; }
+      }
+      if(now > cap){ done(false); return; }
     } catch(e){}
   }, 400);
   a.onended = () => done(true);
@@ -5092,23 +5126,61 @@ function playWordsSlow(text, opts, onDone, onFail){
   return true;
 }
 /* ---------- 预加载：打开一课时把本课句子+逐词录音提前拉进缓存（只当前课） ---------- */
+/* v4.4 限流：旧实现给每个文件都 new 一个 Audio 立刻全量并发拉取——v4.3 起 VL 整课预加载
+   一次排进几百个文件，一起抢带宽，反而把当下要点播的整句/旁白文件挤到看门狗判死。
+   新实现：排队 + 并发上限 PRELOAD_CONCURRENCY=4；共享通道正在出声（curAudio 在播）时
+   暂停发放新预加载（已在下的不打断），播完后泵定时器自动续上。对话/发音页的旧调用点
+   量小，排队后行为等价、不回退。 */
 const preloadSet = new Set();
 const preloadPool = [];
 window.__preloadSet = preloadSet;
+const PRELOAD_CONCURRENCY = 4;
+const preloadQueue = [];
+let preloadActive = 0, preloadPumpTimer = null, preloadPumping = false;
+function preloadPlaybackActive(){
+  try { return !!(typeof curAudio !== "undefined" && curAudio && !curAudio.paused); } catch(e){ return false; }
+}
+function preloadPump(){
+  if(preloadPumping) return;
+  preloadPumping = true;
+  try {
+    while(preloadQueue.length && preloadActive < PRELOAD_CONCURRENCY){
+      if(preloadPlaybackActive()) break;   /* 让行：正在播的声音优先 */
+      const f = preloadQueue.shift();
+      preloadActive++;
+      let released = false;
+      const release = () => {
+        if(released) return; released = true;
+        preloadActive--;
+        preloadPump();
+      };
+      try {
+        const a = new Audio();
+        a.preload = "auto";
+        a.src = "assets/audio/" + f;
+        if(a.load) a.load();
+        preloadPool.push(a);
+        if(preloadPool.length > 600) preloadPool.splice(0, preloadPool.length - 600);
+        ["canplaythrough", "loadeddata", "error"].forEach(evName => { try { a.addEventListener(evName, release); } catch(e){} });
+        setTimeout(release, 30000);   /* 事件没来的兜底：30s 释放名额（文件继续在浏览器后台下） */
+      } catch(e){ released = true; preloadActive--; }
+    }
+  } finally { preloadPumping = false; }
+  if(preloadQueue.length && !preloadPumpTimer){
+    preloadPumpTimer = setInterval(() => {
+      if(!preloadQueue.length){ clearInterval(preloadPumpTimer); preloadPumpTimer = null; return; }
+      preloadPump();
+    }, 700);
+  }
+}
 function preloadFiles(files){
   (files || []).forEach(f => {
     if(!f || preloadSet.has(f)) return;
     preloadSet.add(f);
     if(typeof AUDIO_DATA !== "undefined" && AUDIO_DATA[f]) return;
-    try {
-      const a = new Audio();
-      a.preload = "auto";
-      a.src = "assets/audio/" + f;
-      if(a.load) a.load();
-      preloadPool.push(a);
-      if(preloadPool.length > 600) preloadPool.splice(0, preloadPool.length - 600);
-    } catch(e){}
+    preloadQueue.push(f);
   });
+  preloadPump();
 }
 function linesAudioFiles(lineItems){
   const set = new Set();
@@ -5216,12 +5288,22 @@ function makeUtter(text, rate, speaker){
   u.pitch = /[?？]\s*$/.test(text) ? 1.13 : 1.05;
   return u;
 }
+/* v4.4：整句录音「有文件但没播出来」（慢网加载被判死等）不许静默退 TTS——先给可见提示，
+   再用 TTS 顶上；原播放按钮可再点重试（网络缓过来或文件进了缓存后多半就能播）。
+   没录音文件的文本直接走 TTS 是正常路径，不提示。4s 内不重复弹，防连点/连播刷屏。 */
+let lastRecFailToastAt = 0;
+function recLoadFailToast(msg){
+  const now = Date.now();
+  if(now - lastRecFailToastAt < 4000) return;
+  lastRecFailToastAt = now;
+  toast(msg || "这句的录音没加载出来（网络慢），先用机器声顶替；再点一次播放可重试");
+}
 function speak(text, rate, speaker){
   shadowGen++;
   if(typeof stopShadow === "function") stopShadow();
   const base = (typeof rate === "number") ? rate : 0.98 * (state.speed || 1);
   clearTimeout(speakTimer);
-  if(playRec(text, base, speaker, null, () => speakTTS(text, base, speaker))) return;
+  if(playRec(text, base, speaker, null, () => { recLoadFailToast(); speakTTS(text, base, speaker); })) return;
   speakTTS(text, base, speaker);
 }
 function speakTTS(text, base, speaker){
@@ -5242,6 +5324,9 @@ function speakTTS(text, base, speaker){
   clearTimeout(speakTimer);
   speakTimer = setTimeout(() => speechSynthesis.cancel(), Math.max(5000, text.length * 480 / base));
 }
+/* v4.4：speakLines 断点——某行录音没播出来时停在该行的位置，再次以同一组 lines 调用
+   speakLines（如再点整段播放）时从该行重试续上，而不是从头再来或静默滑过去。 */
+let slResume = null;
 function speakLines(lines, rate, done){
   shadowGen++;
   if(typeof stopShadow === "function") stopShadow();
@@ -5251,6 +5336,8 @@ function speakLines(lines, rate, done){
   clearTimeout(speakTimer);   /* v3.26：上一场 speakTTS 的兜底 cancel 别在本场中途触发 */
   const base = (typeof rate === "number") ? rate : 0.95 * (state.speed || 1);
   let i = 0;
+  if(slResume && slResume.lines === lines && slResume.idx < lines.length){ i = slResume.idx; }
+  slResume = null;
   const ttsLine = (ln, advance) => {
     if(!("speechSynthesis" in window)){ toast("这个浏览器不支持朗读功能"); advance(); return; }
     const u = makeUtter(ln.text, base, ln.speaker);
@@ -5261,7 +5348,13 @@ function speakLines(lines, rate, done){
     if(i >= lines.length){ if(done) done(); return; }
     const ln = lines[i];
     const advance = () => { i++; chunkTimer = setTimeout(next, 320); };
-    if(playRec(ln.text, base, ln.speaker, advance, () => ttsLine(ln, advance))) return;
+    if(playRec(ln.text, base, ln.speaker, advance, () => {
+      /* v4.4：这一行「有录音但没播出来」→ 停在本行，不装作播过往下走、也不在哑 TTS 上
+         静默滑完：记断点 + 可见提示，再点整段播放从本行重试（与 v4.3 failStop 同哲学）。
+         没录音文件的行走 TTS 是正常路径（下面 ttsLine），不在此列。 */
+      slResume = { lines: lines, idx: i };
+      recLoadFailToast("录音没加载出来（网络慢），停在这一句了；再点一次整段播放，从这句继续");
+    })) return;
     ttsLine(ln, advance);
   };
   next();
