@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610290825";
+var APP_BUILD = "v202610300937";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -4858,6 +4858,21 @@ function chanAudio(){ if(!chanEl){ chanEl = new Audio(); chanEl.preload = "auto"
    20s 加载宽限 + duration（未知按 25s）+ 9s——慢网下 cap 不得先于加载宽限误杀长文件。 */
 const CHAN_LOAD_DEAD_MS = 20000;
 const CHAN_PLAY_DEAD_MS = 3200;
+/* v4.5 结算保证（Doki 实测两处冻死：视频课旁白段、对话句逐词读停在第 2 个词）：
+   v4.4 的两段看门狗仍留了一个洞——本场被别的播放抢占时（interval 发现 mySeq !==
+   playSeq）旧代码只自清 interval、永不回调，等待方（逐词链等）原地冻死；且若元素
+   停在「readyState≥3、currentTime 不推进、duration 巨大/未知」的状态，两段看门狗
+   都不触发（加载判死要求 readyState<3，总 cap 随 duration 膨胀），只剩天文数字的
+   cap 兜底。补两条结构性保证：
+   - 被抢占即结算：走 settleStale 只回调 onErr、不碰共享元素状态（新场已接管同一
+     元素，绝不能清它的 onended/onerror/curAudio）；迟到的 play() 拒绝、onended
+     等路径进 done() 时同样先查代次、转走 settleStale。
+   - 绝对硬上限 CHAN_HARD_CAP_MS = 45s：在 400ms 看门狗轮询内判定（不另起
+     setTimeout，免被 iOS 后台节流饿死），起播 45s 未 settle 强制判死；唯一例外
+     是已出声且正在健康播放（currentTime 近 1.5s 内有推进且 duration 已知）——
+     此时顺延给既有 duration 口径 cap 收尾（实测最长旁白文件 48.84s，不许硬上限
+     误杀合法长音频）。 */
+const CHAN_HARD_CAP_MS = 45000;
 function playFileOnce(file, onOk, onErr){
   ensureAudioData();
   const a = chanAudio();
@@ -4876,8 +4891,19 @@ function playFileOnce(file, onOk, onErr){
     if(chanEvtOff === offEvts) chanEvtOff = null;
   };
   chanEvtOff = offEvts;
-  const done = ok => {
+  let lastCtAt = 0;
+  /* 被抢占的结算：只回调 onErr。绝不能碰共享元素的状态（a.onended/onerror/
+     curAudio 已归新场），也不写 lastPlayEndAt（新场还在播、它的 done 会写）。 */
+  const settleStale = () => {
     if(settled) return; settled = true;
+    clearInterval(iv);
+    offEvts();
+    if(onErr) onErr();
+  };
+  const done = ok => {
+    if(settled) return;
+    if(mySeq !== playSeq){ settleStale(); return; }   /* 迟到的拒绝/结束事件：本场已被接管，转抢占结算 */
+    settled = true;
     lastPlayEndAt = Date.now();
     clearInterval(iv);
     offEvts();
@@ -4887,12 +4913,12 @@ function playFileOnce(file, onOk, onErr){
   };
   const iv = setInterval(() => {
     if(settled) return;
-    if(mySeq !== playSeq){ offEvts(); clearInterval(iv); return; }
+    if(mySeq !== playSeq){ settleStale(); return; }   /* v4.5：被抢占必须回调，不许让等待方冻死 */
     try {
       if(a.ended){ done(true); return; }
       const now = Date.now();
       const ct = a.currentTime || 0;
-      if(ct > lastCt + 0.03){ lastCt = ct; lastProg = now; if(!startedAt) startedAt = now; }
+      if(ct > lastCt + 0.03){ lastCt = ct; lastProg = now; lastCtAt = now; if(!startedAt) startedAt = now; }
       /* 加载期兜底轮询：个别浏览器 progress 事件稀疏，buffered 在涨也算有进度 */
       if(!startedAt && a.buffered && a.buffered.length){
         try { const be = a.buffered.end(a.buffered.length - 1); if(be > lastBuf + 0.05){ lastBuf = be; lastProg = now; } } catch(e){}
@@ -4909,6 +4935,13 @@ function playFileOnce(file, onOk, onErr){
         if(now - lastProg > CHAN_PLAY_DEAD_MS && a.readyState < 3 && !a.paused){ done(false); return; }
       }
       if(now > cap){ done(false); return; }
+      /* v4.5 绝对硬上限：在看门狗轮询内判定（不用独立 setTimeout，免被系统节流
+         饿死）：起播 45s 仍未 settle 强制判死；唯一顺延情形——已出声且 currentTime
+         近 1.5s 内有推进、duration 已知：健康长播交给上面 duration 口径 cap 收尾。 */
+      if(now - t0 > CHAN_HARD_CAP_MS){
+        const healthy = startedAt && !a.paused && lastCtAt && (now - lastCtAt < 1500) && isFinite(dur) && dur > 0;
+        if(!healthy){ done(false); return; }
+      }
     } catch(e){}
   }, 400);
   a.onended = () => done(true);
@@ -4930,7 +4963,14 @@ function playRec(text, rate, speaker, onDone, onFail){
   clearTimeout(chunkTimer);
   const finishFail = () => { if(onFail) onFail(); else if(onDone) onDone(); };
   if(useSlow){ /* 慢速版失败（缺失/损坏/卡顿）：退回常速版 */
-    playFileOnce(slowFile, () => { if(onDone) onDone(); }, () => playFileOnce(file, () => { if(onDone) onDone(); }, finishFail));
+    let slowSeq = 0;
+    playFileOnce(slowFile, () => { if(onDone) onDone(); }, () => {
+      /* v4.5：慢速这场若是被别的播放抢占而结算的（playSeq 已推过本场序号），不许再
+         链式发起常速版反抢新播放——直接走失败收尾，去留由调用方的代次守卫决定 */
+      if(slowSeq && playSeq !== slowSeq){ finishFail(); return; }
+      playFileOnce(file, () => { if(onDone) onDone(); }, finishFail);
+    });
+    slowSeq = playSeq;
   } else {
     playFileOnce(file, () => { if(onDone) onDone(); }, finishFail);
   }
@@ -5034,6 +5074,7 @@ function wbwFile(key){
   return AUDIO_MAP[key] || null;
 }
 var WBW_GAP_MS = 250;   /* 逐词读词间间隙：播完一个词，停 250ms 再播下一个 */
+var WBW_WORD_CAP_MS = 10000;   /* v4.5：逐词读单次尝试的链层上限——playFileOnce 万一在某种元素状态下迟迟不回调（加载看门狗 20s、硬上限 45s 都比一句词的耐心长），链条 10s 就按该词失败走既有口径（failStop 重试/停词、普通链 60ms 推进），不许整链冻在某个词上 */
 let wbwGen = 0, wbwTimer = null;
 function wbwStop(){
   wbwGen++;
@@ -5097,9 +5138,16 @@ function playWordsSlow(text, opts, onDone, onFail){
     clearHl();
     if(spans[wi]) spans[wi].classList.add("wbw-on");
     const playAttempt = retrying => {
-      playFileOnce(retrying ? it.file + "?retry=1" : it.file,
-        () => { playedOk++; if(gen === wbwGen && !halted) wbwTimer = setTimeout(stepWord, WBW_GAP_MS); },
-        () => {
+      /* v4.5 词级超时：本次尝试 10s 内没等到 playFileOnce 回调就按失败处理；
+         attSettled 保证真回调与超时只有一方生效，迟到的真回调被挡下不重复推进 */
+      let attSettled = false, attCap = null;
+      const onAttOk = () => {
+        if(attSettled) return; attSettled = true; if(attCap) clearTimeout(attCap);
+        playedOk++; if(gen === wbwGen && !halted) wbwTimer = setTimeout(stepWord, WBW_GAP_MS);
+      };
+      const onAttErr = () => {
+        if(attSettled) return; attSettled = true; if(attCap) clearTimeout(attCap);
+        {
           if(gen !== wbwGen || halted) return;
           if(opts.failStop && !retrying){
             /* 第一败（多为冷拉网络被 playFileOnce 的 3.2s 卡顿看门狗误杀）：同一词重拉重试，不推进 */
@@ -5118,7 +5166,13 @@ function playWordsSlow(text, opts, onDone, onFail){
             return;
           }
           wbwTimer = setTimeout(stepWord, 60);
-        });
+        }
+      };
+      playFileOnce(retrying ? it.file + "?retry=1" : it.file, onAttOk, onAttErr);
+      /* 上限定时器在发起播放之后才建：它管的是「发起之后的等待」，不许被误读成
+         出声前的人为延时（v4.3 口径）；万一回调先于定时器创建就已到达，
+         onAttOk/onAttErr 对 attCap 为 null 有防护、attSettled 也会挡下迟到的它 */
+      attCap = setTimeout(() => { onAttErr(); }, WBW_WORD_CAP_MS);
     };
     playAttempt(false);
   };
@@ -5300,10 +5354,11 @@ function recLoadFailToast(msg){
 }
 function speak(text, rate, speaker){
   shadowGen++;
+  const myShadowGen = shadowGen;   /* v4.5：本场代次——被后来播放抢占的迟到失败回调不许再弹提示/用 TTS 顶替朗读（会和新播放串声） */
   if(typeof stopShadow === "function") stopShadow();
   const base = (typeof rate === "number") ? rate : 0.98 * (state.speed || 1);
   clearTimeout(speakTimer);
-  if(playRec(text, base, speaker, null, () => { recLoadFailToast(); speakTTS(text, base, speaker); })) return;
+  if(playRec(text, base, speaker, null, () => { if(myShadowGen !== shadowGen) return; recLoadFailToast(); speakTTS(text, base, speaker); })) return;
   speakTTS(text, base, speaker);
 }
 function speakTTS(text, base, speaker){
@@ -5329,6 +5384,7 @@ function speakTTS(text, base, speaker){
 let slResume = null;
 function speakLines(lines, rate, done){
   shadowGen++;
+  const myShadowGen = shadowGen;   /* v4.5：本场代次——被抢占的迟到回调不许推进/记断点（新一场自有流程） */
   if(typeof stopShadow === "function") stopShadow();
   stopRec();
   if("speechSynthesis" in window) speechSynthesis.cancel();
@@ -5348,7 +5404,10 @@ function speakLines(lines, rate, done){
     if(i >= lines.length){ if(done) done(); return; }
     const ln = lines[i];
     const advance = () => { i++; chunkTimer = setTimeout(next, 320); };
-    if(playRec(ln.text, base, ln.speaker, advance, () => {
+    if(playRec(ln.text, base, ln.speaker,
+      () => { if(myShadowGen !== shadowGen) return; advance(); },
+      () => {
+      if(myShadowGen !== shadowGen) return;   /* v4.5：已被新一场接管，迟到失败不记断点不弹提示 */
       /* v4.4：这一行「有录音但没播出来」→ 停在本行，不装作播过往下走、也不在哑 TTS 上
          静默滑完：记断点 + 可见提示，再点整段播放从本行重试（与 v4.3 failStop 同哲学）。
          没录音文件的行走 TTS 是正常路径（下面 ttsLine），不在此列。 */
@@ -5439,7 +5498,7 @@ function shStep(gen){
     if(st.gap >= 1000) shMicMonStart(); else shMicMonStop();
   };
   if(st.zh){
-    if(playRec(st.text, st.rate, null, advance, () => shZhTTS(st, advance, () => shDemoFail(gen)))) return;
+    if(playRec(st.text, st.rate, null, advance, () => { if(SH && gen === SH.gen) shZhTTS(st, advance, () => shDemoFail(gen)); })) return;   /* v4.5：迟到失败先查 SH 代次，不许拿旧句的中文 TTS 串进新一场 */
     shZhTTS(st, advance, () => shDemoFail(gen));
     return;
   }
@@ -9832,6 +9891,62 @@ function vlVisHTML(spec, ls){
 /* ================= 视频课：播放器 ================= */
 const VL = { on: false, id: null, steps: [], idx: 0, playing: false, gen: 0, audio: null, q: null, done: false };
 function vlNar(f){ return 'assets/audio/nar/' + f + '.mp3'; }
+/* v4.5：VL 自有 Audio 统一看门狗（Doki 实测语法课「看图学」段冻死：旁白走
+   VL.audio = new Audio(...)，旧代码只靠 onended/onerror/play().catch 推进——连接
+   挂死时不报错、不出声、不结束，整段永久等待，界面停在播放态）。
+   vlPlayAudio(a, gen, onOk, onFail)：接管一个已设 src 的 Audio 并设为 VL.audio，
+   保证恰好结算一次：
+   - ended → onOk；error 事件 / play() 被拒 → onFail；
+   - 无进度看门狗 VL_AUD_WD_MS = 8s：currentTime 不推进且 readyState<3 持续 8s
+     判死（progress/canplay 事件与 buffered 增长刷新计时；play() promise 迟迟不
+     resolve 且未出声同此口径——lastProg 自起播起算、无任何进度即在 8s 判死）；
+     出声后中途冻结同口径判死；
+   - 绝对上限：未出声 30s、出声后 startedAt + duration + 15s（duration 未知按 30s）；
+   - 暂停不计时：VL.playing 为假且元素处于暂停态（vlTogglePlay 暂停）时不累计
+     卡死时间，恢复播放后继续看护；gen 失效（切段/关课）→ 静默摘除、不回调。 */
+const VL_AUD_WD_MS = 8000;
+function vlPlayAudio(a, gen, onOk, onFail){
+  VL.audio = a;
+  let settled = false, lastCt = 0, lastProg = Date.now(), lastBuf = 0, startedAt = 0;
+  const t0 = Date.now();
+  const PROG_EVTS = ["progress", "canplay", "loadeddata", "canplaythrough"];
+  const onProg = () => { if(!settled) lastProg = Date.now(); };
+  PROG_EVTS.forEach(evName => { try { a.addEventListener(evName, onProg); } catch(e){} });
+  const off = () => {
+    clearInterval(iv);
+    PROG_EVTS.forEach(evName => { try { a.removeEventListener(evName, onProg); } catch(e){} });
+  };
+  const settle = ok => {
+    if(settled) return; settled = true; off();
+    a.onended = null; a.onerror = null;
+    if(gen !== VL.gen || !VL.on) return;   /* 已切段/关课：旧段回调一律不落，新段自有流程 */
+    if(ok){ if(onOk) onOk(); } else if(onFail) onFail();
+  };
+  const iv = setInterval(() => {
+    if(settled) return;
+    if(gen !== VL.gen || !VL.on) { settle(0); return; }
+    try {
+      if(a.ended){ settle(1); return; }
+      if(!VL.playing && a.paused){ lastProg = Date.now(); return; }   /* 用户暂停：不累计卡死时间 */
+      const now = Date.now();
+      const ct = a.currentTime || 0;
+      if(ct > lastCt + 0.03){ lastCt = ct; lastProg = now; if(!startedAt) startedAt = now; }
+      if(!startedAt && a.buffered && a.buffered.length){
+        try { const be = a.buffered.end(a.buffered.length - 1); if(be > lastBuf + 0.05){ lastBuf = be; lastProg = now; } } catch(e){}
+      }
+      const dur = a.duration;
+      const durMs = (isFinite(dur) && dur > 0) ? dur * 1000 : 30000;
+      const cap = startedAt ? (startedAt + durMs + 15000) : (t0 + 30000);
+      if(now - lastProg > VL_AUD_WD_MS && a.readyState < 3){ settle(0); return; }
+      if(now > cap){ settle(0); return; }
+    } catch(e){}
+  }, 400);
+  a.onended = () => settle(1);
+  a.onerror = () => settle(0);
+  const p = a.play();
+  if(p && p.catch) p.catch(() => settle(0));
+  return a;
+}
 const VL_SCENES = ["scene-classroom","scene-home","scene-city","scene-food","scene-work","scene-nature"];
 function vlSceneImg(ls){ return '<img class="vl-scene" src="assets/img/' + VL_SCENES[Math.min(VL_SCENES.length - 1, ls.stageIdx || 0)] + '.svg" alt="" loading="lazy">'; }
 function vlBuildSteps(id){
@@ -10072,14 +10187,11 @@ function vlAdvance(gen){
 function vlPlayStep(step, gen){
   if(step.play){ step.play(gen); return; }
   if(step.k === 'nar'){
+    /* v4.5：旁白走统一看门狗——挂死/失败不再永久等：提示后跳过本段继续（旁白是讲解，不许堵死整课） */
     const a = new Audio(vlNar(step.f));
-    VL.audio = a;
-    let moved = false;
-    const next = () => { if(!moved){ moved = true; vlAdvance(gen); } };
-    a.onended = next;
-    a.onerror = () => setTimeout(next, 600);
-    const p = a.play();
-    if(p && p.catch) p.catch(() => setTimeout(next, 900));
+    vlPlayAudio(a, gen,
+      () => vlAdvance(gen),
+      () => { recLoadFailToast('这段讲解的录音没加载出来（网络卡住了），先跳过这段'); vlAdvance(gen); });
   } else if(step.k === 'ex'){
     const ls = LESSON_MAP[VL.id], ex = ls.g[3][step.i];
     const playEx = () => {
@@ -10090,12 +10202,11 @@ function vlPlayStep(step, gen){
       chain(() => setTimeout(() => { if(gen === VL.gen) chain(() => vlAdvance(gen)); }, 380));
     };
     if(step.lead){
+      /* v4.5：开场旁白同走统一看门狗——失败提示后跳过旁白、直接进例句（不许堵住本段） */
       const a = new Audio(vlNar('shared-listen'));
-      VL.audio = a;
-      let started = false;
-      const go = () => { if(!started){ started = true; if(gen === VL.gen) playEx(); } };
-      a.onended = go; a.onerror = () => setTimeout(go, 400);
-      const p = a.play(); if(p && p.catch) p.catch(() => setTimeout(go, 500));
+      vlPlayAudio(a, gen,
+        () => { if(gen === VL.gen) playEx(); },
+        () => { recLoadFailToast('开头的讲解没加载出来（网络卡住了），先直接听例句'); if(gen === VL.gen) playEx(); });
     } else playEx();
   }
 }
@@ -10163,9 +10274,9 @@ function vlQuizRender(){
   if(pkb) pkb.addEventListener('click', () => { const t = document.getElementById('vlPeekTxt'); if(t){ t.hidden = !t.hidden; pkb.textContent = t.hidden ? '👀 看一眼句子' : '👀 收起句子'; } });
 }
 function vlQuizSpeak(f){
+  /* v4.5：反馈音（答对/答错/过关）同走统一看门狗接管 VL.audio，失败静默结算（无链条在等它） */
   const a = new Audio(vlNar(f));
-  VL.audio = a;
-  const p = a.play(); if(p && p.catch) p.catch(() => {});
+  vlPlayAudio(a, VL.gen, null, null);
 }
 function vlQuizPick(i, btn){
   if(!VL.q || VL.q.locked) return;
@@ -10432,11 +10543,9 @@ function wvPlayPath(path, gen, done){
   const fin = () => { if(!settled){ settled = true; done(); } };
   try { ensureAudioData(); } catch(e){}
   const a = new Audio((typeof AUDIO_DATA !== 'undefined' && AUDIO_DATA[path]) || ('assets/audio/' + path));
-  VL.audio = a;
-  a.onended = fin;
-  a.onerror = () => wvLater(fin, 350);
-  const p = a.play(); if(p && p.catch) p.catch(() => wvLater(fin, 600));
-  wvLater(fin, 25000);
+  /* v4.5：改走统一看门狗（取代旧 25s 定时兜底）：无进度约 8s 即判败——提示后照旧
+     fin() 继续链条（偏方/例句讲解是旁白，失败不堵课）；结束/出错同样 fin()。 */
+  vlPlayAudio(a, gen, fin, () => { recLoadFailToast('这段录音没加载出来（网络卡住了），先继续'); fin(); });
 }
 function wvPlayRec(text, rate, speaker, gen, done){
   let settled = false;
