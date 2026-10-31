@@ -28,7 +28,7 @@
    检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
    （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610300937";
+var APP_BUILD = "v202610310940";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -4873,6 +4873,93 @@ const CHAN_PLAY_DEAD_MS = 3200;
      此时顺延给既有 duration 口径 cap 收尾（实测最长旁白文件 48.84s，不许硬上限
      误杀合法长音频）。 */
 const CHAN_HARD_CAP_MS = 45000;
+/* v4.6 fetch 式音频缓存层（Doki 实测：v4.3 预加载后 VL 逐词仍吃词/反应慢）：preloadFiles
+   靠 new Audio + preload 属性预热——iOS Safari 对从没播放过的媒体元素基本不下载数据，
+   预热在她手机上近乎无效，逐词链每个词轮到时仍冷拉（国内→GitHub Pages 1–3s/个），
+   表现为逐词迟到、慢、个别词失败被吞/停。改用 fetch 真下载：文件以 blob 存内存，
+   播放走 objectURL 本地读、加载期近零。AUDIO_BLOB：file → objectURL（Map 保插入序、
+   淘汰最旧）；AUDIO_FETCHING：file → Promise<objectURL|null>，在途去重；fetch 失败
+   只回 null、不抛给调用方（调用方一律回退媒体直拉旧路径）。页面级常驻、不落盘。 */
+const AUDIO_BLOB = new Map();
+const AUDIO_FETCHING = new Map();
+const AUDIO_BLOB_CAP = 1500;   /* 护栏：整课量级几百个小文件（数 MB）；超量按插入序淘汰最旧并 revokeObjectURL */
+const AUDIO_FETCH_WAIT_MS = 6000;   /* playFileOnce 等在途 fetch 落地的上限：等不到就回退直拉，不无限等 */
+window.__AUDIO_BLOB = AUDIO_BLOB;
+function audioBlobPut(file, url){
+  if(AUDIO_BLOB.has(file)){ const old = AUDIO_BLOB.get(file); AUDIO_BLOB.delete(file); try { URL.revokeObjectURL(old); } catch(e){} }
+  AUDIO_BLOB.set(file, url);
+  while(AUDIO_BLOB.size > AUDIO_BLOB_CAP){
+    const k = AUDIO_BLOB.keys().next().value;
+    const u = AUDIO_BLOB.get(k); AUDIO_BLOB.delete(k);
+    try { URL.revokeObjectURL(u); } catch(e){}
+  }
+}
+function audioBlobEvict(file){
+  if(!AUDIO_BLOB.has(file)) return;
+  const u = AUDIO_BLOB.get(file); AUDIO_BLOB.delete(file);
+  try { URL.revokeObjectURL(u); } catch(e){}
+}
+function fetchAudioFile(file){
+  if(!file) return Promise.resolve(null);
+  ensureAudioData();
+  if(typeof AUDIO_DATA !== "undefined" && AUDIO_DATA[file]) return Promise.resolve(null);   /* 已内嵌 base64，本来就是本地读，无需缓存 */
+  if(AUDIO_BLOB.has(file)) return Promise.resolve(AUDIO_BLOB.get(file));
+  if(AUDIO_FETCHING.has(file)) return AUDIO_FETCHING.get(file);
+  if(typeof fetch !== "function") return Promise.resolve(null);   /* 环境无 fetch：静默走旧直拉 */
+  let p;
+  p = (async () => {
+    try {
+      const r = await fetch("assets/audio/" + file);
+      if(!r || !r.ok) throw new Error("fetch failed");
+      const b = await r.blob();
+      const u = URL.createObjectURL(b);
+      audioBlobPut(file, u);
+      return u;
+    } catch(e){ return null; }
+    finally { if(AUDIO_FETCHING.get(file) === p) AUDIO_FETCHING.delete(file); }
+  })();
+  AUDIO_FETCHING.set(file, p);
+  return p;
+}
+/* 预取泵：与 v4.4 preloadFiles 同口径——并发 ≤4、共享通道正在出声时让行、700ms 巡检
+   续泵；队列支持 front 插队（VL 当前段/下一段优先于整课 bulk 前排）。 */
+const audioPrefetchSet = new Set();
+const audioPrefetchQueue = [];
+let audioPrefetchActive = 0, audioPrefetchTimer = null, audioPrefetchPumping = false;
+const AUDIO_PREFETCH_CONCURRENCY = 4;
+function audioPrefetchPump(){
+  if(audioPrefetchPumping) return;
+  audioPrefetchPumping = true;
+  try {
+    while(audioPrefetchQueue.length && audioPrefetchActive < AUDIO_PREFETCH_CONCURRENCY){
+      if(preloadPlaybackActive()) break;   /* 让行：正在播的声音优先（与 preloadFiles 同探针） */
+      const f = audioPrefetchQueue.shift();
+      if(AUDIO_BLOB.has(f) || AUDIO_FETCHING.has(f) || (typeof AUDIO_DATA !== "undefined" && AUDIO_DATA[f])) continue;
+      audioPrefetchActive++;
+      fetchAudioFile(f).then(() => { audioPrefetchActive--; audioPrefetchPump(); });
+    }
+  } finally { audioPrefetchPumping = false; }
+  if(audioPrefetchQueue.length && !audioPrefetchTimer){
+    audioPrefetchTimer = setInterval(() => {
+      if(!audioPrefetchQueue.length){ clearInterval(audioPrefetchTimer); audioPrefetchTimer = null; return; }
+      audioPrefetchPump();
+    }, 700);
+  }
+}
+function prefetchAudio(files, front){
+  const fresh = [];
+  (files || []).forEach(f => {
+    if(!f) return;
+    if(AUDIO_BLOB.has(f) || (typeof AUDIO_DATA !== "undefined" && AUDIO_DATA[f])) return;
+    const qi = audioPrefetchQueue.indexOf(f);
+    if(qi >= 0) audioPrefetchQueue.splice(qi, 1);   /* 已在队：摘出来按本次优先级重新排位 */
+    else if(audioPrefetchSet.has(f) && AUDIO_FETCHING.has(f)) return;   /* 已在下载中，不重复排队 */
+    audioPrefetchSet.add(f);
+    fresh.push(f);
+  });
+  if(fresh.length){ if(front) audioPrefetchQueue.unshift(...fresh); else audioPrefetchQueue.push(...fresh); }
+  audioPrefetchPump();
+}
 function playFileOnce(file, onOk, onErr){
   ensureAudioData();
   const a = chanAudio();
@@ -4882,6 +4969,7 @@ function playFileOnce(file, onOk, onErr){
   a.onended = null; a.onerror = null;
   curAudio = a;
   let settled = false, lastCt = 0, lastProg = Date.now(), lastBuf = 0, startedAt = 0;   /* lastCt 从 0 起：currentTime 必须真推进过（>0.03）才算「已出声」，否则加载期会被误判进播放期 */
+  let srcSet = false;   /* v4.6：本场是否已给元素设过 src——在途 fetch 等待期还没设源时，元素残留的上一场 ended/currentTime 不许冒充本场进度（否则看门狗会把新场误判成「已播完」无声结算） */
   const t0 = Date.now();
   const onNetProg = () => { if(!settled && mySeq === playSeq) lastProg = Date.now(); };
   const PROG_EVTS = ["progress", "canplay", "loadeddata", "canplaythrough"];
@@ -4915,12 +5003,12 @@ function playFileOnce(file, onOk, onErr){
     if(settled) return;
     if(mySeq !== playSeq){ settleStale(); return; }   /* v4.5：被抢占必须回调，不许让等待方冻死 */
     try {
-      if(a.ended){ done(true); return; }
+      if(srcSet && a.ended){ done(true); return; }
       const now = Date.now();
-      const ct = a.currentTime || 0;
+      const ct = srcSet ? (a.currentTime || 0) : 0;
       if(ct > lastCt + 0.03){ lastCt = ct; lastProg = now; lastCtAt = now; if(!startedAt) startedAt = now; }
       /* 加载期兜底轮询：个别浏览器 progress 事件稀疏，buffered 在涨也算有进度 */
-      if(!startedAt && a.buffered && a.buffered.length){
+      if(srcSet && !startedAt && a.buffered && a.buffered.length){
         try { const be = a.buffered.end(a.buffered.length - 1); if(be > lastBuf + 0.05){ lastBuf = be; lastProg = now; } } catch(e){}
       }
       const dur = a.duration;
@@ -4947,9 +5035,31 @@ function playFileOnce(file, onOk, onErr){
   a.onended = () => done(true);
   a.onerror = () => done(false);
   try { a.pause(); } catch(e){}
-  a.src = AUDIO_DATA[file] || ("assets/audio/" + file);
-  const p = a.play();
-  if(p && p.catch) p.catch(() => done(false));
+  /* v4.6 选源：内嵌 data → blob 缓存（本地读、加载期近零）→ 等在途 fetch 落地 → 媒体直拉。
+     ?retry=1 破缓存重试：先淘汰该文件的 blob 缓存（别把坏数据再播一遍），本场照旧直拉。 */
+  const startWith = src => {
+    srcSet = true;
+    a.src = src;
+    const p = a.play();
+    if(p && p.catch) p.catch(() => done(false));
+  };
+  if(file.indexOf("?retry=1") >= 0) audioBlobEvict(file.replace(/\?retry=1.*$/, ""));
+  if(AUDIO_DATA[file]) startWith(AUDIO_DATA[file]);
+  else if(AUDIO_BLOB.has(file)) startWith(AUDIO_BLOB.get(file));
+  else if(AUDIO_FETCHING.has(file)){
+    /* 该文件正在 fetch：别让媒体元素与 fetch 抢同一份数据——等它落地（上限
+       AUDIO_FETCH_WAIT_MS，等不到/失败就回退直拉）；等待期间本场若被抢占就不碰
+       已被新场接管的元素，看门狗 interval 会走 settleStale 结算本场。 */
+    let launched = false;
+    const launch = url => {
+      if(launched) return; launched = true;
+      if(settled || mySeq !== playSeq) return;
+      startWith(url || ("assets/audio/" + file));
+    };
+    AUDIO_FETCHING.get(file).then(u => launch(u));
+    setTimeout(() => launch(null), AUDIO_FETCH_WAIT_MS);
+  }
+  else startWith("assets/audio/" + file);
   return true;
 }
 function playRec(text, rate, speaker, onDone, onFail){
@@ -5176,6 +5286,11 @@ function playWordsSlow(text, opts, onDone, onFail){
     };
     playAttempt(false);
   };
+  /* v4.6 开局抓齐：本句全部词文件此刻并行 fetch 进 blob 缓存——词文件才 ~7KB、整句
+     十几个，直接调 fetchAudioFile、不走限流泵（泵是给整课几百个文件排队用的，当前
+     句不许排队等）。链推进到某词时：已落地 → playFileOnce 命中 blob 本地播；在途 →
+     playFileOnce 等其 promise（≤6s，计入本词 10s 上限口径）；失败 → 回退直拉旧路。 */
+  items.forEach(it => { if(it.file) fetchAudioFile(it.file); });
   stepWord();
   return true;
 }
@@ -10105,10 +10220,12 @@ function vlSetPlayUI(){
 /* v4.3 视频课整课预加载：VL 此前从不预加载，逐词链每个词点到才冷拉网络文件（国内拉
    GitHub Pages 常 1~3s），是「老师发音前等约 3 秒」的主因。进课/切段时把本课旁白、
    跟读例句的整句录音（常速+慢速）与逐词录音、单词课/对话课的全部录音一次性排进
-   preloadFiles 预热（preloadSet 去重，切段重复调用近乎零成本），旁白播放期间就拉完。 */
+   预热队列（去重，切段重复调用近乎零成本），旁白播放期间就拉完。
+   v4.6：预热管道由 preloadFiles（Audio preload，iOS 近乎不下载）换成 prefetchAudio
+   （fetch 真下载进 blob 缓存）；文件集构建口径不变。 */
 function vlPreloadLesson(){
   try {
-    if(!VL.id || typeof preloadFiles !== 'function') return;
+    if(!VL.id || typeof prefetchAudio !== 'function') return;
     const files = new Set();
     const addSent = t => {
       if(!t) return;
@@ -10129,14 +10246,58 @@ function vlPreloadLesson(){
       });
       if(ls.dl) lessonAudioFiles(ls).forEach(f => files.add(f));
     }
-    preloadFiles([...files]);
+    prefetchAudio([...files]);
   } catch(e){}
+}
+/* v4.6 段级文件集（段级前瞻用）：与 vlPreloadLesson 同口径取文件、只取一段的量——
+   旁白段 = 旁白文件；例句段 = 开场旁白（lead 时）+ 整句常速/慢速 + 逐词；单词段 =
+   该词录音/慢速 + 例句 + 偏方 + 例句讲解；对话段 = 按步序对应当句的全套（整句/慢速/
+   中文/逐词）；小测段无固定文件集，返回空。 */
+function vlStepFiles(idx){
+  const files = new Set();
+  try {
+    const st = (VL.steps || [])[idx];
+    if(!st) return [];
+    const ls = (typeof LESSON_MAP !== 'undefined') ? LESSON_MAP[VL.id] : null;
+    const addSent = t => {
+      if(!t) return;
+      const sf = (typeof AUDIO_MAP !== 'undefined') ? AUDIO_MAP[t] : null;
+      if(sf){ files.add(sf); files.add(sf.replace(/\.mp3$/, '-ss.mp3')); }
+      wbwParse(t).forEach(sg => { if(sg.core){ const wf = wbwFile(sg.key); if(wf) files.add(wf); } });
+    };
+    if(st.k === 'nar' && st.f) files.add('nar/' + st.f + '.mp3');
+    if(st.k === 'ex' && ls && ls.g && ls.g[3] && ls.g[3][st.i]){
+      if(st.lead) files.add('nar/shared-listen.mp3');
+      addSent(ls.g[3][st.i][0]);
+    }
+    if(st.k === 'wv' && ls){
+      const wm = st.wvUid ? String(st.wvUid).match(/-w(\d+)$/) : null;
+      if(wm && ls.v && ls.v[+wm[1]]){
+        const v = ls.v[+wm[1]], vi = +wm[1];
+        const wf = AUDIO_MAP[v[0]]; if(wf){ files.add(wf); files.add(wf.replace(/\.mp3$/, '-ss.mp3')); }
+        addSent(v[3]);
+        const hf = (typeof HOOK_AUDIO !== 'undefined') ? HOOK_AUDIO[String(v[0]).toLowerCase()] : null; if(hf) files.add(hf);
+        const ef = (typeof EXCN_AUDIO !== 'undefined') ? EXCN_AUDIO[ls.id + '-w' + vi] : null; if(ef) files.add(ef);
+      } else if(ls.dl && ls.dl.length){
+        /* 对话课 steps 构建序：[0]=开场 nar、[1..dl.length]=逐句、其后是整段连播段 */
+        const li = idx - 1;
+        if(li >= 0 && li < ls.dl.length) linesAudioFiles([{ d: ls.dl[li] }]).forEach(f => files.add(f));
+        else lessonAudioFiles(ls).forEach(f => files.add(f));
+      }
+    }
+  } catch(e){}
+  return [...files];
 }
 function vlGo(i, autoplay){
   if(!VL.on) return;
   VL.gen++;
   vlStopAudio();
   vlPreloadLesson();
+  /* v4.6 段级前瞻：下一段与当前段的文件插到预取队列最前（先排下一段、再排当前段，
+     队列头最终为 当前段 → 下一段 → 整课 bulk）——本段在播时后台把下一段下完，
+     切过去时旁白/逐词已是本地 blob，不再逐个冷拉。 */
+  prefetchAudio(vlStepFiles(i + 1), true);
+  prefetchAudio(vlStepFiles(i), true);
   VL.idx = i; VL.playing = !!autoplay;
   const step = VL.steps[i], gen = VL.gen;
   const _stg = document.getElementById('vlStage');
