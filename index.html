@@ -11,7 +11,7 @@
    APP_BUILD 是构建标记：源文件/工件里保持占位符（开发态，跳过检查）；
    部署时主线把它替换成本次构建号，并在仓库根放 version.json（格式 {"v": "构建号"}）。
    检查点：①页面加载即查（v3.7 原行为）；②visibilitychange 回到前台时查；
-   ③页面存活期间每 10 分钟查（页面隐藏时跳过这一轮）。任一检查发现版本不同，
+   ③页面存活期间每 60 秒查（v4.7 由 10 分钟加密；页面隐藏时跳过这一轮）。任一检查发现版本不同，
    就带 ?v=<新版> 跳转，让长缓存旧页面的手机（iOS Safari/主屏幕图标）自动换到新版。
    v3.14 动因：桌面图标（standalone）长会话里页面实例可连续存活数小时不重载，
    只在加载时检查的话，新版上线后学习者仍在旧页面上跑（2026-10-23 实锤：
@@ -25,17 +25,22 @@
    免得把正当跳转误杀。比对按目标版本：seen === 目标版本才拦。所以同一会话里
    先跳到 A 版、之后又发布 B 版，B ≠ 已记的 A，不会被守卫误杀，照样跳；
    反过来若跳过去后服务端仍回同一版本（缓存未刷新），seen 命中就不再跳，防死循环。
-   检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs } 注入更短的值
-   （冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认 10 分钟 / 15 秒）。
+   检查间隔可经 window.__VERCHECK_TIMING = { midMs, retryMs, fetchMs, forceMs } 注入
+   更短的值（冒烟用，与 __SR_TIMING 同一种注入口径；生产不设该变量，走默认
+   60 秒 / 15 秒 / 拉取超时 8 秒 / 忙碌顺延上限 5 分钟）。v4.7 加固三件：version.json
+   拉取带 8 秒超时（旧版无超时，fetch 挂起＝整轮检查永不返回、永不跳版）；存活期
+   轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
+   可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610310940";
+var APP_BUILD = "v202610311102";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
+  var pendingSince = 0;    /* v4.7：pendingVer 首次被记下的时刻（忙碌顺延上限的起算点） */
   var jumped = false;      /* 本文档已执行跳转（replace 后文档即将卸载，后续检查全停） */
   function isDev() { return !APP_BUILD || APP_BUILD === "__" + "BUILD__"; }
   function timing() {
-    var d = { midMs: 600000, retryMs: 15000 };
+    var d = { midMs: 60000, retryMs: 15000, fetchMs: 8000, forceMs: 300000 };   /* v4.7：存活期轮询 10 分钟→60 秒（新版更快达）；fetchMs＝version.json 拉取超时（挂起不许把整轮检查拖死）；forceMs＝忙碌顺延上限（只挡播放时满 5 分钟强制跳，录音/打分不强跳） */
     try {
       var o = (typeof window !== "undefined" && window.__VERCHECK_TIMING) || {};
       for (var k in d) if (typeof o[k] === "number" && o[k] > 0) d[k] = o[k];
@@ -43,34 +48,63 @@ var APP_BUILD = "v202610310940";
     return d;
   }
   function doJump(v) {
-    jumped = true; pendingVer = null;
+    jumped = true; pendingVer = null; pendingSince = 0;
     try { sessionStorage.setItem(KEY, v); } catch (e) {}   /* 守卫只在真正跳转这一刻写 */
     var url = location.pathname + "?v=" + encodeURIComponent(v) + (location.hash || "");
     if (typeof window !== "undefined" && window.__NAV_LOG) window.__NAV_LOG.push(url);
     location.replace(url);
   }
+  function busyKind() {
+    /* v4.7：忙碌的种类——主脚本 __APP_BUSY_KIND 报 record（录音中）/ score（打分
+       转写中）/ play（只是播放或视频课）/ ""（空闲）。老页面没有这个函数时返回
+       ""，tryJump 按「非 record/score」处理：仍受 forceMs 上限保护，不会永久卡住。 */
+    try { if (typeof window !== "undefined" && window.__APP_BUSY_KIND) return window.__APP_BUSY_KIND() || ""; } catch (e) {}
+    return "";
+  }
   function tryJump(v) {
     var seen = null;
     try { seen = sessionStorage.getItem(KEY); } catch (e) {}
-    if (seen === v) { pendingVer = null; return; }   /* 已为这个版本跳过：防循环；版本再变（≠seen）不拦 */
+    if (seen === v) { pendingVer = null; pendingSince = 0; return; }   /* 已为这个版本跳过：防循环；版本再变（≠seen）不拦 */
     var busy = false;
     try { busy = !!(typeof window !== "undefined" && window.__APP_BUSY && window.__APP_BUSY()); } catch (e) { busy = false; }
-    if (busy) { pendingVer = v; return; }            /* 忙碌：只记目标，不打断、不写守卫 */
+    if (busy) {
+      if (pendingVer !== v || !pendingSince) { pendingVer = v; pendingSince = Date.now(); }   /* 只记目标，不打断、不写守卫 */
+      /* v4.7 顺延上限：忙的只是播放/视频课（kind=play 或未知）且已挡满 forceMs——
+         播放可中断、进度在本地/云端不丢，强制跳，别让长播把新版永久挡在门外；
+         录音/打分（record/score）绝不强跳，继续等，会话一结束补跳定时器立即跳。 */
+      var kind = busyKind();
+      if (kind !== "record" && kind !== "score" && Date.now() - pendingSince >= timing().forceMs) doJump(v);
+      return;
+    }
     doJump(v);
   }
   function checkNow() {
     if (isDev() || jumped) return;
     if (typeof fetch !== "function") return;
-    fetch("version.json?ts=" + Date.now(), { cache: "no-store" }).then(function (r) {
+    /* v4.7：拉 version.json 必须有超时——旧实现无超时，她的网络下 fetch 一旦挂起
+       （连接半死不活），这一轮检查永远不回来、版本永远跳不过去（疑为「卡旧版/
+       旧内容」主因）。AbortController 到点 abort，本轮静默放弃，下一轮（60 秒后
+       或回前台）重试。不支持 AbortController 的环境退化为无信号 fetch（同旧行为）。 */
+    var ctl = null, to = null;
+    try {
+      if (typeof AbortController !== "undefined") {
+        ctl = new AbortController();
+        to = setTimeout(function () { try { ctl.abort(); } catch (e) {} }, timing().fetchMs);
+      }
+    } catch (e) { ctl = null; }
+    var opts = { cache: "no-store" };
+    if (ctl) opts.signal = ctl.signal;
+    fetch("version.json?ts=" + Date.now(), opts).then(function (r) {
+      if (to) { clearTimeout(to); to = null; }
       if (!r || !r.ok) return null;
       return r.json();
     }).then(function (j) {
       try {
         if (!j || !j.v) return;
-        if (j.v === APP_BUILD) { pendingVer = null; return; }   /* 已是最新 */
+        if (j.v === APP_BUILD) { pendingVer = null; pendingSince = 0; return; }   /* 已是最新 */
         tryJump(j.v);
       } catch (e) {}
-    }).catch(function () {}); /* 离线/拉不到就静默忽略，页面照常使用 */
+    }).catch(function () { if (to) { clearTimeout(to); to = null; } }); /* 离线/超时/拉不到就静默忽略，页面照常使用，下一轮再查 */
   }
   try {
     if (isDev()) return;                  /* 开发态/工件态：不检查、不设定时器（v3.7 冒烟口径不变） */
@@ -99,6 +133,23 @@ var APP_BUILD = "v202610310940";
     }
   } catch (e) {}
 })();
+    </script>
+    <script>
+/* ===== v4.7 音频会话类别：静音模式下点播也要有声 =====
+   iOS 上网页 <audio> 默认走 ambient（环境）类别，手机开着静音模式（状态栏出现
+   铃铛带斜杠图标）时被系统消音——2026-10-31 学习者实锤：满格 5G、视频课页面
+   在播、全部录音没声音；Chris 定调：不让用户改任何设置，App 自己保证有声。
+   Web Audio Session API（iOS 17+ Safari）把 navigator.audioSession.type 设为
+   "playback" 后，媒体播放按播放类别出声、静音开关不再消音（与音乐/视频 App
+   同口径）。不支持的环境（无 navigator.audioSession）静默降级、行为不变。
+   该属性可能被系统重置，故除页面脚本最早期先设一次外，还在每次 pointerdown
+   （用户手势入口）、视频课打开/切段、共享通道每次起播前经 ensurePlaybackSession
+   重申——全部收口到这一个函数，不许各处散写。 */
+function ensurePlaybackSession(){
+  try { if (typeof navigator !== "undefined" && navigator.audioSession) navigator.audioSession.type = "playback"; } catch(e){}
+}
+ensurePlaybackSession();
+try { document.addEventListener("pointerdown", ensurePlaybackSession, true); } catch(e){}
     </script>
     <style>
 
@@ -4961,6 +5012,7 @@ function prefetchAudio(files, front){
   audioPrefetchPump();
 }
 function playFileOnce(file, onOk, onErr){
+  ensurePlaybackSession();   /* v4.7：每次起播前重申音频会话类别（防系统重置后又被静音模式消音） */
   ensureAudioData();
   const a = chanAudio();
   const mySeq = ++playSeq;
@@ -6105,6 +6157,12 @@ function grammarHints(res){
 }
 /* ---------- 语音识别 ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+/* v4.7：语音判分能力口径——v4.1 起判分走「录音＋本机离线转写」（gradeSession），
+   判分链根本不用 SR；入口把门只看录音能力（getUserMedia＋MediaRecorder，与单词卡
+   wsCanRec 同口径）。旧口径拿 SR 构造器把门：构造器缺席、但明明能录音的环境
+   （如某些浏览器/主屏幕容器）会把语音打分误换成打字纠错——疑为学习者反映的
+   「打分功能没了」。SR 只保留给真用实时识别的老功能（跟读自测 listenOnce）。 */
+function canVoiceGrade(){ try { return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder); } catch(e){ return false; } }
 /* iOS 独立模式（添加到主屏幕、从桌面图标打开）：该模式下系统网页语音识别出了名地不稳
    （时好时坏、播放切录音后麦克风没声），与学习者「有时能打分、有时听不到」的间歇表现吻合；
    失败收尾要给针对性说法，不能笼统怪「没听清」 */
@@ -6651,6 +6709,24 @@ window.__APP_BUSY = function(){
     if(document.querySelector("[data-wsbusy='1']")) return true;
   } catch(e){}
   return false;
+};
+/* v4.7：忙碌的种类（供 head 版本自检的顺延上限判定）：record＝录音中、
+   score＝打分/离线转写在途——这两类绝不许被版本跳转打断；play＝只是音频播放/
+   视频课在播/判分面板停在 READY 待点——可中断（进度在本地/云端不丢），被新版
+   挡满 5 分钟可强制跳；""＝不忙。口径与 __APP_BUSY 复用同一批状态，不另造。 */
+window.__APP_BUSY_KIND = function(){
+  try {
+    if(curRec) return "record";
+    if(mrRecorder && mrRecorder.state === "recording") return "record";
+    if(GS && GS.state === "rec") return "record";   /* 状态机录音态名为 rec（gsBeginRecord） */
+    if(GS && GS.state === "scoring") return "score";
+    if(asrBusyCount > 0) return "score";
+    if(GS) return "play";   /* 判分会话停在 READY：没在录、没在算，可中断 */
+    if(curAudio && !curAudio.paused) return "play";
+    if(typeof VL !== "undefined" && VL && VL.on && VL.playing) return "play";
+    if(document.querySelector("[data-wsbusy='1']")) return "play";
+  } catch(e){}
+  return "";
 };
 /* ---------- 离线 ASR 兜底打分（v3.10） ----------
    触发口径只有一条：一次判分以整场零结果收场（sa-fail / no-response）且这次有录音时，
@@ -9178,7 +9254,7 @@ function renderCorrList(){
 /* ---- 角色扮演 ---- */
 let rp = null;
 function startRole(ls){
-  rp = { role: "B", idx: 0, phase: "choose", scores: [], errors: 0, mode: SR ? "voice" : "type", lid: ls.id };
+  rp = { role: "B", idx: 0, phase: "choose", scores: [], errors: 0, mode: canVoiceGrade() ? "voice" : "type", lid: ls.id };
   drawRole($("#rpZone"), ls);
 }
 function rpUserLines(ls){ return ls.dl.map((d, i) => ({ d, i })).filter(x => x.d[0] === rp.role); }
@@ -9190,7 +9266,7 @@ function drawRole(zone, ls){
         '<button class="pick-card" id="rpRoleA" style="flex:1;min-width:140px;">演角色 A<small>对话里先开口的一方</small></button>' +
         '<button class="pick-card" id="rpRoleB" style="flex:1;min-width:140px;">演角色 B<small>对话里回应的一方</small></button>' +
       '</div>' +
-      (SR ? "" : '<p class="mic-note">提示：' + NO_SR_HINT + '现在可以先用打字演角色，纠错照样管用。</p>');
+      (canVoiceGrade() ? "" : '<p class="mic-note">提示：' + NO_SR_HINT + '现在可以先用打字演角色，纠错照样管用。</p>');
     zone.querySelector("#rpRoleA").addEventListener("click", () => { rp.role = "A"; rp.phase = "play"; rp.idx = 0; drawRole(zone, ls); });
     zone.querySelector("#rpRoleB").addEventListener("click", () => { rp.role = "B"; rp.phase = "play"; rp.idx = 0; drawRole(zone, ls); });
     return;
@@ -9215,7 +9291,7 @@ function drawRole(zone, ls){
     '<span style="font-weight:700;">你在演角色 ' + rp.role + '</span>' +
     '<span style="color:var(--ink-faint);font-size:13px;">第 ' + (rp.idx + 1) + ' / ' + myLines.length + ' 句轮到你</span>' +
     '<span style="margin-left:auto;" class="seg">' +
-      '<button data-mode="voice" class="' + (rp.mode === "voice" ? "on" : "") + '"' + (SR ? "" : " disabled style='opacity:.4'") + '>🎤 说</button>' +
+      '<button data-mode="voice" class="' + (rp.mode === "voice" ? "on" : "") + '"' + (canVoiceGrade() ? "" : " disabled style='opacity:.4'") + '>🎤 说</button>' +
       '<button data-mode="type" class="' + (rp.mode === "type" ? "on" : "") + '">⌨ 打字</button>' +
     '</span></div><div>';
   ls.dl.forEach((d, i) => {
@@ -9397,7 +9473,7 @@ function rpAnswer(zone, ls, saidRaw, myUrl){
       safeBlock(() => (ls.g && ls.g[4] ? '<div class="tip-box"><b>本课易错点：</b>' + esc(ls.g[4]) + '</div>' : "")) +
       '<div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">' +
         '<button class="btn soft small" id="rpHear">🔊 再听原音</button>' +
-        (rp.mode === "voice" && SR ? '<button class="btn soft small" id="rpReread">🎤 重新录</button>' : '') +
+        (rp.mode === "voice" && canVoiceGrade() ? '<button class="btn soft small" id="rpReread">🎤 重新录</button>' : '') +
         (myUrl ? '<button class="btn ghost small" id="rpMine">▶ 听我的录音</button>' : '') +
         '<button class="btn" id="rpNextLine">' + (last ? "看结果" : "下一句 →") + '</button>' +
       '</div>' +
@@ -9492,7 +9568,7 @@ function renderPronToday(){
   const cnt = $("#cntPronToday");
   if(cnt) cnt.textContent = "已练 " + pp.c.pron.done + " / " + pp.c.pron.total;
   host.innerHTML = '<p class="sec-sub">今天要跟读打分的句子，练完一句，今日进度就记一句。' +
-    (SR ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
+    (canVoiceGrade() ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
   let focusEl = null;
   pp.plan.pron.forEach(lid => {
     const x = ALL_LINES.find(y => y.lid === lid); if(!x) return;
@@ -9512,7 +9588,7 @@ function renderPronBrowse(){
   const ls = LESSON_MAP[sel.pron];
   const host = $("#pronMain");
   host.innerHTML = '<p class="sec-sub">《' + esc(ls.t) + '》的对话句子，逐句跟读打分。' +
-    (SR ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
+    (canVoiceGrade() ? "" : '提示：这个浏览器里用不了语音跟读（多半是在微信等 App 里打开的）；现在点每句的「跟读打分」可以用打字完成纠错。') + '</p>';
   const pvWrap = document.createElement('div');
   pvWrap.style.margin = '0 0 10px';
   pvWrap.innerHTML = '<button class="btn main small" id="pronVideo">▶ 上这一课的视频课</button> <span class="mic-note" style="margin:0;">先看视频跟读，再回来逐句打分</span>';
@@ -9643,8 +9719,8 @@ function pronCard(ls, i){
     try { renderHUD(); saveState(); renderPronExtras(); } catch(e){}
   };
   checkBtn.addEventListener("click", () => {
-    if(!SR){
-      /* 没有语音识别的环境（多半是微信等 App 的内置浏览器）：把话说破，并给打字纠错的替代路径，
+    if(!canVoiceGrade()){
+      /* 没法录音的环境（多半是微信等 App 的内置浏览器）：把话说破，并给打字纠错的替代路径，
          不再只弹一句提示就没了下文，更不能装作「没听清」让她对着空气读 */
       result.innerHTML =
         '<div class="mic-warn" style="margin-top:10px;">' + NO_SR_HINT + '</div>' +
@@ -10186,6 +10262,7 @@ function vlEnsureOverlay(){
   document.getElementById('vlPlayBtn').addEventListener('click', vlTogglePlay);
 }
 function vlOpen(id){
+  ensurePlaybackSession();   /* v4.7：进视频课先重申播放类别 */
   if(typeof VIDEO_PLUS === 'undefined' || !VIDEO_PLUS[id]) return;
   vlEnsureOverlay();
   stopWordInline();
@@ -10289,6 +10366,7 @@ function vlStepFiles(idx){
   return [...files];
 }
 function vlGo(i, autoplay){
+  ensurePlaybackSession();   /* v4.7：切段重申播放类别 */
   if(!VL.on) return;
   VL.gen++;
   vlStopAudio();
