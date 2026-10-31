@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610311102";
+var APP_BUILD = "v202610311125";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -7484,7 +7484,7 @@ function paintBackupUI(){
    data 就是 buildBackup().data 原样（与 v3.14 手动备份同一序列化层）。
    防坑条款对应：①同步内容=两份本地数据原样+updatedAt（acctBuildData 复用 buildBackup）；
    ②云端空/旧永不覆盖本地新——合并只比 updatedAt，严格新者胜，远端不存在只上行
-   （acctSyncNow 三分支；v3.17 护栏：本地实质为空〔已学 0 词且打卡 0 天〕且云端有数据时无条件拉云端、忽略 updatedAt，防数据丢失后的空本地反覆盖云端；v3.19 再加 pristine：已学 0 词且本地历史量〔打卡+servedNew 天数〕严格小于云端时同样只拉不上行——全新机打开即产生当天打卡/servedNew、时间戳又新，旧护栏曾漏判致空壳盖掉云端种子）；③触发=登录后 acctLogin/acctRegister 末尾、本地保存防抖
+   （acctSyncNow 三分支；v3.17 护栏：本地实质为空〔已学 0 词且打卡 0 天〕且云端有数据时无条件拉云端、忽略 updatedAt，防数据丢失后的空本地反覆盖云端；v3.19 再加 pristine：已学 0 词且本地历史量〔打卡+servedNew 天数〕严格小于云端时同样只拉不上行——全新机打开即产生当天打卡/servedNew、时间戳又新，旧护栏曾漏判致空壳盖掉云端种子；v4.8 再加进度量防盖：旧档哪怕学过几个词〔empty/pristine 都漏判〕、时间戳又被每次保存刷新成最新，也按进度量〔词数为主，acctProgressOfMain〕与云端同口径比对，本地量显著小于云端〔词数或总量不足云端一半且总量更小〕时只拉不推，时间戳不再单独定胜负，采纳云端后同量自愈恢复上行）；③触发=登录后 acctLogin/acctRegister 末尾、本地保存防抖
    （saveState/saveWordScore 尾部钩子 acctOnLocalSave→acctScheduleSync 5 秒）、
    切后台（acctBoot 的 visibilitychange）、手动「立即同步」；④状态行常驻账号卡
    （acctStatusText，未登录/同步中/已同步 HH:MM/失败稍后重试，失败只改状态不拦学习）；
@@ -7500,7 +7500,7 @@ const GH_TOKEN = ("github_pat_"+"11AO73DNI0H"+"BgE9grCMWGW"+"_heMUSyzviV"+"SeEYC
 const ACCT_INVITE = "doki2026";
 const ACCT_ITER = 100000;
 const ACCT_TIMING = (() => { const d = { debounceMs: 5000 }; try { const o = window.__ACCT_TIMING || {}; for (const k in d) if (typeof o[k] === "number" && o[k] >= 0) d[k] = o[k]; } catch(e){} return d; })();
-const ACCT = { username: "", pwRecord: null, status: "out", syncing: false, timer: 0, cloudUpdatedAt: 0, msg: "", msgOk: false };
+const ACCT = { username: "", pwRecord: null, status: "out", syncing: false, timer: 0, cloudUpdatedAt: 0, msg: "", msgOk: false, progressGuardCu: 0 };
 const ACCT_UI = { user: "", pass: "", ruser: "", rpass: "", rinvite: "", showReg: false };
 
 function acctMeta(){ try { const m = JSON.parse(localStorage.getItem(ACCT_KEY) || "null"); return (m && typeof m === "object" && !Array.isArray(m)) ? m : {}; } catch(e){ return {}; } }
@@ -7545,6 +7545,42 @@ function acctLocalPristine(file){
     if (!acctRemoteHasData(file)) return false;
     return acctLocalHistoryDays() < acctRemoteHistoryDays(file);
   } catch(e){ return false; }
+}
+
+/* v4.8 进度量（运行时计算、不落盘）：把落盘形主数据折算成"内容有多少"的单调量。
+   分量与权重：已学词（wordGrades 键数）×10000 为主——词数是这个 App 进度的主体，
+   一个词的权重压过其余全部分量的日常增量；打卡天数 ×100；pron 条数、corr 条数、
+   grammarSeen 数各 ×1；studySecs 折成分钟计入、封顶 999（防时长冲淡词数主导性）。
+   两边必须同口径：本地读 localStorage 的落盘形主数据（同步触发点上它与待上行内容
+   一致：上行打包 buildBackup 也是先 saveState 落盘再读它）、云端读文件内
+   data[LS_KEY]，都走 acctProgressOfMain；集合字段数组/对象两种形都按个数计。 */
+function acctProgressOfMain(main){
+  if (!main || typeof main !== "object" || Array.isArray(main)) return null;
+  const cnt = v => Array.isArray(v) ? v.length : (v && typeof v === "object" ? Object.keys(v).length : 0);
+  const words = cnt(main.wordGrades);
+  const ck = cnt(main.checkins);
+  const pron = cnt(main.pron);
+  const corr = cnt(main.corr);
+  const grammar = cnt(main.grammarSeen);
+  const mins = Math.min(Math.floor((+main.studySecs || 0) / 60) || 0, 999);
+  return { words: words, checkins: ck, pron: pron, corr: corr, grammar: grammar, studyMins: mins,
+    total: words * 10000 + ck * 100 + pron + corr + grammar + mins };
+}
+function acctLocalProgress(){
+  try { return acctProgressOfMain(JSON.parse(localStorage.getItem(LS_KEY) || "null")); } catch(e){ return null; }
+}
+function acctRemoteProgress(file){
+  const d = file && file.data;
+  if (!d || typeof d !== "object" || Array.isArray(d)) return null;
+  return acctProgressOfMain(d[LS_KEY]);
+}
+/* 防盖判定：本地总量严格小于云端，且（词数不足云端一半 或 总量不足云端一半）→
+   这是"内容明显更少的旧档"，时间戳再新也不许上行。任一侧算不出量（主数据缺失/
+   解析失败）→ 返回 false 回现行 updatedAt 规则，保护逻辑自身永不卡死同步。 */
+function acctProgressGuard(localP, remoteP){
+  if (!localP || !remoteP) return false;
+  if (!(localP.total < remoteP.total)) return false;
+  return localP.words < remoteP.words * 0.5 || localP.total < remoteP.total * 0.5;
 }
 
 /* ---- 编码与密码学小工具（WebCrypto；iOS Safari 在 https 安全上下文原生具备） ---- */
@@ -7684,7 +7720,20 @@ async function acctSyncNow(manual){
       /* v3.17 护栏：本地实质为空且云端有数据 → 无条件拉云端，忽略 updatedAt 比较 */
       /* v3.19：pristine（未真正开始学、历史量严格小于云端）与实质为空同权，一样无条件拉云端 */
       const pristine = !!remote && acctLocalPristine(remote.file);
-      const forcePull = !!remote && cu !== lu && acctRemoteHasData(remote.file) && (acctLocalEmpty() || pristine);
+      /* v4.8 进度量防盖：updatedAt 区分不了新旧（旧档每次保存都把时间戳刷成当前时间，
+         旧内容+新时间戳在旧规则下必胜——2026-10-31 晚 8 词旧档就是这样盖掉 658 词
+         云端的），内容量分得出。本地进度量显著小于云端 → 判旧档，只拉不推。
+         会话标志 progressGuardCu：本会话已对同一份云端（同 updatedAt）触发过保护、
+         且本地在词数与总量上仍双双落后时继续只拉不推，防采纳未生效等异常下反复横跳；
+         采纳云端后本地与云端同量、后续真实学习自然反超，两条判据同时失效、上行
+         自动恢复（自愈），不另设解锁、不锁死她在该容器里的真实新学习。
+         GET 失败时 acctFetchRemote 已先抛错走现行失败口径；量算不出（null）时
+         acctProgressGuard 恒假，回现行 updatedAt 规则——保护只拦该拦的，不卡同步。 */
+      const pgLocal = acctLocalProgress(), pgRemote = remote ? acctRemoteProgress(remote.file) : null;
+      let progressGuard = !!remote && acctProgressGuard(pgLocal, pgRemote);
+      if (!progressGuard && remote && cu !== 0 && ACCT.progressGuardCu === cu && pgLocal && pgRemote
+          && pgLocal.total < pgRemote.total && pgLocal.words < pgRemote.words) progressGuard = true;
+      const forcePull = !!remote && cu !== lu && acctRemoteHasData(remote.file) && (acctLocalEmpty() || pristine || progressGuard);
       if (remote && (cu > lu || forcePull)){
         /* v3.18 熔断：同一用户同一份云端进度（updatedAt 相同）本会话已拉过 → 不许再拉、再刷新 */
         let pg = null;
@@ -7697,6 +7746,7 @@ async function acctSyncNow(manual){
         try { sessionStorage.setItem(PULL_GUARD_KEY, JSON.stringify({ u: ACCT.username, at: cu })); } catch(e){}
         if (!acctApplyRemote(remote.file)){ try { sessionStorage.removeItem(PULL_GUARD_KEY); } catch(e){} throw new Error("apply-fail"); }
         try { loadState(); } catch(e){}   /* v3.18：拉到的进度同步进内存态，本页后续判定不再误判为空 */
+        if (progressGuard) ACCT.progressGuardCu = cu;   /* v4.8：记下本会话已对这份云端触发过进度量保护 */
         const m = acctMeta(); m.username = ACCT.username; m.localUpdatedAt = cu; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
         ACCT.cloudUpdatedAt = cu; ACCT.status = "ok"; done = true;
         /* v3.24：数据已落盘＋进内存，刷新时机分三路——手动同步（她主动点的）与
@@ -7711,7 +7761,7 @@ async function acctSyncNow(manual){
         }
         break;
       }
-      if (!remote || (lu > cu && !pristine)){   /* v3.19 双保险：pristine 时绝不许上行覆盖历史更丰富的云端 */
+      if (!remote || (lu > cu && !pristine && !progressGuard)){   /* v3.19 双保险：pristine 时绝不许上行覆盖历史更丰富的云端；v4.8 同理：进度量保护命中时绝不上行 */
         const data = acctBuildData();
         if (!data) throw new Error("build-fail");
         const lu2 = acctLocalUpdatedAt();   /* 打包时 saveState 已刷新本地时间戳，以它为这次上行的时间戳 */
