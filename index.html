@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202611011913";
+var APP_BUILD = "v202611020115";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -10187,6 +10187,23 @@ function vlVisHTML(spec, ls){
 /* ================= 视频课：播放器 ================= */
 const VL = { on: false, id: null, steps: [], idx: 0, playing: false, gen: 0, audio: null, q: null, done: false };
 function vlNar(f){ return 'assets/audio/nar/' + f + '.mp3'; }
+/* v5.0：VL 持久播放元素（Doki 真机实锤 v4.9 回归：视频课全无声、发音页三样正常）。
+   病根：v4.9 把 VL 旁白/偏方/讲解的播放元素改成逐段 makeMediaEl() 新建——无
+   audioSession 环境下那是全新的 <video> 元素，而 iOS/WKWebView 对 <video> 的出声
+   解锁是「按元素」的：只有在用户手势调用栈里对本元素 play() 过的元素才被系统放行
+   出声；靠 ended 回调/定时器链式推进时新建的元素，play() 即使不报错、进度照走
+   （界面显示在播），声音也被系统压掉。真机截图实锤：语法课第 1 段（点开课的手势
+   栈内首播）有声、第 2 段起全哑。发音页示范走 chanAudio 共享单例且由点击直接
+   触发，所以独独它没事。修法：VL 全部自有音频（旁白/开场旁白/小测反馈/
+   wvPlayPath 偏方与例句讲解）统一走一个持久元素 vlChanAudio()——在打开课的手势
+   栈里创建（vlOpen/wvOpenCommon 里先建好），首播随即在同栈内发生，此后整课只换
+   src 连播，与 chanAudio 同一存活模式；vlPlayAudio 看门狗与暂停/切段语义不变，
+   VL.audio 指向的始终是这个元素。 */
+let vlMediaEl = null;
+function vlChanAudio(){
+  if(!vlMediaEl){ vlMediaEl = makeMediaEl(); vlMediaEl.preload = "auto"; }
+  return vlMediaEl;
+}
 /* v4.5：VL 自有 Audio 统一看门狗（Doki 实测语法课「看图学」段冻死：旁白走
    VL.audio = new Audio(...)，旧代码只靠 onended/onerror/play().catch 推进——连接
    挂死时不报错、不出声、不结束，整段永久等待，界面停在播放态）。
@@ -10371,6 +10388,7 @@ function vlOpen(id){
   if(typeof VIDEO_PLUS === 'undefined' || !VIDEO_PLUS[id]) return;
   vlEnsureOverlay();
   stopWordInline();
+  vlChanAudio();   /* v5.0：在打开课的手势栈里先把 VL 持久元素建好（首播在同栈内解锁出声） */
   VL.on = true; VL.id = id; VL.done = false; VL.q = null;
   VL.quizData = null; VL.onPass = null; VL.onClose = null; VL.reopen = null;
   VL.steps = vlBuildSteps(id);
@@ -10388,7 +10406,7 @@ function vlClose(){
   else if(typeof renderGrammar === 'function') renderGrammar();
 }
 function vlStopAudio(){
-  if(VL.audio){ const a = VL.audio; VL.audio = null; try { a.pause(); } catch(e){} try { a.remove(); } catch(e){} }
+  if(VL.audio){ const a = VL.audio; VL.audio = null; try { a.pause(); } catch(e){} }   /* v5.0：持久元素不许 remove——销毁已解锁元素，下段又回到新建未解锁元素 */
   stopRec();
   if('speechSynthesis' in window){ try { speechSynthesis.cancel(); } catch(e){} }
 }
@@ -10532,7 +10550,7 @@ function vlPlayStep(step, gen){
   if(step.play){ step.play(gen); return; }
   if(step.k === 'nar'){
     /* v4.5：旁白走统一看门狗——挂死/失败不再永久等：提示后跳过本段继续（旁白是讲解，不许堵死整课） */
-    const a = makeMediaEl(); a.src = vlNar(step.f);
+    const a = vlChanAudio(); a.src = vlNar(step.f);
     vlPlayAudio(a, gen,
       () => vlAdvance(gen),
       () => { recLoadFailToast('这段讲解的录音没加载出来（网络卡住了），先跳过这段'); vlAdvance(gen); });
@@ -10547,7 +10565,7 @@ function vlPlayStep(step, gen){
     };
     if(step.lead){
       /* v4.5：开场旁白同走统一看门狗——失败提示后跳过旁白、直接进例句（不许堵住本段） */
-      const a = makeMediaEl(); a.src = vlNar('shared-listen');
+      const a = vlChanAudio(); a.src = vlNar('shared-listen');
       vlPlayAudio(a, gen,
         () => { if(gen === VL.gen) playEx(); },
         () => { recLoadFailToast('开头的讲解没加载出来（网络卡住了），先直接听例句'); if(gen === VL.gen) playEx(); });
@@ -10619,7 +10637,7 @@ function vlQuizRender(){
 }
 function vlQuizSpeak(f){
   /* v4.5：反馈音（答对/答错/过关）同走统一看门狗接管 VL.audio，失败静默结算（无链条在等它） */
-  const a = makeMediaEl(); a.src = vlNar(f);
+  const a = vlChanAudio(); a.src = vlNar(f);
   vlPlayAudio(a, VL.gen, null, null);
 }
 function vlQuizPick(i, btn){
@@ -10689,16 +10707,24 @@ function wviLater(fn, ms){ const t = setTimeout(fn, ms); WVI.timers.push(t); ret
 function wviClearTimers(){ WVI.timers.forEach(clearTimeout); WVI.timers = []; }
 function stopWordInline(){
   WVI.gen++; WVI.on = false; WVI.paused = false; wviClearTimers();
-  if(WVI.audio){ const a = WVI.audio; WVI.audio = null; try { a.pause(); } catch(e){} try { a.remove(); } catch(e){} }
+  if(WVI.audio){ const a = WVI.audio; WVI.audio = null; try { a.pause(); } catch(e){} }   /* v5.0：持久元素不许 remove（同 vlStopAudio 口径） */
   try { stopRec(); } catch(e){}
   document.querySelectorAll("[data-wvihost]").forEach(h => { h.hidden = true; h.innerHTML = ""; });
   WVI.host = null; WVI.v = null; WVI.uid = null; WVI.stage = -1;
+}
+/* v5.0：WVI（单词卡内嵌小视频）持久播放元素——与 VL 同病同修：旧代码逐段新建
+   <video> 元素靠定时器链式推进，第 2 段起被 iOS 按未解锁元素静音。整段小视频
+   共用一个元素、只换 src；打开小视频的点击栈里首播即解锁。 */
+let wviMediaEl = null;
+function wviChanAudio(){
+  if(!wviMediaEl){ wviMediaEl = makeMediaEl(); wviMediaEl.preload = "auto"; }
+  return wviMediaEl;
 }
 function wviPlayPath(path, gen, done){
   let settled = false;
   const fin = () => { if(!settled){ settled = true; done(); } };
   try { ensureAudioData(); } catch(e){}
-  const a = makeMediaEl(); a.src = (typeof AUDIO_DATA !== "undefined" && AUDIO_DATA[path]) || ("assets/audio/" + path);
+  const a = wviChanAudio(); a.src = (typeof AUDIO_DATA !== "undefined" && AUDIO_DATA[path]) || ("assets/audio/" + path);
   WVI.audio = a;
   a.onended = fin;
   a.onerror = () => wviLater(fin, 350);
@@ -10886,7 +10912,7 @@ function wvPlayPath(path, gen, done){
   let settled = false;
   const fin = () => { if(!settled){ settled = true; done(); } };
   try { ensureAudioData(); } catch(e){}
-  const a = makeMediaEl(); a.src = (typeof AUDIO_DATA !== 'undefined' && AUDIO_DATA[path]) || ('assets/audio/' + path);
+  const a = vlChanAudio(); a.src = (typeof AUDIO_DATA !== 'undefined' && AUDIO_DATA[path]) || ('assets/audio/' + path);
   /* v4.5：改走统一看门狗（取代旧 25s 定时兜底）：无进度约 8s 即判败——提示后照旧
      fin() 继续链条（偏方/例句讲解是旁白，失败不堵课）；结束/出错同样 fin()。 */
   vlPlayAudio(a, gen, fin, () => { recLoadFailToast('这段录音没加载出来（网络卡住了），先继续'); fin(); });
@@ -10958,6 +10984,7 @@ function wvPulse(which){
 }
 function wvOpenCommon(title, onClose, reopen){
   vlEnsureOverlay();
+  vlChanAudio();   /* v5.0：同 vlOpen——单词/对话课打开的手势栈里先建 VL 持久元素 */
   if(typeof stopShadow === 'function'){ try { stopShadow(); } catch(e){} }
   stopWordInline();
   wvTimers.forEach(clearTimeout); wvTimers = [];
