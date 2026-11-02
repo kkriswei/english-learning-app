@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202610311125";
+var APP_BUILD = "v202611011913";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -4896,7 +4896,38 @@ function baihuaChunk(chunk){
    preloadFiles 把当前课的录音提前拉进浏览器缓存，点播直接命中缓存。
    playSeq 让旧的看门狗/回调用在新播放开始后自动失效。 */
 let playSeq = 0, chanEl = null, chanEvtOff = null;
-function chanAudio(){ if(!chanEl){ chanEl = new Audio(); chanEl.preload = "auto"; } return chanEl; }
+/* v4.9 双通道播放元素（Doki 实测：升级后独立模式下跟读示范仍无声）：
+   v4.7 的 navigator.audioSession 只在 Safari 浏览器里存在——iOS 主屏幕独立模式
+   （WKWebView）下该 API 可能根本不存在，类别设置等于没设，<audio> 仍被静音开关
+   消音。无此 API 时唯一可靠的老解法：用 <video> 元素播音频文件——iOS 把视频
+   播放归为「媒体播放」类别，不受静音开关消音。故全应用播放元素统一由
+   makeMediaEl() 造：有 audioSession → new Audio()（走 v4.7 类别逻辑）；
+   没有 → <video playsInline>，挂 body 以 2×2px 近透明样式常驻（不许
+   display:none——iOS 会暂停隐藏的视频）。video 与 audio 的媒体 API 同名
+   （src/currentTime/duration/paused/ended/readyState/事件），现行看门狗口径不变。 */
+function mediaUseVideo(){
+  try { return !(typeof navigator !== "undefined" && navigator.audioSession); } catch(e){ return true; }
+}
+function makeMediaEl(){
+  if(!mediaUseVideo()) return new Audio();
+  const v = document.createElement("video");
+  try { v.playsInline = true; } catch(e){}
+  try { v.setAttribute("playsinline", ""); v.setAttribute("webkit-playsinline", ""); } catch(e){}
+  try { if("disablePictureInPicture" in v) v.disablePictureInPicture = true; } catch(e){}
+  v.style.cssText = "position:fixed;right:0;bottom:0;width:2px;height:2px;opacity:.01;pointer-events:none;";
+  try { if(document.body) document.body.appendChild(v); } catch(e){}
+  return v;
+}
+/* v4.9 录音会话类别切换：playback 类别不带输入，可能反过来压制采集——打分会话
+   开录前（有 audioSession 时）先切 play-and-record，gsTeardown 统一切回 playback
+   （出分/失败/取消/被顶替/异常所有出口都经 teardown）。无此 API 时静默跳过。 */
+function setAudioSessionForRecord(on){
+  try {
+    if(typeof navigator === "undefined" || !navigator.audioSession) return;
+    navigator.audioSession.type = on ? "play-and-record" : "playback";
+  } catch(e){}
+}
+function chanAudio(){ if(!chanEl){ chanEl = makeMediaEl(); chanEl.preload = "auto"; } return chanEl; }
 /* v4.4 看门狗分两段（Doki 实测：除单词外点播放都没声音）：旧看门狗只认 currentTime 进度，
    而文件「加载期」currentTime 恒为 0——国内慢网下拉一个 30–200KB 的整句/旁白文件，从点击
    到出声常超 3.2s，还没下完就被判死 → playRec 失败 → speak 静默退到 iOS 主屏幕模式下常哑的
@@ -6459,7 +6490,9 @@ function srErrText(err){
   if(err === "no-response")
     return "麦克风录到了声音，但识别服务没给出结果。";
   if(err === "not-allowed" || err === "service-not-allowed")
-    return "没有麦克风权限：弹出提示时请点『允许』；如果之前拒绝过，去 iPhone 设置 → Safari → 麦克风改成允许，再刷新页面";
+    return "没有麦克风权限：弹出提示时请点『允许』。如果之前拒绝过，就不会再弹提示了，只能去 iPhone『设置』里打开：用主屏幕图标进来的，在设置里找到这个英语学习 App、打开『麦克风』；用 Safari 打开的，去『设置 → Safari → 麦克风』改成允许。改好后回来再点一次录音就行";
+  if(err === "no-device")
+    return "没找到能用的麦克风——这台设备上没有可用的麦克风（或被系统关掉了）。接上带麦克风的耳机、或者换一台设备再试";
   if(err === "timeout")
     return "识别服务没反应，这次没出结果。";
   if(err === "no-speech" || err === "end")
@@ -6526,6 +6559,7 @@ function gsDropRec(S){
 /* 唯一出口：任何路径回 IDLE 都走这里，逐项释放会话资源 */
 function gsTeardown(S, displaced){
   if(!S || S.tornDown) return; S.tornDown = true;
+  setAudioSessionForRecord(false);   /* v4.9：任何出口（出分/失败/取消/被顶替/异常）都把音频类别切回播放 */
   if(GS === S) GS = null;
   S.tAll.forEach(id => { try { clearTimeout(id); } catch(e){} });
   S.tAll.clear();
@@ -6553,6 +6587,15 @@ function gsSessionError(S){
   if(S.settled || GS !== S || S.state === "ready") return;
   gsDeliver(S, gsFailOut(S, "error"));
 }
+/* v4.9：getUserMedia 拒绝按 error.name 分类（旧代码一律映射 not-allowed，
+   「没有麦克风」也被说成「没权限」，误导她去翻设置）。NotFound 类设备上根本
+   没有麦克风，与权限无关，必须分开说。返回的码经 gsFailOut → srErrText 落面。 */
+function gsMicErrCode(err){
+  const n = (err && err.name) || "";
+  if(n === "NotAllowedError") return "not-allowed";
+  if(n === "NotFoundError" || n === "DevicesNotFoundError") return "no-device";
+  return "error";
+}
 /* ── READY → RECORDING：只由用户点「开始录音」触发（保 iOS 手势链），仅 MediaRecorder ── */
 function gsBeginRecord(S){
   if(GS !== S || S.state !== "ready" || S.settled) return;
@@ -6571,6 +6614,7 @@ function gsBeginRecordNow(S){
   if(GS !== S || S.state !== "rec" || S.settled) return;
   const MR = window.MediaRecorder || null;
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !MR){ S.recPending = false; gsDeliverFail(S, "error"); return; }
+  setAudioSessionForRecord(true);   /* v4.9：开录前切 play-and-record（playback 类别不带输入、会压采集） */
   let gum;
   try { gum = navigator.mediaDevices.getUserMedia({ audio: true }); } catch(e){ S.recPending = false; gsDeliverFail(S, "error"); return; }
   Promise.resolve(gum).then(stream => {
@@ -6586,7 +6630,7 @@ function gsBeginRecordNow(S){
     S.recPending = false;
     gsT(S, () => { if(GS === S && S.state === "rec" && !S.recStopping) gsFinishRecording(S); }, GS_REC_CAP_MS);   /* 30s 安全上限：仅防忘关 */
     if(S.stopWhenReady){ S.stopWhenReady = false; gsFinishRecording(S); }   /* 她在开麦完成前就点了「我说完了」：立即收尾 */
-  }).catch(() => { S.recPending = false; if(GS === S && S.state === "rec") gsDeliverFail(S, "not-allowed"); });
+  }).catch(err => { S.recPending = false; if(GS === S && S.state === "rec") gsDeliverFail(S, gsMicErrCode(err)); });
 }
 /* 停录并收尾（v3.26 finishRec 口径：onstop＋1.4s 看门狗，只执行一次，tracks 必停） */
 function gsFinishRecording(S){
@@ -8376,8 +8420,8 @@ function startWordScore(host, v, uid){
   const wsWireMine = url => {
     const mine = panel.querySelector("[data-wsmine]");
     if(!mine || !url) return;
-    if(panel._wsAudio){ try { panel._wsAudio.pause(); } catch(e){} panel._wsAudio = null; }
-    const au = new Audio(); au.preload = "auto"; au.src = url; panel._wsAudio = au;
+    if(panel._wsAudio){ try { panel._wsAudio.pause(); } catch(e){} try { panel._wsAudio.remove(); } catch(e){} panel._wsAudio = null; }
+    const au = makeMediaEl(); au.preload = "auto"; au.src = url; panel._wsAudio = au;
     mine.addEventListener("click", () => {
       if(!panel._wsAudio) return;
       if(!panel._wsAudio.paused){ panel._wsAudio.pause(); mine.textContent = "▶ 听我的录音"; return; }
@@ -9530,7 +9574,7 @@ function rpAnswer(zone, ls, saidRaw, myUrl){
     '</div>';
   result.querySelector("#rpHear").addEventListener("click", () => speak(target, 0.6, cur.d[0]));
   const rpMineBtn = result.querySelector("#rpMine");
-  if(rpMineBtn) rpMineBtn.addEventListener("click", () => { try { const pa = new Audio(myUrl); const pr = pa.play(); if(pr && pr.catch) pr.catch(() => {}); } catch(e){} });
+  if(rpMineBtn) rpMineBtn.addEventListener("click", () => { try { if(rpMineBtn._pa){ try { rpMineBtn._pa.pause(); rpMineBtn._pa.remove(); } catch(e){} rpMineBtn._pa = null; } const pa = makeMediaEl(); pa.src = myUrl; rpMineBtn._pa = pa; const pr = pa.play(); if(pr && pr.catch) pr.catch(() => {}); } catch(e){} });
   const rpRereadBtn = result.querySelector("#rpReread");
   if(rpRereadBtn) rpRereadBtn.addEventListener("click", () => {
     /* 重读本句：先把刚才这次入账整体回滚（分数统计/错句本/经验），以重读后的最终结果为准；
@@ -9674,7 +9718,16 @@ function pronCard(ls, i){
     '<div class="mine-label"><span>我的录音</span><button class="btn soft small" data-act="orig">原音</button></div>' +
     '<audio class="mine-audio" controls></audio>' +
     '<div data-result></div>';
-  const audio = card.querySelector(".mine-audio");
+  let audio = card.querySelector(".mine-audio");
+  /* v4.9：无 audioSession 环境（独立模式）下原生 <audio> 回放她录音同样会被静音
+     开关消音——换成工厂的 video 元素（同 class/controls，她点原生播放条就能出声） */
+  if(audio && mediaUseVideo()){
+    try {
+      const vel = makeMediaEl();
+      vel.className = "mine-audio"; vel.controls = true; vel.style.cssText = "";
+      audio.replaceWith(vel); audio = vel;
+    } catch(e){}
+  }
   const mineLabel = card.querySelector(".mine-label");
   function showMine(url){
     if(!url) return;
@@ -9692,12 +9745,14 @@ function pronCard(ls, i){
   card.querySelector('[data-act="rec"]').addEventListener("click", async () => {
     if(myRecorder && myRecorder.state === "recording"){ myRecorder.stop(); return; }
     if(!navigator.mediaDevices || !window.MediaRecorder){ toast("这个浏览器不支持录音，可以大声跟读后自己判断"); return; }
+    setAudioSessionForRecord(true);   /* v4.9：与打分会话同口径，开录前切 play-and-record */
     try { myStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-    catch(e){ toast("没有拿到麦克风权限，请在浏览器设置里允许麦克风"); return; }
+    catch(e){ setAudioSessionForRecord(false); toast(srErrText(gsMicErrCode(e))); return; }
     myChunks = [];
     myRecorder = new MediaRecorder(myStream);
     myRecorder.ondataavailable = e => { if(e.data.size) myChunks.push(e.data); };
     myRecorder.onstop = () => {
+      setAudioSessionForRecord(false);   /* v4.9：停录后切回播放类别 */
       if(myStream) myStream.getTracks().forEach(t => t.stop());
       status.classList.remove("on");
       if(myChunks.length){
@@ -10333,7 +10388,7 @@ function vlClose(){
   else if(typeof renderGrammar === 'function') renderGrammar();
 }
 function vlStopAudio(){
-  if(VL.audio){ const a = VL.audio; VL.audio = null; try { a.pause(); } catch(e){} }
+  if(VL.audio){ const a = VL.audio; VL.audio = null; try { a.pause(); } catch(e){} try { a.remove(); } catch(e){} }
   stopRec();
   if('speechSynthesis' in window){ try { speechSynthesis.cancel(); } catch(e){} }
 }
@@ -10477,7 +10532,7 @@ function vlPlayStep(step, gen){
   if(step.play){ step.play(gen); return; }
   if(step.k === 'nar'){
     /* v4.5：旁白走统一看门狗——挂死/失败不再永久等：提示后跳过本段继续（旁白是讲解，不许堵死整课） */
-    const a = new Audio(vlNar(step.f));
+    const a = makeMediaEl(); a.src = vlNar(step.f);
     vlPlayAudio(a, gen,
       () => vlAdvance(gen),
       () => { recLoadFailToast('这段讲解的录音没加载出来（网络卡住了），先跳过这段'); vlAdvance(gen); });
@@ -10492,7 +10547,7 @@ function vlPlayStep(step, gen){
     };
     if(step.lead){
       /* v4.5：开场旁白同走统一看门狗——失败提示后跳过旁白、直接进例句（不许堵住本段） */
-      const a = new Audio(vlNar('shared-listen'));
+      const a = makeMediaEl(); a.src = vlNar('shared-listen');
       vlPlayAudio(a, gen,
         () => { if(gen === VL.gen) playEx(); },
         () => { recLoadFailToast('开头的讲解没加载出来（网络卡住了），先直接听例句'); if(gen === VL.gen) playEx(); });
@@ -10564,7 +10619,7 @@ function vlQuizRender(){
 }
 function vlQuizSpeak(f){
   /* v4.5：反馈音（答对/答错/过关）同走统一看门狗接管 VL.audio，失败静默结算（无链条在等它） */
-  const a = new Audio(vlNar(f));
+  const a = makeMediaEl(); a.src = vlNar(f);
   vlPlayAudio(a, VL.gen, null, null);
 }
 function vlQuizPick(i, btn){
@@ -10634,7 +10689,7 @@ function wviLater(fn, ms){ const t = setTimeout(fn, ms); WVI.timers.push(t); ret
 function wviClearTimers(){ WVI.timers.forEach(clearTimeout); WVI.timers = []; }
 function stopWordInline(){
   WVI.gen++; WVI.on = false; WVI.paused = false; wviClearTimers();
-  if(WVI.audio){ const a = WVI.audio; WVI.audio = null; try { a.pause(); } catch(e){} }
+  if(WVI.audio){ const a = WVI.audio; WVI.audio = null; try { a.pause(); } catch(e){} try { a.remove(); } catch(e){} }
   try { stopRec(); } catch(e){}
   document.querySelectorAll("[data-wvihost]").forEach(h => { h.hidden = true; h.innerHTML = ""; });
   WVI.host = null; WVI.v = null; WVI.uid = null; WVI.stage = -1;
@@ -10643,7 +10698,7 @@ function wviPlayPath(path, gen, done){
   let settled = false;
   const fin = () => { if(!settled){ settled = true; done(); } };
   try { ensureAudioData(); } catch(e){}
-  const a = new Audio((typeof AUDIO_DATA !== "undefined" && AUDIO_DATA[path]) || ("assets/audio/" + path));
+  const a = makeMediaEl(); a.src = (typeof AUDIO_DATA !== "undefined" && AUDIO_DATA[path]) || ("assets/audio/" + path);
   WVI.audio = a;
   a.onended = fin;
   a.onerror = () => wviLater(fin, 350);
@@ -10831,7 +10886,7 @@ function wvPlayPath(path, gen, done){
   let settled = false;
   const fin = () => { if(!settled){ settled = true; done(); } };
   try { ensureAudioData(); } catch(e){}
-  const a = new Audio((typeof AUDIO_DATA !== 'undefined' && AUDIO_DATA[path]) || ('assets/audio/' + path));
+  const a = makeMediaEl(); a.src = (typeof AUDIO_DATA !== 'undefined' && AUDIO_DATA[path]) || ('assets/audio/' + path);
   /* v4.5：改走统一看门狗（取代旧 25s 定时兜底）：无进度约 8s 即判败——提示后照旧
      fin() 继续链条（偏方/例句讲解是旁白，失败不堵课）；结束/出错同样 fin()。 */
   vlPlayAudio(a, gen, fin, () => { recLoadFailToast('这段录音没加载出来（网络卡住了），先继续'); fin(); });
