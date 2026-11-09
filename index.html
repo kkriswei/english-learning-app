@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202611020115";
+var APP_BUILD = "v202611091424";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -4457,7 +4457,7 @@ const state = {
   grammarSeen: new Set(), grammarQuiz: new Set(),
   stats: { pronAttempts: 0, pron90: 0, roleRounds: 0, corrTotal: 0, roleScoreSum: 0, roleScoreN: 0 },
   studySecs: 0, badgesSeen: [],
-  planTier: 30, dailyPlan: null, servedNew: {},
+  planTier: 30, dailyPlan: null, servedNew: {}, planDone: {},
   voiceURI: "auto", speed: 1,
   currentLesson: null, currentStep: "words"
 };
@@ -4473,7 +4473,7 @@ function saveState(){
       corr: state.corr.slice(0, 150), pron: state.pron.slice(0, 200), pronBest: state.pronBest,
       grammarSeen: [...state.grammarSeen], grammarQuiz: [...state.grammarQuiz],
       stats: state.stats, studySecs: state.studySecs, badgesSeen: state.badgesSeen,
-      planTier: state.planTier, dailyPlan: state.dailyPlan, servedNew: state.servedNew,
+      planTier: state.planTier, dailyPlan: state.dailyPlan, servedNew: state.servedNew, planDone: state.planDone,
       voiceURI: state.voiceURI, speed: state.speed
     }));
   } catch(e){ }
@@ -4516,6 +4516,7 @@ function loadState(){
   state.badgesSeen = d.badgesSeen || [];
   state.planTier = TIERS[d.planTier] ? d.planTier : 30;
   state.dailyPlan = d.dailyPlan || null;
+  state.planDone = (d.planDone && typeof d.planDone === "object" && !Array.isArray(d.planDone)) ? d.planDone : {};
   state.servedNew = (d.servedNew && typeof d.servedNew === "object" && !Array.isArray(d.servedNew)) ? d.servedNew : {};
   state.voiceURI = d.voiceURI || "auto";
   state.speed = d.speed || 1;
@@ -4543,6 +4544,7 @@ function streakDays(){
 }
 function pracLine(lid){
   if(!state.pracLines.has(lid)){ state.pracLines.add(lid); todayLog().lines++; }
+  markPlanDone("dialogue", lid);   /* v5.1：复习句的今日完成标记（新句靠 pracLines 本身判完成，不受影响） */
   markStudied();
 }
 /* ---------- 通用 ---------- */
@@ -4599,6 +4601,37 @@ function serveNewWords(tier, prevWords){
   const fresh = record.filter(id => state.wordGrades[id] === undefined);
   return graded.concat(fresh.slice(0, Math.max(0, quota - graded.length)));
 }
+/* v5.1 计划枯竭修复（Doki 真机：语法 60 课、对话 360 句全部学完后，今日页语法/对话
+   变 0/0、发音永远顶着未练池前 16 条不更新）：
+   - 发放顺序永远是「未学新内容 → 复习补齐」：新内容按原顺序先发，只有配额没凑满时
+     才从已学里按「最早学过」优先、叠加按日轮换偏移补齐（复习只是兜底）。
+   - 发音未练池按日轮换（偏移 = 日序号 × 配额），不再每天顶着同一批。
+   - 复习项记在 plan.review 里：它们的完成只认「今天真练过」（planDone 当日标记，
+     由各完成入口打上），不许因为「早就学过」一发放就显示已完成。 */
+function planDayIndex(){
+  const m = /^(\d+)-(\d+)-(\d+)$/.exec(dayKey());
+  if(!m) return 0;
+  return Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3]) / 86400000);
+}
+function rotateByDay(pool, quota){
+  const a = (pool || []).slice();
+  if(a.length <= quota) return a;
+  const off = (planDayIndex() * Math.max(1, quota)) % a.length;
+  return a.slice(off).concat(a.slice(0, off));
+}
+function markPlanDone(kind, id){
+  if(!id) return;
+  if(!state.planDone || typeof state.planDone !== "object" || Array.isArray(state.planDone)) state.planDone = {};
+  const t = dayKey();
+  Object.keys(state.planDone).forEach(k => { if(k !== t) delete state.planDone[k]; });
+  const d = state.planDone[t] || (state.planDone[t] = { grammar: [], dialogue: [] });
+  if(!Array.isArray(d[kind])) d[kind] = [];
+  if(!d[kind].includes(id)) d[kind].push(id);
+}
+function planDoneToday(kind, id){
+  const d = state.planDone && state.planDone[dayKey()];
+  return !!(d && Array.isArray(d[kind]) && d[kind].includes(id));
+}
 function buildPlanFor(tier, prev){
   const t = TIERS[tier];
   /* 先保留今天已打勾的项，再保留原清单里未做的，最后按从易到难补没学过的内容，凑满新档数量 */
@@ -4617,15 +4650,41 @@ function buildPlanFor(tier, prev){
   const dialogue = keep(prev && prev.dialogue, t.dialogue,
     id => state.pracLines.has(id),
     ALL_LINES.filter(x => !state.pracLines.has(x.lid)).map(x => x.lid));
-  const pron = keep(prev && prev.pron, t.pron,
-    id => state.pronBest[id] !== undefined,
-    ALL_LINES.filter(x => state.pronBest[x.lid] === undefined).map(x => x.lid));
-  return { date: dayKey(), tier, words, grammar, dialogue, pron };
+  /* 发音：已练过的今日项保留，其余一律从「按日轮换后的未练池」补——不再保留昨日
+     未做项（那正是名单永远不变的原因） */
+  const pron = [];
+  const pronPush = id => { if(id && !pron.includes(id)) pron.push(id); };
+  (prev && prev.pron || []).forEach(id => { if(state.pronBest[id] !== undefined) pronPush(id); });
+  rotateByDay(ALL_LINES.filter(x => state.pronBest[x.lid] === undefined).map(x => x.lid), t.pron)
+    .forEach(id => { if(pron.length < t.pron) pronPush(id); });
+  /* 复习兜底：新内容不足配额时才补，顺序为已学先后（最早学过的先复习）经按日轮换 */
+  const prevReview = (prev && prev.review) || { grammar: [], dialogue: [] };
+  const filled = { grammar: [], dialogue: [] };
+  if(grammar.length < t.grammar){
+    rotateByDay([...state.grammarSeen].filter(id => LESSON_MAP[id]), t.grammar)
+      .forEach(id => { if(grammar.length < t.grammar && !grammar.includes(id)){ grammar.push(id); filled.grammar.push(id); } });
+  }
+  if(dialogue.length < t.dialogue){
+    rotateByDay([...state.pracLines], t.dialogue)
+      .forEach(id => { if(dialogue.length < t.dialogue && !dialogue.includes(id)){ dialogue.push(id); filled.dialogue.push(id); } });
+  }
+  const review = {
+    grammar: grammar.filter(id => prevReview.grammar.includes(id) || filled.grammar.includes(id)),
+    dialogue: dialogue.filter(id => prevReview.dialogue.includes(id) || filled.dialogue.includes(id))
+  };
+  return { date: dayKey(), tier, words, grammar, dialogue, pron, review };
 }
 function planComplete(p, tier){
   const t = TIERS[tier];
   if(!t || !p) return false;
-  const pools = { words: ALL_WORDS.length, grammar: ALL_LESSONS.length, dialogue: ALL_LINES.length, pron: ALL_LINES.length };
+  /* v5.1：可达上限按「新内容＋复习兜底」算——语法/对话可达全部内容量（复习补齐），
+     发音只能发未练过的（加上今日名单里已练的），别再拿总池量判满逼着每渲染重建 */
+  const pools = {
+    words: ALL_WORDS.length,
+    grammar: ALL_LESSONS.length,
+    dialogue: ALL_LINES.length,
+    pron: ALL_LINES.filter(x => state.pronBest[x.lid] === undefined).length + (p.pron || []).filter(id => state.pronBest[id] !== undefined).length
+  };
   return ["words", "grammar", "dialogue", "pron"].every(k => (p[k] || []).length >= Math.min(t[k], pools[k]));
 }
 function genPlan(){
@@ -4648,10 +4707,12 @@ function genPlan(){
 }
 function planProgress(){
   const p = genPlan();
+  const rev = p.review || { grammar: [], dialogue: [] };
   const c = {
     words:    { done: p.words.filter(id => state.wordGrades[id] !== undefined).length, total: p.words.length },
-    grammar:  { done: p.grammar.filter(id => state.grammarSeen.has(id)).length, total: p.grammar.length },
-    dialogue: { done: p.dialogue.filter(id => state.pracLines.has(id)).length, total: p.dialogue.length },
+    /* v5.1：复习项只认今天真练过（planDone 当日标记）；新内容项沿用旧口径 */
+    grammar:  { done: p.grammar.filter(id => rev.grammar.includes(id) ? planDoneToday("grammar", id) : state.grammarSeen.has(id)).length, total: p.grammar.length },
+    dialogue: { done: p.dialogue.filter(id => rev.dialogue.includes(id) ? planDoneToday("dialogue", id) : state.pracLines.has(id)).length, total: p.dialogue.length },
     pron:     { done: p.pron.filter(id => state.pronBest[id] !== undefined).length, total: p.pron.length }
   };
   const done = c.words.done + c.grammar.done + c.dialogue.done + c.pron.done;
@@ -9127,7 +9188,7 @@ function renderGrammarToday(){
     const t = $("#grammarMain"); if(t) setTimeout(() => t.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
   }));
   host.querySelectorAll("[data-gt-done]").forEach(b => b.addEventListener("click", () => {
-    state.grammarSeen.add(b.dataset.gtDone); addXP(5); renderGrammarToday(); renderHUD();
+    state.grammarSeen.add(b.dataset.gtDone); markPlanDone("grammar", b.dataset.gtDone); addXP(5); renderGrammarToday(); renderHUD();
     toast("已标记学完：今日语法进度 +1");
   }));
 }
@@ -9197,7 +9258,7 @@ function renderGrammarBrowse(){
   }
   const doneBtn = $("#gDone");
   if(doneBtn) doneBtn.addEventListener("click", () => {
-    state.grammarSeen.add(ls.id); addXP(5); renderGrammar(); toast("已标记学完：今日语法进度 +1");
+    state.grammarSeen.add(ls.id); markPlanDone("grammar", ls.id); addXP(5); renderGrammar(); toast("已标记学完：今日语法进度 +1");
   });
   const undoBtn = $("#gUndo");
   if(undoBtn) undoBtn.addEventListener("click", () => { state.grammarSeen.delete(ls.id); saveState(); renderGrammar(); });
@@ -10690,7 +10751,7 @@ function vlQuizPass(){
   else {
     if(!state.grammarQuiz.has(VL.id)){ addXP(10); }
     state.grammarQuiz.add(VL.id);
-    state.grammarSeen.add(VL.id);
+    state.grammarSeen.add(VL.id); markPlanDone("grammar", VL.id);
     saveState();
   }
   const c = document.getElementById('vlPassClose');
