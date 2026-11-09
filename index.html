@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202611091424";
+var APP_BUILD = "v202611091514";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
