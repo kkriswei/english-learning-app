@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202611101812";
+var APP_BUILD = "v202611230403";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6608,10 +6608,12 @@ function endGradeNow(){ if(gradeDoneHook) gradeDoneHook(); }
    v3.24 同步刷新延后/版本自检延后照常。 */
 let GS = null;                 /* 当前判分会话；null = IDLE */
 const GS_SCORING_MS = 90000;   /* SCORING 总超时，含自装下载（__GS_TIMING.scoringMs 可注入） */
+const GS_INSTALL_MS = 300000;   /* v5.8：SCORING 停在自装/重下阶段时的总上限——77MB 慢网下载需要分钟级，仍须有界（__GS_TIMING.installMs 可注入） */
 const GS_REC_CAP_MS = 30000;   /* 录音安全上限（防忘关）：正常流程永不触发，不做任何「读完」判定 */
 function gsTiming(){
   const g = (typeof window !== "undefined" && window.__GS_TIMING) || {};
-  return { scoringMs: (typeof g.scoringMs === "number" && g.scoringMs > 0) ? g.scoringMs : GS_SCORING_MS };
+  return { scoringMs: (typeof g.scoringMs === "number" && g.scoringMs > 0) ? g.scoringMs : GS_SCORING_MS,
+           installMs: (typeof g.installMs === "number" && g.installMs > 0) ? g.installMs : GS_INSTALL_MS };
 }
 /* 结果区按块渲染：每块独立 try/catch，抛错只缺本块（fb 给必达块兜底） */
 function safeBlock(fn, fb){ try { const r = fn(); return (r === null || r === undefined) ? "" : String(r); } catch(e){ return fb || ""; } }
@@ -6646,6 +6648,7 @@ function gsDeliver(S, out){
 function gsFailOut(S, err){
   return { text: null, res: null, alts: null, url: S.url || null, blob: S.blob || null,
     err: err || "no-response", offline: false, phaseB: true, retried: false,
+    asrDown: !!S.asrDown,   /* v5.8：本次失败出在离线组件自装/重下环节（非引擎没听清）→ 失败面据此给真因说明＋重装入口 */
     recSilent: !!S.recSilent, recPeak: (S.recPeak === undefined ? null : S.recPeak) };
 }
 function gsDeliverFail(S, err){ gsDeliver(S, gsFailOut(S, err)); }
@@ -6727,7 +6730,20 @@ function gsFinishRecording(S){
 function gsScoring(S){
   if(GS !== S || S.settled) return;
   S.state = "scoring";
-  gsT(S, () => gsDeliverFail(S, "timeout"), gsTiming().scoringMs);   /* 本阶段总超时（含自装下载） */
+  /* v5.8：总超时改按阶段判定——纯转写沿用 scoringMs；停在自装/重下阶段时放宽到
+     installMs（慢网下 77MB 分钟级属正常），到点仍按失败交付且标 asrDown 让失败面
+     说清真因。每 5s 轮询一次阶段与耗时，任一阶段都保证有界、绝不无限等。 */
+  const scT0 = Date.now();
+  const armScoringCap = () => {
+    gsT(S, () => {
+      if(GS !== S || S.state !== "scoring" || S.settled) return;
+      const cap = S.asrPhase === "install" ? gsTiming().installMs : gsTiming().scoringMs;
+      if(Date.now() - scT0 < cap){ armScoringCap(); return; }
+      if(S.asrPhase === "install"){ S.asrDown = true; gsDeliverFail(S, "no-response"); }
+      else gsDeliverFail(S, "timeout");
+    }, 5000);
+  };
+  armScoringCap();
   const done = pk => {
     if(GS !== S || S.state !== "scoring") return;
     S.recPeak = pk; S.recSilent = recSilentOf(pk);
@@ -6742,7 +6758,8 @@ function gsScoring(S){
           if(sc) gsDeliver(S, { text: sc.text, res: sc.res, alts: [text], url: S.url, blob: S.blob, err: null, offline: true, phaseB: true, retried: false, recSilent: S.recSilent, recPeak: pk });
           else gsDeliverFail(S, "no-response");
         },
-        onFail: () => { if(GS === S && S.state === "scoring") gsDeliverFail(S, "no-response"); },
+        onPhase: p => { S.asrPhase = p; },
+        onFail: reason => { if(GS === S && S.state === "scoring"){ if(reason === "install") S.asrDown = true; gsDeliverFail(S, "no-response"); } },
         alive: () => GS === S && S.state === "scoring"
       });
     } catch(e){ gsDeliverFail(S, "no-response"); }
@@ -6889,7 +6906,32 @@ function asrTextSane(text, targetEn, wordMode){
   }
   return true;
 }
-function asrMarkCached(){ try { localStorage.setItem(ASR_FLAG_KEY, "1"); } catch(e){} }
+function asrMarkCached(){ asrCacheVerdict = true; try { localStorage.setItem(ASR_FLAG_KEY, "1"); } catch(e){} }
+/* v5.8：模型实存校验——「已装」标志只写在 localStorage，而 77MB 模型本体躺在
+   transformers.js 的 Cache Storage（transformers-cache）里，两者被 iOS 独立回收：
+   系统在存储压力下清掉缓存、标志却留着时，旧版永远以为已装、每次转写在 Worker 里
+   默默重下 77MB（decoder 单文件 53.7MB、无断点续传），网一卡就轮轮 25s 超时失败，
+   界面只给一句与真因无关的「识别服务没给出结果」、重装入口还被假标志挡住不显示
+   （2026-11-23 学员实测：发音全灭、语法/对话/单词照常）。校验口径：两个 ONNX 大
+   文件都在缓存里才算实存；校验本身出错/环境无 Cache Storage → 信旧标志不回退。
+   结论按页缓存（asrCacheVerdict），下载/转写成功即置 true（asrMarkCached）。 */
+let asrCacheVerdict = null;   /* null＝未校验；true＝实存（或无法校验、信标志）；false＝实锤被清 */
+function asrVerifyModelCache(){
+  if(asrCacheVerdict !== null) return Promise.resolve(asrCacheVerdict);
+  return (async () => {
+    try {
+      if(typeof caches === "undefined" || !caches || !caches.open){ asrCacheVerdict = true; return true; }
+      const c = await caches.open("transformers-cache");
+      const keys = await c.keys();
+      const urls = keys.map(r => (r && r.url) || "");
+      const hasDec = urls.some(u => u.indexOf("decoder_model_merged_quantized.onnx") >= 0);
+      const hasEnc = urls.some(u => u.indexOf("encoder_model_quantized.onnx") >= 0);
+      asrCacheVerdict = !!(hasDec && hasEnc);
+    } catch(e){ asrCacheVerdict = true; }
+    return asrCacheVerdict;
+  })();
+}
+function asrClearCachedFlag(){ asrCacheVerdict = false; try { localStorage.removeItem(ASR_FLAG_KEY); } catch(e){} }
 /* 录音 Blob → 16kHz 单声道 Float32Array（报告实测链：AudioContext({sampleRate:16000}).decodeAudioData → getChannelData(0)） */
 function asrDecodePcm(blob){
   return new Promise(res => {
@@ -7006,9 +7048,14 @@ function asrProgAgg(){
   };
 }
 let asrMainPipeP = null;
+const ASR_MAINLOAD_TIMEOUT_DEFAULT = 45000;   /* v5.8：主线程回退的「加载」上限（只管 import+建管线，不管推理）——旧版无超时，fetch 卡住时 Promise 永不落定、整条回退链挂死（__ASR_TIMING.mainLoadMs 可注入） */
+function asrMainLoadTimeoutMs(){
+  const o = (typeof window !== "undefined" && window.__ASR_TIMING) || {};
+  return (typeof o.mainLoadMs === "number" && o.mainLoadMs > 0) ? o.mainLoadMs : ASR_MAINLOAD_TIMEOUT_DEFAULT;
+}
 function asrMainLoad(){
   if(asrMainPipeP) return asrMainPipeP;
-  asrMainPipeP = (async () => {
+  const raw = (async () => {
     const T = await import(ASR_BASE + "lib/transformers.web.min.js");
     const env = T.env;
     env.remoteHost = ASR_BASE;
@@ -7017,7 +7064,8 @@ function asrMainLoad(){
     env.backends.onnx.wasm.wasmPaths = { mjs: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.mjs", wasm: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.wasm" };
     return await T.pipeline("automatic-speech-recognition", "whisper-base.en", { device: "wasm", dtype: "q8", progress_callback: asrProgAgg() });
   })();
-  asrMainPipeP.catch(() => { asrMainPipeP = null; });
+  asrMainPipeP = Promise.race([raw, new Promise((_, rej) => setTimeout(() => rej(new Error("asr main load timeout")), asrMainLoadTimeoutMs()))]);
+  asrMainPipeP.catch(() => { asrMainPipeP = null; });   /* 失败/超时都清缓存承诺：卡死的一次不毒害后续尝试 */
   return asrMainPipeP;
 }
 async function asrDoTranscribe(blob){
@@ -7074,7 +7122,15 @@ function paintAsrSetup(host){
   const b = host.querySelector("[data-asrdl]");
   if(b) b.addEventListener("click", () => asrSetupDownload(host));
 }
-function refreshAsrSetup(){ document.querySelectorAll(".asr-setup-host").forEach(h => paintAsrSetup(h)); }
+function refreshAsrSetup(){
+  document.querySelectorAll(".asr-setup-host").forEach(h => paintAsrSetup(h));
+  /* v5.8：标志说已装时顺手验一次实存——被系统清掉就清标志、安装卡重新出现（她在今日页就能一键重装，不必等打分失败才发现） */
+  try {
+    if(asrEngine() === realAsrEngine && asrEngine().cached() && asrCacheVerdict === null){
+      asrVerifyModelCache().then(p => { if(!p){ asrClearCachedFlag(); document.querySelectorAll(".asr-setup-host").forEach(h => paintAsrSetup(h)); } });
+    }
+  } catch(e){}
+}
 /* v3.24：词卡跟读失败时的出路——带她去今日页装离线组件。v3.21 口径不变：词卡内
    绝不放下载卡，这里只做导航：先把词卡跟读状态收尾干净（清 wsbusy、作废本场
    判分、停录音，免得残留忙碌标记把同步/版本检查的延后刷新卡死），再切到今日页，
@@ -7115,24 +7171,48 @@ function asrSetupDownload(host){
 }
 /* 只下载模型、不转写：注入引擎（冒烟）可自备 download(prog, cb)；生产走 Worker 的
    preload 消息（模型进缓存、进度走同一条 progress 通道），Worker 不可用退主线程加载 */
+/* v5.8：下载看门狗口径——停滞（无任何下载进度）满 dlStallMs 判死、总时长满
+   dlMaxMs 判死。旧版 asrDownloadModel 没有任何超时：Worker 的 20s 静默看门狗会被
+   涓流进度无限续命、主线程回退 asrMainLoad 更是无界，连接半死不活时下载能永远
+   转下去（今日页安装卡与打分面自装都中招）。__ASR_TIMING.dlStallMs/dlMaxMs 可注入。 */
+const ASR_DL_STALL_DEFAULT = 45000, ASR_DL_MAX_DEFAULT = 240000;
+function asrDlTiming(){
+  const o = (typeof window !== "undefined" && window.__ASR_TIMING) || {};
+  return { stallMs: (typeof o.dlStallMs === "number" && o.dlStallMs > 0) ? o.dlStallMs : ASR_DL_STALL_DEFAULT,
+           maxMs: (typeof o.dlMaxMs === "number" && o.dlMaxMs > 0) ? o.dlMaxMs : ASR_DL_MAX_DEFAULT };
+}
 function asrDownloadModel(prog, cb){
   let finished = false;
-  const finish = ok => { if(finished) return; finished = true; asrBusyCount--; asrProgSink = null; cb(!!ok); };
+  let dlStallTimer = null, dlMaxTimer = null;
+  const finish = ok => {
+    if(finished) return; finished = true;
+    if(dlStallTimer){ try { clearInterval(dlStallTimer); } catch(e){} dlStallTimer = null; }
+    if(dlMaxTimer){ try { clearTimeout(dlMaxTimer); } catch(e){} dlMaxTimer = null; }
+    asrBusyCount--; asrProgSink = null; cb(!!ok);
+  };
   asrBusyCount++;   /* v3.14：模型下载中途被版本跳转打断等于白下，下载也算忙碌 */
   const eng = asrEngine();
   if(eng !== realAsrEngine && eng && typeof eng.download === "function"){
     try { eng.download(prog, finish); } catch(e){ finish(false); }
     return;
   }
-  asrProgSink = prog || null;
+  /* 真实引擎路径才挂看门狗（注入引擎是冒烟替身，口径不变）：进度每动一次刷新
+     活动时刻；判死时先杀 Worker 解开在途 preload，再按失败落定（上层会给重试入口） */
+  const dlT = asrDlTiming();
+  let dlLastAct = Date.now();
+  asrProgSink = pct => { dlLastAct = Date.now(); if(prog){ try { prog(pct); } catch(e){} } };
+  const dlDie = () => { try { asrKillWorker(); } catch(e){} try { asrFailAllWaiters("download watchdog"); } catch(e){} finish(false); };
+  dlStallTimer = setInterval(() => { if(Date.now() - dlLastAct > dlT.stallMs) dlDie(); }, 5000);
+  dlMaxTimer = setTimeout(dlDie, dlT.maxMs);
   (async () => {
     if(!asrWorkerDead){
       const r = await asrWorkerCall({ type: "preload" });
+      if(finished) return;   /* 看门狗已判死落定：不再顺手走主线程回退重复下载 */
       if(r && r.type === "loaded"){ asrMarkCached(); finish(true); return; }
       asrWorkerDead = true;
       if(asrWorker){ const wk = asrWorker; asrWorker = null; try { wk.terminate(); } catch(e){} }
     }
-    try { await asrMainLoad(); asrEmitProg(100); asrMarkCached(); finish(true); }
+    try { await asrMainLoad(); if(finished) return; asrEmitProg(100); asrMarkCached(); finish(true); }
     catch(e){ finish(false); }
   })();
 }
@@ -7239,34 +7319,58 @@ function asrEnsureModel(prog, done){
   });
 }
 /* opt: { render(text)->progEl（把状态文案 + ASR_PROG_HTML 写进本面容器、返回进度根元素）,
-        onText(转写文字), onFail(), alive()->bool（可选，缺省恒真） } */
+        onText(转写文字), onFail(reason), onPhase(phase)（可选）, alive()->bool（可选，缺省恒真） }
+   v5.8 修订：①已装分支先验模型实存（asrVerifyModelCache）——标志在、实存被系统
+   清掉时，清标志并走安装分支当场重下（带进度），文案明说「被系统清掉了」；
+   ②onFail 带 reason："install"＝自装/重下环节失败、"engine"＝引擎转写失败，
+   调用方据此给真因说明；③onPhase 上报 "install"/"transcribe" 阶段，供会话
+   总超时按阶段放宽（gsScoring）。注入引擎（冒烟）不走实存校验、行为与旧版一致。 */
 function asrEngageOrInstall(out, opt){
   const alive = () => { try { return !opt.alive || opt.alive(); } catch(e){ return false; } };
-  if(asrEngine().cached()){
+  const phase = p => { if(opt.onPhase){ try { opt.onPhase(p); } catch(e){} } };
+  const goCached = () => {
+    phase("transcribe");
     const progEl = opt.render("离线识别中…");
-    asrRunOffline(out, progEl, t => { if(alive()) opt.onText(t); }, () => { if(alive()) opt.onFail(); });
-    return;
-  }
-  const progEl = opt.render("正在装离线打分组件（约80MB，装一次，以后没网也能打分）…");
-  const showProg = pct => {
-    if(!progEl || !progEl.isConnected) return;
-    progEl.hidden = false;
-    const bar = progEl.querySelector("i"), tx = progEl.querySelector("[data-asrpt]");
-    if(bar) bar.style.width = pct + "%";
-    if(tx) tx.textContent = pct >= 100 ? "装好了，正在识别你刚才读的…" : "正在装离线打分组件… " + pct + "%";
+    asrRunOffline(out, progEl, t => { if(alive()) opt.onText(t); }, () => { if(alive()) opt.onFail("engine"); });
   };
-  showProg(0);
-  asrEnsureModel(showProg, ok => {
-    if(!ok){ if(alive()) opt.onFail(); return; }
-    if(!alive()) return;   /* 她已离开这个面板：组件装好留着下次用，这遍不写 UI */
-    asrRunOffline(out, (progEl && progEl.isConnected) ? progEl : null,
-      t => { if(alive()) opt.onText(t); }, () => { if(alive()) opt.onFail(); });
+  const goInstall = evicted => {
+    phase("install");
+    const progEl = opt.render(evicted
+      ? "离线组件被系统清掉了，正在重新下载（约80MB，装好自动打分）…"
+      : "正在装离线打分组件（约80MB，装一次，以后没网也能打分）…");
+    const showProg = pct => {
+      if(!progEl || !progEl.isConnected) return;
+      progEl.hidden = false;
+      const bar = progEl.querySelector("i"), tx = progEl.querySelector("[data-asrpt]");
+      if(bar) bar.style.width = pct + "%";
+      if(tx) tx.textContent = pct >= 100 ? "装好了，正在识别你刚才读的…" : (evicted ? "正在重新下载离线组件… " : "正在装离线打分组件… ") + pct + "%";
+    };
+    showProg(0);
+    asrEnsureModel(showProg, ok => {
+      if(!ok){ if(alive()) opt.onFail("install"); return; }
+      if(!alive()) return;   /* 她已离开这个面板：组件装好留着下次用，这遍不写 UI */
+      phase("transcribe");
+      asrRunOffline(out, (progEl && progEl.isConnected) ? progEl : null,
+        t => { if(alive()) opt.onText(t); }, () => { if(alive()) opt.onFail("engine"); });
+    });
+  };
+  const eng = asrEngine();
+  if(eng !== realAsrEngine){ if(eng.cached()) goCached(); else goInstall(false); return; }
+  if(!eng.cached()){ goInstall(false); return; }
+  asrVerifyModelCache().then(present => {
+    if(!alive()) return;
+    if(present) goCached();
+    else { asrClearCachedFlag(); goInstall(true); }
   });
 }
 /* 句子面（角色扮演/发音句）失败 UI 的导航按钮：与词卡 v3.24 同口径——组件没装
    时才出现，点击去今日页那张一次性安装卡。句子面没有词卡面板要收尾，走
    wsGotoAsrSetup(null)：其内部对空 panel 有防护，只做切页 + 滚动 + 高亮。 */
 const ASR_NAV_BTN_HTML = '<button class="btn ghost small" data-asrnav type="button">去装离线组件（装一次，没网也能跟读）</button>';
+/* v5.8：失败出在离线组件自装/重下环节（out.asrDown）时的真因说明——不是她没读好、
+   也不是苹果识别的事：组件没装好/被系统清了。三个打分面共用，配 ASR_NAV_BTN_HTML
+   给一键去重装的入口（今日页安装卡，装完回来重读即可）。 */
+const ASR_DOWN_HINT = "这次没打成不是你读的问题：离线打分组件没装好（可能被系统清掉了）。去把组件下载完，再回来读就能打分。";
 function asrWireNavBtn(root){
   const b = root && root.querySelector ? root.querySelector("[data-asrnav]") : null;
   if(b) b.addEventListener("click", () => wsGotoAsrSetup(null));
@@ -8518,12 +8622,15 @@ function startWordScore(host, v, uid){
   const wsShowFail = out => {
     const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
     panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>' +
+      /* v5.8：组件自装/重下环节失败 → 真因说明（同另两个打分面口径） */
+      (out && out.asrDown ? '<div class="ws-state" style="font-size:13px;">' + ASR_DOWN_HINT + '</div>' : '') +
       '<div class="ws-row">' +
       (out && out.url ? '<button class="btn ghost small" data-wsmine type="button">▶ 听我的录音</button>' : '') +
       '<button class="btn soft small" data-wsretry type="button">🎤 重新录</button>' +
       /* v3.24：只给「重新录」是死胡同——离线组件没装时多给一个次级导航按钮，
-         去今日页装一次，以后没网也能跟读；已装则不显示（已装还失败是别的原因）。 */
-      (asrSetupNeeded() ? '<button class="btn ghost small" data-wsasr type="button">去装离线组件（装一次，没网也能跟读）</button>' : '') + '</div>';
+         去今日页装一次，以后没网也能跟读；已装则不显示（已装还失败是别的原因）。
+         v5.8：asrDown（装的过程中失败）同样给入口。 */
+      ((asrSetupNeeded() || (out && out.asrDown)) ? '<button class="btn ghost small" data-wsasr type="button">去装离线组件（装一次，没网也能跟读）</button>' : '') + '</div>';
     wsWire();
     wsWireMine(out && out.url);
     const ab = panel.querySelector("[data-wsasr]");
@@ -9572,7 +9679,9 @@ function rpGradeResult(zone, ls, cur, out){
       const rz = zone.querySelector("#rpResult");
       if(rz){
         rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div>' +
-          (asrSetupNeeded() ? '<div style="margin-top:8px;">' + ASR_NAV_BTN_HTML + '</div>' : '') + '</div>';
+          /* v5.8：组件自装/重下环节失败 → 真因说明＋重装入口（口径同发音句） */
+          (out.asrDown ? '<div class="mic-note" style="margin-top:6px;">' + ASR_DOWN_HINT + '</div>' : '') +
+          ((asrSetupNeeded() || out.asrDown) ? '<div style="margin-top:8px;">' + ASR_NAV_BTN_HTML + '</div>' : '') + '</div>';
         asrWireNavBtn(rz);
       } else toast(srErrText(out.err));
     } else {
@@ -9841,10 +9950,12 @@ function pronCard(ls, i){
   const renderZeroFail = out => {
     const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
     result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>' +
+      /* v5.8：失败出在组件自装/重下环节 → 补真因说明（组件被清/没装好），别让她对着「识别没给出结果」反复重读 */
+      (out.asrDown ? '<div class="mic-note" style="margin-top:6px;">' + ASR_DOWN_HINT + '</div>' : '') +
       /* v4.1：失败面也给「重新录」（回 READY 重录）＋录音回放（gradeOut 已 showMine 到 .mine-audio） */
       '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;"><button class="btn soft small" data-reread type="button">🎤 重新录</button></div>' +
-      /* 组件没装时失败面补一个导航按钮，去今日页装（与词卡同口径） */
-      (asrSetupNeeded() ? '<div style="margin-top:8px;">' + ASR_NAV_BTN_HTML + '</div>' : '');
+      /* 组件没装时失败面补一个导航按钮，去今日页装（与词卡同口径）；v5.8：asrDown 时同样给入口 */
+      ((asrSetupNeeded() || out.asrDown) ? '<div style="margin-top:8px;">' + ASR_NAV_BTN_HTML + '</div>' : '');
     const rrb0 = result.querySelector("[data-reread]");
     if(rrb0) rrb0.addEventListener("click", () => checkBtn.click());
     asrWireNavBtn(result);
