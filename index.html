@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202611240220";
+var APP_BUILD = "v202611241238";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6644,6 +6644,9 @@ function gsTeardown(S, displaced){
 /* 交付结果：先 teardown 回 IDLE（渲染时 __APP_BUSY 已为 false），再且只调一次 ui.result */
 function gsDeliver(S, out){
   if(S.settled || GS !== S) return; S.settled = true;
+  /* v6.0：SCORING 态的失败交付先收一条 ASR 诊断（asrDiagOnScoreFail 在 ASR 段定义、
+     函数声明提升可达）：给 out 挂诊断短码供失败面展示、条目回传、自检随后台跑 */
+  try { if(out && out.err && S.state === "scoring") asrDiagOnScoreFail(S, out); } catch(e){}
   gsTeardown(S, false);
   try { S.ui.result(out); } catch(e){ setTimeout(() => { throw e; }, 0); }
 }
@@ -6732,6 +6735,7 @@ function gsFinishRecording(S){
 function gsScoring(S){
   if(GS !== S || S.settled) return;
   S.state = "scoring";
+  asrFailNote = null; asrFailChain = [];   /* v6.0：诊断注记按场清空，只记本场链路 */
   /* v5.8：总超时改按阶段判定——纯转写沿用 scoringMs；停在自装/重下阶段时放宽到
      installMs（慢网下 77MB 分钟级属正常），到点仍按失败交付且标 asrDown 让失败面
      说清真因。每 5s 轮询一次阶段与耗时，任一阶段都保证有界、绝不无限等。 */
@@ -6741,6 +6745,7 @@ function gsScoring(S){
       if(GS !== S || S.state !== "scoring" || S.settled) return;
       const cap = S.asrPhase === "install" ? gsTiming().installMs : gsTiming().scoringMs;
       if(Date.now() - scT0 < cap){ armScoringCap(); return; }
+      if(!asrFailChain.length) asrNoteFail(S.asrPhase === "install" ? "download" : "timeout", "scoring phase cap reached");   /* v6.0：纯超时、无低层注记时以阶段上限为失败点 */
       if(S.asrPhase === "install"){ S.asrDown = true; gsDeliverFail(S, "no-response"); }
       else gsDeliverFail(S, "timeout");
     }, 5000);
@@ -6755,10 +6760,10 @@ function gsScoring(S){
         render: t => { try { return S.ui.scoring(S.ctl, t); } catch(e){ return null; } },
         onText: text => {
           if(GS !== S || S.state !== "scoring") return;
-          if(!asrTextSane(text, S.target, S.word)){ gsDeliverFail(S, "no-speech"); return; }   /* 转写是垃圾＝没听清：不出分、不入账 */
+          if(!asrTextSane(text, S.target, S.word)){ asrNoteFail("transcribe", "transcript rejected by sane-guard"); gsDeliverFail(S, "no-speech"); return; }   /* 转写是垃圾＝没听清：不出分、不入账 */
           const sc = scoreFirst(S.target, [text], S.word);
           if(sc) gsDeliver(S, { text: sc.text, res: sc.res, alts: [text], url: S.url, blob: S.blob, err: null, offline: true, phaseB: true, retried: false, recSilent: S.recSilent, recPeak: pk });
-          else gsDeliverFail(S, "no-response");
+          else { if(!asrFailChain.length) asrNoteFail("transcribe", "transcript unscored (scoreFirst null)"); gsDeliverFail(S, "no-response"); }
         },
         onPhase: p => { S.asrPhase = p; },
         onFail: reason => { if(GS === S && S.state === "scoring"){ if(reason === "install") S.asrDown = true; gsDeliverFail(S, "no-response"); } },
@@ -6919,22 +6924,181 @@ function asrMarkCached(){ asrCacheVerdict = true; asrCacheVerifyKnown = true; tr
    结论按页缓存（asrCacheVerdict），下载/转写成功即置 true（asrMarkCached）。 */
 let asrCacheVerdict = null;   /* null＝未校验；true＝实存（或无法校验、信标志）；false＝实锤被清 */
 let asrCacheVerifyKnown = true;   /* v5.9：false＝这次根本没验成（无 Cache API/校验抛错）——v5.8 在这种情况下静默信标志，今日页连状态行都没有，她无从自救；v5.9 起状态行明说「无法确认」并给重装入口 */
+let asrCacheFilesSeen = [];   /* v6.0：最近一次实存校验在 transformers-cache 里实际看到的文件名（诊断条目的 modelFiles 来源） */
 function asrVerifyModelCache(){
   if(asrCacheVerdict !== null) return Promise.resolve(asrCacheVerdict);
   return (async () => {
     try {
-      if(typeof caches === "undefined" || !caches || !caches.open){ asrCacheVerifyKnown = false; asrCacheVerdict = true; return true; }
+      if(typeof caches === "undefined" || !caches || !caches.open){ asrCacheVerifyKnown = false; asrNoteFail("verify", "no Cache Storage API"); asrCacheVerdict = true; return true; }
       const c = await caches.open("transformers-cache");
       const keys = await c.keys();
       const urls = keys.map(r => (r && r.url) || "");
+      asrCacheFilesSeen = urls.map(u => String(u).split("/").pop()).filter(Boolean).slice(0, 12);
       const hasDec = urls.some(u => u.indexOf("decoder_model_merged_quantized.onnx") >= 0);
       const hasEnc = urls.some(u => u.indexOf("encoder_model_quantized.onnx") >= 0);
       asrCacheVerdict = !!(hasDec && hasEnc);
-    } catch(e){ asrCacheVerifyKnown = false; asrCacheVerdict = true; }
+    } catch(e){ asrCacheVerifyKnown = false; asrNoteFail("verify", e); asrCacheVerdict = true; }
     return asrCacheVerdict;
   })();
 }
 function asrClearCachedFlag(){ asrCacheVerdict = false; asrCacheVerifyKnown = true; try { localStorage.removeItem(ASR_FLAG_KEY); } catch(e){} }
+/* ═══════════ v6.0：ASR 失败诊断回传＋引擎自检（只诊断、不改判分） ═══════════
+   背景（2026-11-24）：deploy58/59 把缓存被清/下载卡死都修了，她的引擎仍不出
+   结果、发音连续 3 天 0 记录，而 App 不留任何失败细节——每一轮都只能盲猜。
+   本版三件事：①全链路每个低层失败点先落一枚注记（asrNoteFail：哪个阶段、
+   什么错），判分失败交付时（gsDeliver 钩子）收成一条结构化记录，存本地环
+   english-asr-diag-v1（最近 10 条），随账号同步信封层的 asrDiag 字段送出
+   （与 build 同层、不参与任何同步判定、不动 data 与 english-dialogue-v2）；
+   失败后主动触发一次同步（acctScheduleSync 既有防抖；防覆盖守卫口径不变——
+   诊断只搭上行便车：本地进度不许上行时诊断也不上行，留待下次）。非判分场景
+   的下载失败（今日页安装卡/重装）由 asrDownloadModel 失败落定处直接收条。
+   ②判分失败自动跑一次引擎自检：拿 App 自带的一条 TTS 标准录音（文本已知）
+   喂同一条转写管线，结果另记一条 stage=selftest 记录——自检也空/报错＝引擎
+   在本机坏；自检正常＝问题在她的录音链。③失败提示末尾带诊断短码（阶段→
+   A1..A9，ASR_DIAG_CODES），她截图即可对号。判分口径一字不动。 */
+const ASR_DIAG_KEY = "english-asr-diag-v1";
+const ASR_DIAG_CODES = { verify: "A1", download: "A2", worker: "A3", load: "A4", decode: "A5", transcribe: "A6", timeout: "A7", session: "A9" };
+let asrFailNote = null;   /* 最近一次低层失败注记 {stage, errName, errMsg}；每场 gsScoring 开场清空 */
+let asrFailChain = [];    /* 本场失败阶段链（去重相邻同阶段）：级联失败时终点定 stage、链留全程 */
+function asrNoteFail(stage, err){
+  const msg = err == null ? "" : String((err && err.message) || err);
+  asrFailNote = { stage: stage, errName: (err && err.name) || "", errMsg: msg.slice(0, 200) };
+  if(asrFailChain[asrFailChain.length - 1] !== stage) asrFailChain.push(stage);
+}
+function asrDiagRead(){
+  try { const a = JSON.parse(localStorage.getItem(ASR_DIAG_KEY) || "[]"); return Array.isArray(a) ? a : []; } catch(e){ return []; }
+}
+function asrDiagWrite(a){
+  try { localStorage.setItem(ASR_DIAG_KEY, JSON.stringify((a || []).slice(-10))); } catch(e){}
+}
+function asrDiagEntry(stage, errName, errMsg, extra){
+  let standalone = false;
+  try { standalone = (typeof navigator !== "undefined" && navigator.standalone === true) || (typeof window !== "undefined" && window.matchMedia && window.matchMedia("(display-mode: standalone)").matches); } catch(e){}
+  const ent = {
+    ts: Date.now(),
+    build: (typeof APP_BUILD !== "undefined" ? APP_BUILD : ""),
+    stage: stage || "session",
+    errName: String(errName || "").slice(0, 60),
+    errMsg: String(errMsg || "").slice(0, 200),
+    cacheState: { flag: false, verdict: asrCacheVerdict, known: asrCacheVerifyKnown },
+    modelFiles: (asrCacheFilesSeen || []).slice(0, 12),
+    ua: String((typeof navigator !== "undefined" && navigator.userAgent) || "").slice(0, 120),
+    standalone: !!standalone
+  };
+  try { ent.cacheState.flag = !!asrEngine().cached(); } catch(e){}
+  if(asrFailChain.length) ent.chain = asrFailChain.slice(0, 8);
+  if(extra){ for(const k in extra) ent[k] = extra[k]; }
+  return ent;
+}
+function asrDiagPush(ent){
+  const a = asrDiagRead();
+  a.push(Object.assign({}, ent, { sent: false }));
+  asrDiagWrite(a);
+}
+function asrDiagPending(){
+  try { return asrDiagRead().some(e => e && !e.sent); } catch(e){ return false; }
+}
+/* 上行信封里的 asrDiag：本地 sent 标记不外带 */
+function asrDiagEnvelope(){
+  return asrDiagRead().map(e => { const o = {}; for(const k in e){ if(k !== "sent") o[k] = e[k]; } return o; });
+}
+function asrDiagMarkSent(){
+  const a = asrDiagRead();
+  let changed = false;
+  a.forEach(e => { if(e && !e.sent){ e.sent = true; changed = true; } });
+  if(changed) asrDiagWrite(a);
+}
+/* 另一容器（Safari/桌面图标）上行过的诊断，拉取时并进本地环：已在云端的条目
+   标 sent、不重复上行；按 ts+stage+errMsg 去重 */
+function asrDiagMergeRemote(remoteDiag){
+  if(!Array.isArray(remoteDiag) || !remoteDiag.length) return;
+  const a = asrDiagRead();
+  const seen = new Set(a.map(e => (e && e.ts) + "|" + (e && e.stage) + "|" + (e && e.errMsg)));
+  let added = false;
+  remoteDiag.forEach(r => {
+    if(!r || typeof r !== "object") return;
+    const k = r.ts + "|" + r.stage + "|" + r.errMsg;
+    if(seen.has(k)) return;
+    seen.add(k);
+    const o = {}; for(const kk in r){ if(kk !== "sent") o[kk] = r[kk]; }
+    o.sent = true;
+    a.push(o); added = true;
+  });
+  if(added){ a.sort((x, y) => (x.ts || 0) - (y.ts || 0)); asrDiagWrite(a); }
+}
+function asrDiagKickSync(){
+  try { if(typeof ACCT !== "undefined" && ACCT && ACCT.username && typeof acctScheduleSync === "function") acctScheduleSync(); } catch(e){}
+}
+/* 判分失败交付口（gsDeliver 在 SCORING 态失败时调用）：收一条诊断、给 out 挂
+   短码、触发同步、后台跑自检。注记缺失时按 out 形态兜底定 stage */
+function asrDiagOnScoreFail(S, out){
+  const note = asrFailNote;
+  const stage = note ? note.stage : (out.asrDown ? "download" : (out.err === "timeout" ? "timeout" : "session"));
+  const ent = asrDiagEntry(stage, note ? note.errName : "", note ? note.errMsg : ("grade fail err=" + (out.err || "")));
+  out.diagCode = ASR_DIAG_CODES[stage] || "A9";
+  asrDiagPush(ent);
+  asrDiagKickSync();
+  asrSelfTest();
+}
+function asrDiagSuffix(out){ return out && out.diagCode ? "（诊断码 " + out.diagCode + "）" : ""; }
+/* ── 引擎自检（判别器）：TTS 标准录音（文本已知）喂同一条转写管线 ── */
+let asrSelfTestBusy = false;
+function asrSelfTestSample(){
+  return (async () => {
+    try {
+      if(typeof ensureAudioData === "function") ensureAudioData();
+      const lines = (typeof ALL_LINES !== "undefined" && ALL_LINES) || [];
+      for(let i = 0; i < lines.length; i++){
+        const d = lines[i] && lines[i].d;
+        if(!d || !d[1]) continue;
+        const file = (typeof AUDIO_MAP !== "undefined") && (AUDIO_MAP[(d[0] ? d[0] + "\n" : "") + d[1]] || AUDIO_MAP[d[1]]);
+        if(!file) continue;
+        const text = d[1];
+        if(typeof AUDIO_DATA !== "undefined" && AUDIO_DATA[file]){
+          const m = /^data:([^;,]*)(;base64)?,([\s\S]*)$/.exec(String(AUDIO_DATA[file]));
+          if(m){
+            let blob = null;
+            if(m[2]){ const bin = atob(m[3]); const u8 = new Uint8Array(bin.length); for(let j = 0; j < bin.length; j++) u8[j] = bin.charCodeAt(j); blob = new Blob([u8], { type: m[1] || "audio/mpeg" }); }
+            else blob = new Blob([decodeURIComponent(m[3])], { type: m[1] || "audio/mpeg" });
+            if(blob && blob.size) return { blob: blob, text: text };
+          }
+          continue;
+        }
+        if(typeof fetch === "function"){
+          try { const r = await fetch("assets/audio/" + file); if(r && r.ok){ const b = await r.blob(); if(b && b.size) return { blob: b, text: text }; } } catch(e){}
+        }
+      }
+    } catch(e){}
+    return null;
+  })();
+}
+function asrSelfTest(){
+  if(asrSelfTestBusy) return;
+  asrSelfTestBusy = true;
+  const finish = ent => { asrSelfTestBusy = false; if(ent){ asrDiagPush(ent); asrDiagKickSync(); } };
+  (async () => {
+    const sample = await asrSelfTestSample();
+    if(!sample){ finish(asrDiagEntry("selftest", "", "sample audio unavailable")); return; }
+    const prevNote = asrFailNote, prevChain = asrFailChain;
+    asrFailNote = null; asrFailChain = [];
+    let timedOut = false;
+    const t = await new Promise(res => {
+      let settled = false;
+      const to = setTimeout(() => { if(!settled){ settled = true; timedOut = true; res(null); } }, 30000);
+      try {
+        asrEngine().transcribe(sample.blob, null, v => { if(!settled){ settled = true; clearTimeout(to); res(v === undefined ? null : v); } });
+      } catch(e){ if(!settled){ settled = true; clearTimeout(to); res(null); } }
+    });
+    const note = asrFailNote, chain = asrFailChain;
+    asrFailNote = prevNote; asrFailChain = prevChain;
+    const extra = { expect: String(sample.text).slice(0, 200) };
+    if(chain.length) extra.chain = chain.slice(0, 8);
+    if(timedOut) finish(asrDiagEntry("selftest", "", "selftest timeout 30s", extra));
+    else if(t === null) finish(asrDiagEntry("selftest", "", "engine fail" + (note ? (" stage=" + note.stage + " err=" + note.errMsg) : ""), extra));
+    else if(!String(t).trim()) finish(asrDiagEntry("selftest", "", "empty transcript", Object.assign({}, extra, { text: "" })));
+    else finish(asrDiagEntry("selftest", "", "ok", Object.assign({}, extra, { text: String(t).slice(0, 200) })));
+  })().catch(() => { asrSelfTestBusy = false; });
+}
 /* 录音 Blob → 16kHz 单声道 Float32Array（报告实测链：AudioContext({sampleRate:16000}).decodeAudioData → getChannelData(0)） */
 function asrDecodePcm(blob){
   return new Promise(res => {
@@ -6993,6 +7157,7 @@ function asrArmWaiter(id){
   if(en.timer) clearTimeout(en.timer);
   en.timer = setTimeout(() => {
     if(!asrWaiters.has(id)) return;
+    asrNoteFail("worker", "worker timeout (no message within " + asrWorkerTimeoutMs() + "ms)");   /* v6.0 诊断注记 */
     asrKillWorker();
     asrFailAllWaiters("worker timeout");
   }, asrWorkerTimeoutMs());
@@ -7011,18 +7176,19 @@ function asrSpawn(){
     });
     w.addEventListener("error", () => {
       asrWorkerDead = true;
+      asrNoteFail("worker", "worker error event");   /* v6.0 诊断注记 */
       try { w.terminate(); } catch(e){}
       if(asrWorker === w) asrWorker = null;
       asrFailAllWaiters("worker error");
     });
     asrWorker = w;
-  } catch(e){ asrWorkerDead = true; asrWorker = null; }
+  } catch(e){ asrWorkerDead = true; asrWorker = null; asrNoteFail("worker", e); }   /* v6.0 诊断注记：Worker 起不来 */
   return asrWorker;
 }
 function asrWorkerCall(msg){
   return new Promise(resolve => {
     const w = asrSpawn();
-    if(!w){ resolve({ type: "error", error: "no worker" }); return; }
+    if(!w){ asrNoteFail("worker", "no worker (spawn failed/dead)"); resolve({ type: "error", error: "no worker" }); return; }
     const id = ++asrSeq;
     asrWaiters.set(id, { resolve: resolve, timer: null });
     asrArmWaiter(id);
@@ -7030,6 +7196,7 @@ function asrWorkerCall(msg){
       if(msg.pcm) w.postMessage({ type: msg.type, id: id, pcm: msg.pcm }, [msg.pcm.buffer]);
       else w.postMessage({ type: msg.type, id: id });
     } catch(e){
+      asrNoteFail("worker", e);   /* v6.0 诊断注记 */
       const en = asrWaiters.get(id);
       if(en){ asrWaiters.delete(id); if(en.timer) clearTimeout(en.timer); }
       resolve({ type: "error", error: String(e) });
@@ -7068,12 +7235,12 @@ function asrMainLoad(){
     return await T.pipeline("automatic-speech-recognition", "whisper-base.en", { device: "wasm", dtype: "q8", progress_callback: asrProgAgg() });
   })();
   asrMainPipeP = Promise.race([raw, new Promise((_, rej) => setTimeout(() => rej(new Error("asr main load timeout")), asrMainLoadTimeoutMs()))]);
-  asrMainPipeP.catch(() => { asrMainPipeP = null; });   /* 失败/超时都清缓存承诺：卡死的一次不毒害后续尝试 */
+  asrMainPipeP.catch(e => { asrNoteFail("load", e); asrMainPipeP = null; });   /* 失败/超时都清缓存承诺：卡死的一次不毒害后续尝试；v6.0：顺手落模型加载失败注记 */
   return asrMainPipeP;
 }
 async function asrDoTranscribe(blob){
   const pcm = await asrDecodePcm(blob);
-  if(!pcm || !pcm.length) return null;
+  if(!pcm || !pcm.length){ asrNoteFail("decode", "decodeAudioData failed or empty pcm"); return null; }   /* v6.0 诊断注记：录音解码不出 PCM */
   /* v3.26：Worker 路最多走两轮——首轮失败/无响应超时（asrWorkerCall 已把卡死的
      Worker 判死并 terminate）后，清掉死亡标记、spawn 全新 Worker 自动重试一次，
      对上层透明（上层仍只收到一次最终结果）；入口时 Worker 已是死亡标记（上次
@@ -7084,14 +7251,18 @@ async function asrDoTranscribe(blob){
   for(let round = 0; round < 2; round++){
     asrWorkerDead = false;   /* 允许 asrSpawn 重生（spawn 本身起不来会立刻再置死并按 error 落定，不会空转） */
     const r = await asrWorkerCall({ type: "transcribe", pcm: pcm.slice(0) });
-    if(r && r.type === "result"){ asrMarkCached(); return (r.text || "").trim(); }   /* v3.14：转写成功但为空 → 返回 ""（与失败的 null 区分；v3.21 起空转写在复核里不作判分依据） */
+    if(r && r.type === "result"){ const tx = (r.text || "").trim(); if(!tx) asrNoteFail("transcribe", "empty transcript (worker)"); asrMarkCached(); return tx; }   /* v3.14：转写成功但为空 → 返回 ""（与失败的 null 区分；v3.21 起空转写在复核里不作判分依据）；v6.0：空转写落注记 */
     asrKillWorker();   /* 本轮失败：确保旧 Worker 已 terminate、死亡标记就位，再进下一轮/主线程回退 */
   }
   const p = await asrMainLoad();
   asrEmitProg(100);
-  const r = await p(pcm, { chunk_length_s: 30 });   /* v4.2：whisper-base.en 英文单语模型，传 language/task 会被库抛错，只带 chunk_length_s */
+  let r;
+  try { r = await p(pcm, { chunk_length_s: 30 }); }   /* v4.2：whisper-base.en 英文单语模型，传 language/task 会被库抛错，只带 chunk_length_s */
+  catch(e){ asrNoteFail("transcribe", e); throw e; }   /* v6.0 诊断注记：主线程推理抛错 */
   asrMarkCached();
-  return ((Array.isArray(r) ? (r[0] && r[0].text) : (r && r.text)) || "").trim();   /* 同上：成功为空返回 ""；失败走异常/解码失败，由 realAsrEngine 归一成 null */
+  const mtx = ((Array.isArray(r) ? (r[0] && r[0].text) : (r && r.text)) || "").trim();
+  if(!mtx) asrNoteFail("transcribe", "empty transcript (main)");   /* v6.0 诊断注记 */
+  return mtx;   /* 同上：成功为空返回 ""；失败走异常/解码失败，由 realAsrEngine 归一成 null */
 }
 const realAsrEngine = {
   cached(){ try { return localStorage.getItem(ASR_FLAG_KEY) === "1"; } catch(e){ return false; } },
@@ -7244,7 +7415,17 @@ function asrDownloadModel(prog, cb){
     if(finished) return; finished = true;
     if(dlStallTimer){ try { clearInterval(dlStallTimer); } catch(e){} dlStallTimer = null; }
     if(dlMaxTimer){ try { clearTimeout(dlMaxTimer); } catch(e){} dlMaxTimer = null; }
-    asrBusyCount--; asrProgSink = null; cb(!!ok);
+    asrBusyCount--; asrProgSink = null;
+    /* v6.0：非判分场景的下载失败（今日页安装卡/状态行重装）没有 gsDeliver 来收条，
+       在这里直接落一条诊断并触发同步；判分中（GS scoring）的失败由交付口统一收 */
+    if(!ok && !(typeof GS !== "undefined" && GS && GS.state === "scoring")){
+      try {
+        const n = asrFailNote;
+        asrDiagPush(asrDiagEntry(n ? n.stage : "download", n ? n.errName : "", n ? n.errMsg : "download failed"));
+        asrDiagKickSync();
+      } catch(e){}
+    }
+    cb(!!ok);
   };
   asrBusyCount++;   /* v3.14：模型下载中途被版本跳转打断等于白下，下载也算忙碌 */
   const eng = asrEngine();
@@ -7257,7 +7438,7 @@ function asrDownloadModel(prog, cb){
   const dlT = asrDlTiming();
   let dlLastAct = Date.now();
   asrProgSink = pct => { dlLastAct = Date.now(); if(prog){ try { prog(pct); } catch(e){} } };
-  const dlDie = () => { try { asrKillWorker(); } catch(e){} try { asrFailAllWaiters("download watchdog"); } catch(e){} finish(false); };
+  const dlDie = () => { asrNoteFail("download", "download watchdog (stall " + dlT.stallMs + "ms / max " + dlT.maxMs + "ms)"); try { asrKillWorker(); } catch(e){} try { asrFailAllWaiters("download watchdog"); } catch(e){} finish(false); };   /* v6.0：看门狗判死落注记 */
   dlStallTimer = setInterval(() => { if(Date.now() - dlLastAct > dlT.stallMs) dlDie(); }, 5000);
   dlMaxTimer = setTimeout(dlDie, dlT.maxMs);
   (async () => {
@@ -7334,7 +7515,7 @@ function asrRunOffline(out, progEl, onText, onFail){
   let finished = false;
   const finish = t => { if(finished) return; finished = true; asrBusyCount--; clearTimeout(wd); if(t) onText(t); else onFail(); };
   asrBusyCount++;   /* v3.14：离线转写进行中也算忙碌（版本自检不许这时把页面跳走） */
-  const wd = setTimeout(() => finish(null), 25000);   /* 与双验同口径：25s 不回就按失败收尾，绝不卡死 */
+  const wd = setTimeout(() => { asrNoteFail("timeout", "offline transcribe watchdog 25s"); finish(null); }, 25000);   /* 与双验同口径：25s 不回就按失败收尾，绝不卡死；v6.0：落超时注记 */
   try {
     asrEngine().transcribe(out.blob, pct => {
       if(!progEl) return;
@@ -8016,6 +8197,7 @@ async function acctSyncNow(manual){
         }
         try { sessionStorage.setItem(PULL_GUARD_KEY, JSON.stringify({ u: ACCT.username, at: cu })); } catch(e){}
         if (!acctApplyRemote(remote.file)){ try { sessionStorage.removeItem(PULL_GUARD_KEY); } catch(e){} throw new Error("apply-fail"); }
+        try { asrDiagMergeRemote(remote.file.asrDiag); } catch(e){}   /* v6.0：另一容器上行过的 ASR 诊断并进本地环（已在云端、标 sent 不重复上行） */
         try { loadState(); } catch(e){}   /* v3.18：拉到的进度同步进内存态，本页后续判定不再误判为空 */
         if (progressGuard) ACCT.progressGuardCu = cu;   /* v4.8：记下本会话已对这份云端触发过进度量保护 */
         const m = acctMeta(); m.username = ACCT.username; m.localUpdatedAt = cu; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
@@ -8032,7 +8214,8 @@ async function acctSyncNow(manual){
         }
         break;
       }
-      if (!remote || (lu > cu && !pristine && !progressGuard)){   /* v3.19 双保险：pristine 时绝不许上行覆盖历史更丰富的云端；v4.8 同理：进度量保护命中时绝不上行 */
+      const diagPend = asrDiagPending();   /* v6.0：有未回传的 ASR 诊断时也上行——只搭便车：pristine/进度量守卫命中时照样不上行（守卫口径不变），诊断留待下次 */
+      if (!remote || ((lu > cu || diagPend) && !pristine && !progressGuard)){   /* v3.19 双保险：pristine 时绝不许上行覆盖历史更丰富的云端；v4.8 同理：进度量保护命中时绝不上行 */
         const data = acctBuildData();
         if (!data) throw new Error("build-fail");
         const lu2 = acctLocalUpdatedAt();   /* 打包时 saveState 已刷新本地时间戳，以它为这次上行的时间戳 */
@@ -8040,9 +8223,11 @@ async function acctSyncNow(manual){
         if (!file.pw && ACCT.pwRecord) file.pw = ACCT.pwRecord;
         file.username = ACCT.username; file.updatedAt = lu2; file.data = data;
         file.build = (typeof APP_BUILD !== "undefined" ? APP_BUILD : "");   /* v5.9：云端文件信封层记构建号（data 之外、不参与任何同步判定），下次再有人问「她跑的是哪一版」云端直接可查 */
+        file.asrDiag = asrDiagEnvelope();   /* v6.0：ASR 失败诊断（信封层、与 build 同级，不参与任何同步判定） */
         try {
           await acctGhPut(await acctUserPath(ACCT.username), JSON.stringify(file), remote ? remote.sha : undefined);
         } catch(e){ if (e && e.conflict) continue; throw e; }   /* 409：重读、重比、重试（至多 3 轮） */
+        asrDiagMarkSent();   /* v6.0：上行成功才把本地诊断标 sent */
         const m = acctMeta(); m.username = ACCT.username; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
         ACCT.cloudUpdatedAt = lu2; ACCT.status = "ok"; done = true;
         break;
@@ -8094,13 +8279,14 @@ async function acctRegister(){
     const data = acctBuildData();   /* 初始 data = 当前本地进度：在旧手机注册即自动带进度上行 */
     if (!data){ ACCT.msg = "暂时读不到这台手机的进度，注册先停一下，进度没有被改动。"; ACCT.msgOk = false; paintBackupUI(); return; }
     const lu2 = acctLocalUpdatedAt();
-    const file = { username: u, pw: pwRec, updatedAt: lu2, data: data, build: (typeof APP_BUILD !== "undefined" ? APP_BUILD : "") };
+    const file = { username: u, pw: pwRec, updatedAt: lu2, data: data, build: (typeof APP_BUILD !== "undefined" ? APP_BUILD : ""), asrDiag: asrDiagEnvelope() };   /* v6.0：asrDiag 同步带上（信封层） */
     try {
       await acctGhPut(await acctUserPath(u), JSON.stringify(file), undefined);
     } catch(e){
       if (e && e.conflict){ ACCT.msg = "这个用户名刚刚被人抢注了，换一个试试。"; ACCT.msgOk = false; paintBackupUI(); return; }
       throw e;
     }
+    asrDiagMarkSent();   /* v6.0 */
     ACCT.username = u; ACCT.pwRecord = pwRec; ACCT.cloudUpdatedAt = lu2; ACCT.status = "ok";
     const m = acctMeta(); m.username = u; m.localUpdatedAt = lu2; m.lastSyncAt = Date.now(); m.lastSyncOk = true; acctMetaSave(m);
     ACCT_UI.rpass = ""; ACCT_UI.rinvite = "";
@@ -8678,7 +8864,7 @@ function startWordScore(host, v, uid){
   };
   const wsShowFail = out => {
     const wemsg = out && out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out && out.err);
-    panel.innerHTML = '<div class="ws-state">' + esc(wemsg) + '</div>' +
+    panel.innerHTML = '<div class="ws-state">' + esc(wemsg + asrDiagSuffix(out)) + '</div>' +   /* v6.0：失败提示末尾带诊断短码 */
       /* v5.8：组件自装/重下环节失败 → 真因说明（同另两个打分面口径） */
       (out && out.asrDown ? '<div class="ws-state" style="font-size:13px;">' + ASR_DOWN_HINT + '</div>' : '') +
       '<div class="ws-row">' +
@@ -9735,14 +9921,14 @@ function rpGradeResult(zone, ls, cur, out){
       /* 录到了声但没听清/识别没给出结果：把原因说破并给去装离线组件的入口，别只弹一句就让她对着空气再读 */
       const rz = zone.querySelector("#rpResult");
       if(rz){
-        rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err)) + '</div>' +
+        rz.innerHTML = '<div class="card corr-card"><div class="comment-line">' + esc(srErrText(out.err) + asrDiagSuffix(out)) + '</div>' +   /* v6.0：诊断短码 */
           /* v5.8：组件自装/重下环节失败 → 真因说明＋重装入口（口径同发音句） */
           (out.asrDown ? '<div class="mic-note" style="margin-top:6px;">' + ASR_DOWN_HINT + '</div>' : '') +
           ((asrSetupNeeded() || out.asrDown) ? '<div style="margin-top:8px;">' + ASR_NAV_BTN_HTML + '</div>' : '') + '</div>';
         asrWireNavBtn(rz);
-      } else toast(srErrText(out.err));
+      } else toast(srErrText(out.err) + asrDiagSuffix(out));
     } else {
-      toast(out.err === "unsupported" ? NO_SR_HINT + "请切换到打字模式。" : srErrText(out.err));
+      toast(out.err === "unsupported" ? NO_SR_HINT + "请切换到打字模式。" : srErrText(out.err) + asrDiagSuffix(out));
     }
     return;
   }
@@ -10006,7 +10192,7 @@ function pronCard(ls, i){
      含 v3.25 面板内自装与 v3.27 垃圾守卫；SR 不再参与判分）——本函数只做落点渲染。 */
   const renderZeroFail = out => {
     const emsg = out.recSilent && (out.err === "no-speech" || out.err === "end") ? MIC_HINT : srErrText(out.err);
-    result.innerHTML = '<div class="comment-line">' + esc(emsg) + '</div>' +
+    result.innerHTML = '<div class="comment-line">' + esc(emsg + asrDiagSuffix(out)) + '</div>' +   /* v6.0：失败提示末尾带诊断短码 */
       /* v5.8：失败出在组件自装/重下环节 → 补真因说明（组件被清/没装好），别让她对着「识别没给出结果」反复重读 */
       (out.asrDown ? '<div class="mic-note" style="margin-top:6px;">' + ASR_DOWN_HINT + '</div>' : '') +
       /* v4.1：失败面也给「重新录」（回 READY 重录）＋录音回放（gradeOut 已 showMine 到 .mine-audio） */
