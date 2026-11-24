@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202611230403";
+var APP_BUILD = "v202611240220";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -1360,11 +1360,13 @@ figure.wfig{margin:0 0 8px;}
           </div>
         </div>
 
+        <div id="asrSetupToday" class="asr-setup-host" style="display:none;margin-top:14px;"></div>
+        <div id="asrStatusToday" style="display:none;margin-top:14px;"></div>
+
         <div id="pastReview"></div>
 
         <div id="planList"></div>
         <div id="planDone"></div>
-        <div id="asrSetupToday" class="asr-setup-host" style="display:none;margin-top:14px;"></div>
         <div id="backupCard" style="margin-top:14px;"></div>
       </section>
 
@@ -6906,7 +6908,7 @@ function asrTextSane(text, targetEn, wordMode){
   }
   return true;
 }
-function asrMarkCached(){ asrCacheVerdict = true; try { localStorage.setItem(ASR_FLAG_KEY, "1"); } catch(e){} }
+function asrMarkCached(){ asrCacheVerdict = true; asrCacheVerifyKnown = true; try { localStorage.setItem(ASR_FLAG_KEY, "1"); } catch(e){} }
 /* v5.8：模型实存校验——「已装」标志只写在 localStorage，而 77MB 模型本体躺在
    transformers.js 的 Cache Storage（transformers-cache）里，两者被 iOS 独立回收：
    系统在存储压力下清掉缓存、标志却留着时，旧版永远以为已装、每次转写在 Worker 里
@@ -6916,22 +6918,23 @@ function asrMarkCached(){ asrCacheVerdict = true; try { localStorage.setItem(ASR
    文件都在缓存里才算实存；校验本身出错/环境无 Cache Storage → 信旧标志不回退。
    结论按页缓存（asrCacheVerdict），下载/转写成功即置 true（asrMarkCached）。 */
 let asrCacheVerdict = null;   /* null＝未校验；true＝实存（或无法校验、信标志）；false＝实锤被清 */
+let asrCacheVerifyKnown = true;   /* v5.9：false＝这次根本没验成（无 Cache API/校验抛错）——v5.8 在这种情况下静默信标志，今日页连状态行都没有，她无从自救；v5.9 起状态行明说「无法确认」并给重装入口 */
 function asrVerifyModelCache(){
   if(asrCacheVerdict !== null) return Promise.resolve(asrCacheVerdict);
   return (async () => {
     try {
-      if(typeof caches === "undefined" || !caches || !caches.open){ asrCacheVerdict = true; return true; }
+      if(typeof caches === "undefined" || !caches || !caches.open){ asrCacheVerifyKnown = false; asrCacheVerdict = true; return true; }
       const c = await caches.open("transformers-cache");
       const keys = await c.keys();
       const urls = keys.map(r => (r && r.url) || "");
       const hasDec = urls.some(u => u.indexOf("decoder_model_merged_quantized.onnx") >= 0);
       const hasEnc = urls.some(u => u.indexOf("encoder_model_quantized.onnx") >= 0);
       asrCacheVerdict = !!(hasDec && hasEnc);
-    } catch(e){ asrCacheVerdict = true; }
+    } catch(e){ asrCacheVerifyKnown = false; asrCacheVerdict = true; }
     return asrCacheVerdict;
   })();
 }
-function asrClearCachedFlag(){ asrCacheVerdict = false; try { localStorage.removeItem(ASR_FLAG_KEY); } catch(e){} }
+function asrClearCachedFlag(){ asrCacheVerdict = false; asrCacheVerifyKnown = true; try { localStorage.removeItem(ASR_FLAG_KEY); } catch(e){} }
 /* 录音 Blob → 16kHz 单声道 Float32Array（报告实测链：AudioContext({sampleRate:16000}).decodeAudioData → getChannelData(0)） */
 function asrDecodePcm(blob){
   return new Promise(res => {
@@ -7124,12 +7127,60 @@ function paintAsrSetup(host){
 }
 function refreshAsrSetup(){
   document.querySelectorAll(".asr-setup-host").forEach(h => paintAsrSetup(h));
+  paintAsrStatus();
   /* v5.8：标志说已装时顺手验一次实存——被系统清掉就清标志、安装卡重新出现（她在今日页就能一键重装，不必等打分失败才发现） */
   try {
     if(asrEngine() === realAsrEngine && asrEngine().cached() && asrCacheVerdict === null){
-      asrVerifyModelCache().then(p => { if(!p){ asrClearCachedFlag(); document.querySelectorAll(".asr-setup-host").forEach(h => paintAsrSetup(h)); } });
+      asrVerifyModelCache().then(p => { if(!p){ asrClearCachedFlag(); document.querySelectorAll(".asr-setup-host").forEach(h => paintAsrSetup(h)); } paintAsrStatus(); });
     }
   } catch(e){}
+}
+/* v5.9：今日页离线组件状态行（常驻、首屏）——2026-11-24 实锤教训：v5.8 的安装卡
+   宿主排在整份今日计划清单之后，她打开今日页根本看不到；且校验不可用时静默信
+   标志、模型在但引擎坏时也没有任何入口，她「没看到卡」无从自救。状态行与大卡
+   并存：未装时大卡负责、状态行让位；已装（含验不出/被清）时状态行常驻明说状态，
+   永远给一个「重新安装」入口（全量重置：删缓存＋杀 Worker＋清标志＋带进度重下）。 */
+function asrStatusRowHtml(text, btnLabel){
+  return '<div class="card" data-asrstatus style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
+    '<div style="flex:1;min-width:200px;font-size:14px;">' + text + '</div>' +
+    (btnLabel ? '<button class="btn ghost small" data-asrre type="button">' + btnLabel + '</button>' : '') +
+    '<div style="flex-basis:100%;">' + ASR_PROG_HTML + '</div></div>';
+}
+function paintAsrStatus(){
+  const el = document.getElementById("asrStatusToday");
+  if(!el) return;
+  let cached = false;
+  try { cached = !!asrEngine().cached(); } catch(e){}
+  let html = "";
+  if(cached){
+    if(asrCacheVerdict === false) html = asrStatusRowHtml("离线组件被系统清掉了，跟读暂时打不了分，重新下载一次就好（约 80MB）。", "重新下载");
+    else if(asrCacheVerdict === null) html = asrStatusRowHtml("离线组件：正在检查还在不在…", null);
+    else if(!asrCacheVerifyKnown) html = asrStatusRowHtml("离线组件：记录显示装过，但现在没法确认还在不在。跟读打分要是失败，点右边重装一次。", "重新安装");
+    else html = asrStatusRowHtml("离线组件：已装好，跟读打分可用。如果跟读一直打不了分，点右边重装一次。", "重新安装");
+  }
+  el.innerHTML = html;
+  el.style.display = html ? "" : "none";
+  const b = el.querySelector("[data-asrre]");
+  if(b) b.addEventListener("click", () => asrReinstall(el));
+}
+async function asrReinstall(statusEl){
+  const btn = statusEl ? statusEl.querySelector("[data-asrre]") : null;
+  if(btn){ btn.disabled = true; btn.textContent = "正在重装…"; }
+  try { asrKillWorker(); } catch(e){}
+  asrWorkerDead = false;   /* 与转写重试同口径（asrDoTranscribe 重生处）：允许新 Worker 重生，spawn 本身起不来会再置死 */
+  try { if(typeof caches !== "undefined" && caches && typeof caches.delete === "function") await caches.delete("transformers-cache"); } catch(e){}
+  asrClearCachedFlag();
+  const progEl = statusEl ? statusEl.querySelector("[data-asrprog]") : null;
+  asrDownloadModel(pct => {
+    if(!progEl) return;
+    progEl.hidden = false;
+    const bar = progEl.querySelector("i"), tx = progEl.querySelector("[data-asrpt]");
+    if(bar) bar.style.width = pct + "%";
+    if(tx) tx.textContent = pct >= 100 ? "下载完成" : "正在重新下载离线组件… " + pct + "%";
+  }, ok => {
+    refreshAsrSetup();
+    toast(ok ? "离线组件重装完成，读完直接出分" : "重装没成功，检查网络后再点一次");
+  });
 }
 /* v3.24：词卡跟读失败时的出路——带她去今日页装离线组件。v3.21 口径不变：词卡内
    绝不放下载卡，这里只做导航：先把词卡跟读状态收尾干净（清 wsbusy、作废本场
@@ -7146,12 +7197,17 @@ function wsGotoAsrSetup(panel){
   try { stopRec(); } catch(e){}
   showView("today");
   const host = document.getElementById("asrSetupToday");
-  if(host){
-    try { host.scrollIntoView({ behavior: "smooth", block: "center" }); } catch(e){ try { host.scrollIntoView(); } catch(e2){} }
-    const card = host.querySelector("[data-asrsetup]") || host;
-    const oldShadow = card.style.boxShadow;
-    card.style.boxShadow = "0 0 0 3px #c2a14d, 0 0 22px rgba(194,161,77,.55)";
-    setTimeout(() => { try { card.style.boxShadow = oldShadow || ""; } catch(e){} }, 2400);
+  /* v5.9：大卡不在（标志说已装）时别滚到一个空宿主就完事——落到常驻状态行，
+     那里永远有状态说明和重装入口 */
+  const stEl = document.getElementById("asrStatusToday");
+  let card = host ? host.querySelector("[data-asrsetup]") : null;
+  if(!card && stEl && stEl.style.display !== "none") card = stEl.querySelector("[data-asrstatus]");
+  const tgt = card || host;
+  if(tgt){
+    try { tgt.scrollIntoView({ behavior: "smooth", block: "center" }); } catch(e){ try { tgt.scrollIntoView(); } catch(e2){} }
+    const oldShadow = tgt.style.boxShadow;
+    tgt.style.boxShadow = "0 0 0 3px #c2a14d, 0 0 22px rgba(194,161,77,.55)";
+    setTimeout(() => { try { tgt.style.boxShadow = oldShadow || ""; } catch(e){} }, 2400);
   }
 }
 function asrSetupDownload(host){
@@ -7983,6 +8039,7 @@ async function acctSyncNow(manual){
         const file = remote ? remote.file : { username: ACCT.username, pw: ACCT.pwRecord || null, updatedAt: 0, data: null };
         if (!file.pw && ACCT.pwRecord) file.pw = ACCT.pwRecord;
         file.username = ACCT.username; file.updatedAt = lu2; file.data = data;
+        file.build = (typeof APP_BUILD !== "undefined" ? APP_BUILD : "");   /* v5.9：云端文件信封层记构建号（data 之外、不参与任何同步判定），下次再有人问「她跑的是哪一版」云端直接可查 */
         try {
           await acctGhPut(await acctUserPath(ACCT.username), JSON.stringify(file), remote ? remote.sha : undefined);
         } catch(e){ if (e && e.conflict) continue; throw e; }   /* 409：重读、重比、重试（至多 3 轮） */
@@ -8037,7 +8094,7 @@ async function acctRegister(){
     const data = acctBuildData();   /* 初始 data = 当前本地进度：在旧手机注册即自动带进度上行 */
     if (!data){ ACCT.msg = "暂时读不到这台手机的进度，注册先停一下，进度没有被改动。"; ACCT.msgOk = false; paintBackupUI(); return; }
     const lu2 = acctLocalUpdatedAt();
-    const file = { username: u, pw: pwRec, updatedAt: lu2, data: data };
+    const file = { username: u, pw: pwRec, updatedAt: lu2, data: data, build: (typeof APP_BUILD !== "undefined" ? APP_BUILD : "") };
     try {
       await acctGhPut(await acctUserPath(u), JSON.stringify(file), undefined);
     } catch(e){
