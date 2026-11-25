@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202611241238";
+var APP_BUILD = "v202611251039";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6936,7 +6936,12 @@ function asrVerifyModelCache(){
       asrCacheFilesSeen = urls.map(u => String(u).split("/").pop()).filter(Boolean).slice(0, 12);
       const hasDec = urls.some(u => u.indexOf("decoder_model_merged_quantized.onnx") >= 0);
       const hasEnc = urls.some(u => u.indexOf("encoder_model_quantized.onnx") >= 0);
-      asrCacheVerdict = !!(hasDec && hasEnc);
+      /* v6.1：ORT 的 wasm 二进制（21.6MB）自 v6.1 起也回存这个缓存（见 asr-worker.js
+         与 asrFetchWasmBinary）——旧版它从不落缓存、每次现抓，她真机抓取失败引擎
+         起不来而模型校验全绿（2026-11-25 诊断实证）。故实存口径三者缺一不可：
+         模型在、wasm 不在同样判被清，安装卡重现、重下时一并补齐。 */
+      const hasWasm = urls.some(u => u.indexOf("ort-wasm-simd-threaded.jsep.wasm") >= 0);
+      asrCacheVerdict = !!(hasDec && hasEnc && hasWasm);
     } catch(e){ asrCacheVerifyKnown = false; asrNoteFail("verify", e); asrCacheVerdict = true; }
     return asrCacheVerdict;
   })();
@@ -7223,6 +7228,31 @@ function asrMainLoadTimeoutMs(){
   const o = (typeof window !== "undefined" && window.__ASR_TIMING) || {};
   return (typeof o.mainLoadMs === "number" && o.mainLoadMs > 0) ? o.mainLoadMs : ASR_MAINLOAD_TIMEOUT_DEFAULT;
 }
+/* v6.1：主线程回退取 wasm 二进制——与 Worker 同口径（transformers-cache 缓存优先、
+   未命中同源 fetch 回存），字节直喂 ORT 的 wasmBinary，运行时不再现抓 21.6MB。
+   真机诊断（2026-11-25）：旧版 wasm 无任何持久化（Pages 只给 max-age=600），
+   她网络下 ORT 自行抓取 fetch/同步 XHR 双失败、引擎死在 load 阶段。 */
+const ASR_WASM_URL = ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.wasm";
+async function asrFetchWasmBinary(){
+  try {
+    if(typeof caches !== "undefined" && caches && typeof caches.open === "function"){
+      const c = await caches.open("transformers-cache");
+      const hit = await c.match(ASR_WASM_URL);
+      if(hit){ const b = await hit.arrayBuffer(); if(b && b.byteLength > 1000000) return b; }
+    }
+  } catch(e){}
+  const resp = await fetch(ASR_WASM_URL);
+  if(!resp || !resp.ok) throw new Error("wasm fetch failed: " + (resp && resp.status));
+  const buf = await resp.arrayBuffer();
+  if(!buf || buf.byteLength <= 1000000) throw new Error("wasm fetch failed: bad body " + (buf && buf.byteLength));
+  try {
+    if(typeof caches !== "undefined" && caches && typeof caches.open === "function"){
+      const c = await caches.open("transformers-cache");
+      await c.put(ASR_WASM_URL, new Response(buf.slice(0), { headers: { "Content-Type": "application/wasm" } }));
+    }
+  } catch(e){}
+  return buf;
+}
 function asrMainLoad(){
   if(asrMainPipeP) return asrMainPipeP;
   const raw = (async () => {
@@ -7232,6 +7262,7 @@ function asrMainLoad(){
     env.remotePathTemplate = "model/";
     env.backends.onnx.wasm.numThreads = 1;
     env.backends.onnx.wasm.wasmPaths = { mjs: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.mjs", wasm: ASR_BASE + "lib/ort-wasm-simd-threaded.jsep.wasm" };
+    env.backends.onnx.wasm.wasmBinary = await asrFetchWasmBinary();   /* v6.1：字节直喂，运行时零抓取 */
     return await T.pipeline("automatic-speech-recognition", "whisper-base.en", { device: "wasm", dtype: "q8", progress_callback: asrProgAgg() });
   })();
   asrMainPipeP = Promise.race([raw, new Promise((_, rej) => setTimeout(() => rej(new Error("asr main load timeout")), asrMainLoadTimeoutMs()))]);
