@@ -1,0 +1,94 @@
+{
+ "version": 1,
+ "pieceSize": 4194304,
+ "files": [
+  {
+   "path": "model/onnx/decoder_model_merged_quantized.onnx",
+   "bytes": 53707027,
+   "sha256": "a25afc5858a20aabb7652cb2d555996ebe10691a69bbdb423d5073d52f060325",
+   "pieces": 13,
+   "pieceBytes": [
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    3375379
+   ],
+   "partsDir": "parts/decoder_model_merged_quantized.onnx.parts"
+  },
+  {
+   "path": "model/onnx/encoder_model_quantized.onnx",
+   "bytes": 23200856,
+   "sha256": "d0d4e59e2842617b39787cece73d7e8f76f99b1697d3386c0e682eca2269f4a1",
+   "pieces": 6,
+   "pieceBytes": [
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    2229336
+   ],
+   "partsDir": "parts/encoder_model_quantized.onnx.parts"
+  },
+  {
+   "path": "lib/ort-wasm-simd-threaded.jsep.wasm",
+   "bytes": 21596019,
+   "sha256": "c46655e8a94afc45338d4cb2b840475f88e5012d524509916e505079c00bfa39",
+   "pieces": 6,
+   "pieceBytes": [
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    4194304,
+    624499
+   ],
+   "partsDir": "parts/ort-wasm-simd-threaded.jsep.wasm.parts"
+  },
+  {
+   "path": "model/config.json",
+   "bytes": 2202,
+   "sha256": "5c390f2c6ba84ddeb7e362cd8b2123832911407850174e64d7081ccc36df2d64",
+   "pieces": 0
+  },
+  {
+   "path": "model/generation_config.json",
+   "bytes": 1500,
+   "sha256": "1e57ed56ad1bd7f08a49ece7fe7daada674573805a35f8bdbbe68380aab5b1ee",
+   "pieces": 0
+  },
+  {
+   "path": "model/preprocessor_config.json",
+   "bytes": 339,
+   "sha256": "a6a76d28c93edb273669eb9e0b0636a2bddbb1272c3261e47b7ca6dfdbac1b8d",
+   "pieces": 0
+  },
+  {
+   "path": "model/tokenizer.json",
+   "bytes": 2128494,
+   "sha256": "c6ee8f089220a5b1188f6426456772572671c6141ae007eecb83c6a8349f5deb",
+   "pieces": 0
+  },
+  {
+   "path": "model/tokenizer_config.json",
+   "bytes": 835,
+   "sha256": "e082c1ad251541bf277967a703252cddd4bb37a71a43737e03d050c22ec08238",
+   "pieces": 0
+  },
+  {
+   "path": "model/special_tokens_map.json",
+   "bytes": 1717,
+   "sha256": "7da611d517fe29e77335b8d8384e71795fb7b37cbf95bdc3b5252fa7e09dd1f8",
+   "pieces": 0
+  }
+ ]
+}

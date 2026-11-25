@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202611251039";
+var APP_BUILD = "v202611251115";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6965,9 +6965,9 @@ const ASR_DIAG_KEY = "english-asr-diag-v1";
 const ASR_DIAG_CODES = { verify: "A1", download: "A2", worker: "A3", load: "A4", decode: "A5", transcribe: "A6", timeout: "A7", session: "A9" };
 let asrFailNote = null;   /* 最近一次低层失败注记 {stage, errName, errMsg}；每场 gsScoring 开场清空 */
 let asrFailChain = [];    /* 本场失败阶段链（去重相邻同阶段）：级联失败时终点定 stage、链留全程 */
-function asrNoteFail(stage, err){
+function asrNoteFail(stage, err, extra){
   const msg = err == null ? "" : String((err && err.message) || err);
-  asrFailNote = { stage: stage, errName: (err && err.name) || "", errMsg: msg.slice(0, 200) };
+  asrFailNote = { stage: stage, errName: (err && err.name) || "", errMsg: msg.slice(0, 200), extra: extra || null };
   if(asrFailChain[asrFailChain.length - 1] !== stage) asrFailChain.push(stage);
 }
 function asrDiagRead(){
@@ -7039,7 +7039,7 @@ function asrDiagKickSync(){
 function asrDiagOnScoreFail(S, out){
   const note = asrFailNote;
   const stage = note ? note.stage : (out.asrDown ? "download" : (out.err === "timeout" ? "timeout" : "session"));
-  const ent = asrDiagEntry(stage, note ? note.errName : "", note ? note.errMsg : ("grade fail err=" + (out.err || "")));
+  const ent = asrDiagEntry(stage, note ? note.errName : "", note ? note.errMsg : ("grade fail err=" + (out.err || "")), (note && note.extra) || undefined);
   out.diagCode = ASR_DIAG_CODES[stage] || "A9";
   asrDiagPush(ent);
   asrDiagKickSync();
@@ -7341,7 +7341,7 @@ function refreshAsrSetup(){
    宿主排在整份今日计划清单之后，她打开今日页根本看不到；且校验不可用时静默信
    标志、模型在但引擎坏时也没有任何入口，她「没看到卡」无从自救。状态行与大卡
    并存：未装时大卡负责、状态行让位；已装（含验不出/被清）时状态行常驻明说状态，
-   永远给一个「重新安装」入口（全量重置：删缓存＋杀 Worker＋清标志＋带进度重下）。 */
+   永远给一个「重新安装」入口（v6.2 起为非破坏性重装：分片校验替换、失败不丢旧文件）。 */
 function asrStatusRowHtml(text, btnLabel){
   return '<div class="card" data-asrstatus style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
     '<div style="flex:1;min-width:200px;font-size:14px;">' + text + '</div>' +
@@ -7370,8 +7370,11 @@ async function asrReinstall(statusEl){
   if(btn){ btn.disabled = true; btn.textContent = "正在重装…"; }
   try { asrKillWorker(); } catch(e){}
   asrWorkerDead = false;   /* 与转写重试同口径（asrDoTranscribe 重生处）：允许新 Worker 重生，spawn 本身起不来会再置死 */
-  try { if(typeof caches !== "undefined" && caches && typeof caches.delete === "function") await caches.delete("transformers-cache"); } catch(e){}
-  asrClearCachedFlag();
+  /* v6.2：废除「先删缓存＋清标志再裸奔重下」——2026-11-25 真机实证：deploy61
+     的重装先把 transformers-cache 删掉、再整文件重下，她网络下新的下不回来，
+     第二次尝试起 modelFiles=0，完好模型被自己的重装流程清掉。新口径：什么都
+     不删不退——分片安装器逐个文件校验替换（完好的跳过、缺的坏的补），全部验
+     过才覆盖正式缓存；中途失败，旧文件与已装标志一律原样保留。 */
   const progEl = statusEl ? statusEl.querySelector("[data-asrprog]") : null;
   asrDownloadModel(pct => {
     if(!progEl) return;
@@ -7427,6 +7430,193 @@ function asrSetupDownload(host){
     else if(btn){ btn.disabled = false; btn.textContent = "下载没成功，点这里重试"; }
   });
 }
+/* ═══════════ v6.2：分片下载＋端上拼装安装器（asrSeedFromParts） ═══════════
+   真机实证（2026-11-25，deploy61 上线后 asrDiag 三连）：新校验正确判出她「模型
+   在、wasm 缺」并触发补下载，但三次全死在 stage=download 的停滞看门狗——decoder
+   53.7MB 单文件由 transformers.js 整文件抓取，她网络下中途停滞、无断点续传、
+   看门狗判死。且旧重装流先删缓存再下载：第二次起 modelFiles=0，她原先完好的
+   模型被我们自己的重装流程清掉、新的又下不回来。本版改法：
+   · 服务端预分片：三个大文件（decoder/encoder ONNX、ORT wasm）按 4MiB 切成
+     静态分片（asr/parts/<文件>.parts/pNN + manifest.json，含总字节/sha256/
+     每片字节；分片由 planaudit/make_asr_parts62.py 确定性切分、构建期拼回自验）。
+     小文件（音频、5MB 首页）她天天正常加载——小块抓取在她网络下可行。
+   · 安装器逐片抓取：每片独立「无字节进展 20s」判超时（有进展不误杀慢速片）、
+     失败自动重试（默认 5 次）、进度按已完成字节实时上报；全片到齐按序拼装，
+     验总字节＋sha256 才算数。小文件同口径直抓（单文件、带重试与进度）。
+   · 不破坏现有可用集：拼装校验全在暂存 cache（asr-staging-v62）里完成，全部
+     文件验过才逐个覆盖正式缓存 transformers-cache；已在正式缓存且字节+sha
+     完好的文件直接跳过（她若只缺 wasm 就只补 wasm）。中途失败：暂存丢弃、
+     正式缓存与已装标志一律原样保留（asrReinstall 同步废除先删逻辑）。
+   · 灌完缓存再走既有 preload 确认引擎能起（库按完整 URL 查缓存、全命中、
+     零整文件抓取）。分片基础设施不可用（无 fetch/Cache Storage/SubtleCrypto
+     的环境）返回 unavailable，调用方回落旧的整文件下载路径——那是这些环境
+     （含全部冒烟替身）原有的行为口径。片级失败返回 failed 并带 file/piece/
+     已完成字节，落进 asrDiag 的 download 条目（extra），下一轮仍可定点。 */
+const ASR_PARTS_MANIFEST_URL = ASR_BASE + "parts/manifest.json";
+const ASR_STAGING_CACHE = "asr-staging-v62";
+function asrPieceTiming(){
+  const o = (typeof window !== "undefined" && window.__ASR_TIMING) || {};
+  return { pieceMs: (typeof o.pieceMs === "number" && o.pieceMs > 0) ? o.pieceMs : 20000,
+           pieceTries: (typeof o.pieceTries === "number" && o.pieceTries > 0) ? Math.floor(o.pieceTries) : 5 };
+}
+async function asrSha256Hex(buf){
+  const h = await crypto.subtle.digest("SHA-256", buf);
+  const u8 = new Uint8Array(h);
+  let s = "";
+  for(let i = 0; i < u8.length; i++) s += (u8[i] < 16 ? "0" : "") + u8[i].toString(16);
+  return s;
+}
+/* 抓一个小块/小文件：流式读、按字节回调进度；无字节进展满 stallMs 用
+   AbortController 判死（有进展自动续命，慢速但活着的片不误杀）。无 body 流
+   时退 arrayBuffer（此时只有总超时口径）。 */
+async function asrFetchBuf(url, stallMs, onBytes){
+  let timer = null;
+  const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+  const arm = () => { if(ctrl){ if(timer) clearTimeout(timer); timer = setTimeout(() => { try { ctrl.abort(); } catch(e){} }, stallMs); } };
+  try {
+    arm();
+    const resp = await fetch(url, ctrl ? { signal: ctrl.signal } : undefined);
+    if(!resp || !resp.ok) throw new Error("http " + (resp && resp.status) + " on " + String(url).split("/").pop());
+    if(resp.body && typeof resp.body.getReader === "function"){
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let got = 0;
+      for(;;){
+        const r = await reader.read();
+        if(r.done) break;
+        chunks.push(r.value);
+        got += r.value.length;
+        arm();
+        if(onBytes){ try { onBytes(got); } catch(e){} }
+      }
+      const u8 = new Uint8Array(got);
+      let off = 0;
+      for(const ch of chunks){ u8.set(ch, off); off += ch.length; }
+      return u8.buffer;
+    }
+    const buf = await resp.arrayBuffer();
+    if(onBytes && buf){ try { onBytes(buf.byteLength); } catch(e){} }
+    return buf;
+  } finally { if(timer) clearTimeout(timer); }
+}
+async function asrFetchWithRetries(url, expectBytes, timing, onBytes){
+  let lastErr = null;
+  for(let a = 1; a <= timing.pieceTries; a++){
+    try {
+      const buf = await asrFetchBuf(url, timing.pieceMs, onBytes);
+      if(expectBytes != null && (!buf || buf.byteLength !== expectBytes))
+        throw new Error("size " + (buf && buf.byteLength) + " != " + expectBytes + " on " + String(url).split("/").pop());
+      return buf;
+    } catch(e){
+      lastErr = e;
+      if(a < timing.pieceTries) await new Promise(r => setTimeout(r, 400 * a));
+    }
+  }
+  throw lastErr || new Error("fetch failed: " + String(url).split("/").pop());
+}
+async function asrLoadManifest(timing){
+  const buf = await asrFetchWithRetries(ASR_PARTS_MANIFEST_URL, null, timing, null);
+  const man = JSON.parse(new TextDecoder("utf-8").decode(buf));
+  if(!man || !Array.isArray(man.files) || !man.files.length) throw new Error("bad manifest");
+  for(const f of man.files){
+    if(!f || typeof f.path !== "string" || typeof f.bytes !== "number" || typeof f.sha256 !== "string")
+      throw new Error("bad manifest entry");
+    if(f.pieces > 0 && (typeof f.partsDir !== "string" || !Array.isArray(f.pieceBytes) || f.pieceBytes.length !== f.pieces))
+      throw new Error("bad manifest parts: " + f.path);
+  }
+  return man;
+}
+/* 返回 {status:"ok"} | {status:"unavailable"} | {status:"failed", detail, extra}。
+   onProg(pct)：按字节口径的完成百分比（已完好跳过的文件计入已完成）。 */
+async function asrSeedFromParts(onProg){
+  if(typeof fetch !== "function") return { status: "unavailable" };
+  if(typeof caches === "undefined" || !caches || typeof caches.open !== "function") return { status: "unavailable" };
+  if(typeof crypto === "undefined" || !crypto.subtle || typeof crypto.subtle.digest !== "function") return { status: "unavailable" };
+  const timing = asrPieceTiming();
+  let man;
+  try { man = await asrLoadManifest(timing); }
+  catch(e){ return { status: "failed", detail: "manifest: " + String((e && e.message) || e).slice(0, 130), extra: { file: "manifest.json", piece: -1, got: 0 } }; }
+  const total = man.files.reduce((s, f) => s + f.bytes, 0);
+  let committed = 0;
+  const emit = active => { if(onProg){ try { onProg(Math.max(0, Math.min(100, Math.round((committed + (active || 0)) / total * 100)))); } catch(e){} } };
+  let real, staging;
+  try {
+    real = await caches.open("transformers-cache");
+    staging = await caches.open(ASR_STAGING_CACHE);
+  } catch(e){ return { status: "unavailable" }; }
+  const staged = [];
+  const fail = (detail, extra) => ({ status: "failed", detail: detail, extra: extra });
+  try {
+    for(const f of man.files){
+      const url = ASR_BASE + f.path;
+      /* 正式缓存里已在且字节+sha 完好 → 跳过（她只缺哪个就只补哪个） */
+      let good = false;
+      try {
+        const hit = await real.match(url);
+        if(hit){
+          const b = await hit.arrayBuffer();
+          if(b && b.byteLength === f.bytes && (await asrSha256Hex(b)) === f.sha256) good = true;
+        }
+      } catch(e){}
+      if(good){ committed += f.bytes; emit(0); continue; }
+      let buf;
+      if(f.pieces > 0){
+        const parts = [];
+        let fileGot = 0;
+        for(let i = 0; i < f.pieces; i++){
+          const purl = ASR_BASE + f.partsDir + "/p" + (i < 10 ? "0" + i : "" + i);
+          let pb;
+          try {
+            pb = await asrFetchWithRetries(purl, f.pieceBytes[i], timing, n => emit(fileGot + n));
+          } catch(e){
+            try { await caches.delete(ASR_STAGING_CACHE); } catch(e2){}
+            return fail("shard fail file=" + f.path.split("/").pop() + " piece=" + i + "/" + f.pieces +
+              " got=" + (committed + fileGot) + "/" + total + " err=" + String((e && e.message) || e).slice(0, 70),
+              { file: f.path, piece: i, got: committed + fileGot });
+          }
+          parts.push(pb);
+          fileGot += pb.byteLength;
+        }
+        const u8 = new Uint8Array(f.bytes);
+        let off = 0;
+        for(const pb of parts){ u8.set(new Uint8Array(pb), off); off += pb.byteLength; }
+        buf = u8.buffer;
+        parts.length = 0;
+      } else {
+        try {
+          buf = await asrFetchWithRetries(url, f.bytes, timing, n => emit(n));
+        } catch(e){
+          try { await caches.delete(ASR_STAGING_CACHE); } catch(e2){}
+          return fail("file fail file=" + f.path.split("/").pop() + " got=" + committed + "/" + total +
+            " err=" + String((e && e.message) || e).slice(0, 70), { file: f.path, piece: -1, got: committed });
+        }
+      }
+      if(!buf || buf.byteLength !== f.bytes){
+        try { await caches.delete(ASR_STAGING_CACHE); } catch(e){}
+        return fail("assembled size mismatch file=" + f.path.split("/").pop(), { file: f.path, piece: -1, got: committed });
+      }
+      const hex = await asrSha256Hex(buf);
+      if(hex !== f.sha256){
+        try { await caches.delete(ASR_STAGING_CACHE); } catch(e){}
+        return fail("sha256 mismatch file=" + f.path.split("/").pop(), { file: f.path, piece: -1, got: committed });
+      }
+      await staging.put(url, new Response(buf, { headers: { "Content-Type": f.path.slice(-5) === ".wasm" ? "application/wasm" : "application/octet-stream" } }));
+      staged.push(url);
+      committed += f.bytes;
+      emit(0);
+    }
+    /* 全部文件验过 → 才逐个覆盖正式缓存；此后引擎按完整 URL 查缓存全命中 */
+    for(const url of staged){
+      const r = await staging.match(url);
+      if(r) await real.put(url, r);
+    }
+    try { await caches.delete(ASR_STAGING_CACHE); } catch(e){}
+    return { status: "ok" };
+  } catch(e){
+    try { await caches.delete(ASR_STAGING_CACHE); } catch(e2){}
+    return fail("seed: " + String((e && e.message) || e).slice(0, 130), { file: "", piece: -1, got: committed });
+  }
+}
 /* 只下载模型、不转写：注入引擎（冒烟）可自备 download(prog, cb)；生产走 Worker 的
    preload 消息（模型进缓存、进度走同一条 progress 通道），Worker 不可用退主线程加载 */
 /* v5.8：下载看门狗口径——停滞（无任何下载进度）满 dlStallMs 判死、总时长满
@@ -7452,7 +7642,7 @@ function asrDownloadModel(prog, cb){
     if(!ok && !(typeof GS !== "undefined" && GS && GS.state === "scoring")){
       try {
         const n = asrFailNote;
-        asrDiagPush(asrDiagEntry(n ? n.stage : "download", n ? n.errName : "", n ? n.errMsg : "download failed"));
+        asrDiagPush(asrDiagEntry(n ? n.stage : "download", n ? n.errName : "", n ? n.errMsg : "download failed", (n && n.extra) || undefined));
         asrDiagKickSync();
       } catch(e){}
     }
@@ -7465,14 +7655,32 @@ function asrDownloadModel(prog, cb){
     return;
   }
   /* 真实引擎路径才挂看门狗（注入引擎是冒烟替身，口径不变）：进度每动一次刷新
-     活动时刻；判死时先杀 Worker 解开在途 preload，再按失败落定（上层会给重试入口） */
+     活动时刻；判死时先杀 Worker 解开在途 preload，再按失败落定（上层会给重试入口）。
+     v6.2：看门狗改为进入 preload 确认阶段才武装——分片安装阶段自带单片超时+重试
+     的有界口径，且慢网装满 ~100MB 本就可能超过旧的 240s 总上限，沿用旧看门狗
+     会在健康慢速安装中途误杀；分片阶段的失败由安装器自己落定（带 file/piece）。 */
   const dlT = asrDlTiming();
   let dlLastAct = Date.now();
   asrProgSink = pct => { dlLastAct = Date.now(); if(prog){ try { prog(pct); } catch(e){} } };
   const dlDie = () => { asrNoteFail("download", "download watchdog (stall " + dlT.stallMs + "ms / max " + dlT.maxMs + "ms)"); try { asrKillWorker(); } catch(e){} try { asrFailAllWaiters("download watchdog"); } catch(e){} finish(false); };   /* v6.0：看门狗判死落注记 */
-  dlStallTimer = setInterval(() => { if(Date.now() - dlLastAct > dlT.stallMs) dlDie(); }, 5000);
-  dlMaxTimer = setTimeout(dlDie, dlT.maxMs);
+  let dlArmed = false;
+  const armWatchdog = () => {
+    if(dlArmed) return; dlArmed = true;
+    dlLastAct = Date.now();
+    dlStallTimer = setInterval(() => { if(Date.now() - dlLastAct > dlT.stallMs) dlDie(); }, 5000);
+    dlMaxTimer = setTimeout(dlDie, dlT.maxMs);
+  };
   (async () => {
+    /* v6.2：先走分片安装器把全部文件灌进正式缓存（校验通过才落），再走既有
+       preload 确认引擎能起——库按完整 URL 查缓存、全命中、零整文件抓取。
+       分片片级失败 → 直接落定（带 file/piece 的诊断），不回落整文件路径
+       （那正是她网络下已实证下不完的路）；仅分片基础设施不可用时回落旧路。 */
+    let seed = { status: "unavailable" };
+    try { seed = await asrSeedFromParts(p => asrEmitProg(Math.min(95, Math.round(p * 0.95)))); }
+    catch(e){ seed = { status: "failed", detail: "seed exception: " + String((e && e.message) || e).slice(0, 110), extra: { file: "", piece: -1, got: 0 } }; }
+    if(finished) return;
+    if(seed.status === "failed"){ asrNoteFail("download", seed.detail, seed.extra); finish(false); return; }
+    armWatchdog();
     if(!asrWorkerDead){
       const r = await asrWorkerCall({ type: "preload" });
       if(finished) return;   /* 看门狗已判死落定：不再顺手走主线程回退重复下载 */
