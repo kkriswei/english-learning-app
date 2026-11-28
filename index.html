@@ -32,7 +32,7 @@
    轮询加密到 60 秒；忙碌顺延加上限——只在播放/视频课里挡满 5 分钟强制跳（播放
    可中断、进度不丢），录音/打分中（__APP_BUSY_KIND 报 record/score）绝不强跳。
    注意下方开发态判断用字符串拼接写哨兵值，保证部署 sed 只命中赋值处这一处占位符。 */
-var APP_BUILD = "v202611251115";
+var APP_BUILD = "v202611281405";
 (function () {
   var KEY = "english-app-verjump";
   var pendingVer = null;   /* 已发现、但因忙碌暂缓跳转的目标版本 */
@@ -6876,6 +6876,14 @@ window.__APP_BUSY_KIND = function(){
    __REC_PEAK 同一种注入口径；生产不设该变量。资产在站点 asr/ 目录，坏掉不拖垮主 App。 */
 const ASR_FLAG_KEY = "english-asr-v1";
 const ASR_BASE = (() => { try { return new URL("asr/", document.baseURI).href; } catch(e){ return "asr/"; } })();
+/* v6.3：转写执行路径开关——默认 OFF＝转写强制主线程。真机实证（2026-11-26～28）：
+   asr-worker.js 自 v3.20 起语法错误死亡，全部成功期（至 11-21）的转写本就走
+   主线程回退；deploy62 时代（11-26/27）主线程自检 ok、发音连续两天入账；
+   deploy61 复活 Worker 后 11-28 起 chain 反复 ["worker","timeout"] 全灭。
+   即 iOS 26 独立模式下 Worker 路径不稳定，主线程是唯一被真机证明的路径。
+   Worker 代码与文件保留：将来真机条件变化时把此常量改 true 即恢复原双路。
+   本开关只管转写执行路径；安装/下载的 preload 确认等既有口径不受影响。 */
+const ASR_USE_WORKER = false;
 const ASR_PROG_HTML = '<div data-asrprog hidden style="margin-top:10px;"><div style="height:8px;border-radius:99px;background:rgba(23,20,14,.12);overflow:hidden;"><i style="display:block;height:100%;width:0%;background:#c2a14d;transition:width .2s;"></i></div><div data-asrpt style="font-size:12.5px;color:var(--ink-faint);margin-top:4px;">正在下载离线识别模型… 0%</div></div>';
 const ASR_OFFLINE_NOTE = "离线识别打分：这分是手机在本机把你的录音转成文字后打的，没用苹果的识别服务。";
 function asrZeroApplies(out){
@@ -6970,6 +6978,14 @@ function asrNoteFail(stage, err, extra){
   asrFailNote = { stage: stage, errName: (err && err.name) || "", errMsg: msg.slice(0, 200), extra: extra || null };
   if(asrFailChain[asrFailChain.length - 1] !== stage) asrFailChain.push(stage);
 }
+/* v6.3：诊断 chain 的路径标记——Worker 停用期间 chain 恒以 "main" 开头且不含
+   "worker"，与 11-28 全灭时的 ["worker","timeout"] 形态一眼区分；开关打开
+   （恢复 Worker 双路）时维持原始阶段链。 */
+function asrChainWithPath(chain){
+  const c = (chain || []).slice(0, 7);
+  if(!ASR_USE_WORKER) return ["main"].concat(c.filter(x => x !== "worker" && x !== "main"));
+  return c.slice(0, 8);
+}
 function asrDiagRead(){
   try { const a = JSON.parse(localStorage.getItem(ASR_DIAG_KEY) || "[]"); return Array.isArray(a) ? a : []; } catch(e){ return []; }
 }
@@ -6991,7 +7007,7 @@ function asrDiagEntry(stage, errName, errMsg, extra){
     standalone: !!standalone
   };
   try { ent.cacheState.flag = !!asrEngine().cached(); } catch(e){}
-  if(asrFailChain.length) ent.chain = asrFailChain.slice(0, 8);
+  ent.chain = asrChainWithPath(asrFailChain);   /* v6.3：恒带路径标记（Worker 停用时恒以 "main" 开头） */
   if(extra){ for(const k in extra) ent[k] = extra[k]; }
   return ent;
 }
@@ -7089,7 +7105,7 @@ function asrSelfTest(){
     let timedOut = false;
     const t = await new Promise(res => {
       let settled = false;
-      const to = setTimeout(() => { if(!settled){ settled = true; timedOut = true; res(null); } }, 30000);
+      const to = setTimeout(() => { if(!settled){ settled = true; timedOut = true; res(null); } }, asrTranscribeTimeoutMs());   /* v6.3：与转写看门狗同口径（默认 60s，主线程实测数秒，给足余量仍判死） */
       try {
         asrEngine().transcribe(sample.blob, null, v => { if(!settled){ settled = true; clearTimeout(to); res(v === undefined ? null : v); } });
       } catch(e){ if(!settled){ settled = true; clearTimeout(to); res(null); } }
@@ -7097,8 +7113,8 @@ function asrSelfTest(){
     const note = asrFailNote, chain = asrFailChain;
     asrFailNote = prevNote; asrFailChain = prevChain;
     const extra = { expect: String(sample.text).slice(0, 200) };
-    if(chain.length) extra.chain = chain.slice(0, 8);
-    if(timedOut) finish(asrDiagEntry("selftest", "", "selftest timeout 30s", extra));
+    extra.chain = asrChainWithPath(chain);   /* v6.3：自检 chain 同口径恒带路径标记 */
+    if(timedOut) finish(asrDiagEntry("selftest", "", "selftest timeout " + Math.round(asrTranscribeTimeoutMs() / 1000) + "s", extra));
     else if(t === null) finish(asrDiagEntry("selftest", "", "engine fail" + (note ? (" stage=" + note.stage + " err=" + note.errMsg) : ""), extra));
     else if(!String(t).trim()) finish(asrDiagEntry("selftest", "", "empty transcript", Object.assign({}, extra, { text: "" })));
     else finish(asrDiagEntry("selftest", "", "ok", Object.assign({}, extra, { text: String(t).slice(0, 200) })));
@@ -7122,7 +7138,8 @@ function asrDecodePcm(blob){
     } catch(e){ done(null); }
   });
 }
-/* ---- 真实引擎：优先模块 Worker（asr/asr-worker.js），起不来/中途坏掉退主线程动态 import ---- */
+/* ---- 真实引擎：v6.3 起转写强制主线程（动态 import、管线单例保活）；模块 Worker
+   （asr/asr-worker.js）代码与文件保留、默认停用（ASR_USE_WORKER=false） ---- */
 let asrWorker = null, asrWorkerDead = false, asrSeq = 0;
 const asrWaiters = new Map();   /* id -> { resolve, timer } */
 let asrProgSink = null;
@@ -7143,6 +7160,15 @@ const ASR_WORKER_TIMEOUT_DEFAULT = 20000;   /* v4.2：15s→20s——引擎换 w
 function asrWorkerTimeoutMs(){
   const o = (typeof window !== "undefined" && window.__ASR_TIMING) || {};
   return (typeof o.workerMs === "number" && o.workerMs > 0) ? o.workerMs : ASR_WORKER_TIMEOUT_DEFAULT;
+}
+/* v6.3：主线程转写看门狗——旧 25s 是 Worker 时代口径（两轮 Worker 陪等之后
+   留给回退的时间本就不多）；强制主线程后按她设备实测给足余量：自检在主线程
+   约数秒、单句推理同量级，60s 只杀真卡死、不误杀慢推理；仍有界，绝不回到
+   无限转圈。冒烟可经 __ASR_TIMING.transcribeMs 注入更短值。 */
+const ASR_TRANSCRIBE_TIMEOUT_DEFAULT = 60000;
+function asrTranscribeTimeoutMs(){
+  const o = (typeof window !== "undefined" && window.__ASR_TIMING) || {};
+  return (typeof o.transcribeMs === "number" && o.transcribeMs > 0) ? o.transcribeMs : ASR_TRANSCRIBE_TIMEOUT_DEFAULT;
 }
 function asrFailAllWaiters(errMsg){
   const pend = Array.from(asrWaiters.values());
@@ -7272,19 +7298,24 @@ function asrMainLoad(){
 async function asrDoTranscribe(blob){
   const pcm = await asrDecodePcm(blob);
   if(!pcm || !pcm.length){ asrNoteFail("decode", "decodeAudioData failed or empty pcm"); return null; }   /* v6.0 诊断注记：录音解码不出 PCM */
-  /* v3.26：Worker 路最多走两轮——首轮失败/无响应超时（asrWorkerCall 已把卡死的
-     Worker 判死并 terminate）后，清掉死亡标记、spawn 全新 Worker 自动重试一次，
-     对上层透明（上层仍只收到一次最终结果）；入口时 Worker 已是死亡标记（上次
-     失败判死的）同样先试着重生——iOS 把 Worker 杀掉是一次性事件，不该让引擎
-     此后整场都退主线程。两轮都败才退主线程动态 import（原有回退口径不变）。
-     pcm 每轮传副本：postMessage 转移 buffer 会把原 buffer detach，重试与主线程
-     回退都要用未被转移的原件。 */
-  for(let round = 0; round < 2; round++){
-    asrWorkerDead = false;   /* 允许 asrSpawn 重生（spawn 本身起不来会立刻再置死并按 error 落定，不会空转） */
-    const r = await asrWorkerCall({ type: "transcribe", pcm: pcm.slice(0) });
-    if(r && r.type === "result"){ const tx = (r.text || "").trim(); if(!tx) asrNoteFail("transcribe", "empty transcript (worker)"); asrMarkCached(); return tx; }   /* v3.14：转写成功但为空 → 返回 ""（与失败的 null 区分；v3.21 起空转写在复核里不作判分依据）；v6.0：空转写落注记 */
-    asrKillWorker();   /* 本轮失败：确保旧 Worker 已 terminate、死亡标记就位，再进下一轮/主线程回退 */
+  /* v6.3：转写强制主线程——不再尝试 Worker（ASR_USE_WORKER=false，实证见
+     ASR 段头注：Worker 在她设备 iOS 26 独立模式下不稳定、反复超时全灭，
+     主线程是唯一被真机证明的路径）。下方 v3.26 的 Worker 两轮重试逻辑整段
+     保留、仅由开关门控：开关打开才走，平时连 Worker 都不会被构造。
+     v3.26 原注：Worker 路最多走两轮——首轮失败/无响应超时后 spawn 全新
+     Worker 自动重试一次，两轮都败才退主线程动态 import；pcm 每轮传副本
+     （postMessage 转移 buffer 会 detach 原件）。 */
+  if(ASR_USE_WORKER){
+    for(let round = 0; round < 2; round++){
+      asrWorkerDead = false;   /* 允许 asrSpawn 重生（spawn 本身起不来会立刻再置死并按 error 落定，不会空转） */
+      const r = await asrWorkerCall({ type: "transcribe", pcm: pcm.slice(0) });
+      if(r && r.type === "result"){ const tx = (r.text || "").trim(); if(!tx) asrNoteFail("transcribe", "empty transcript (worker)"); asrMarkCached(); return tx; }   /* v3.14：转写成功但为空 → 返回 ""（与失败的 null 区分；v3.21 起空转写在复核里不作判分依据）；v6.0：空转写落注记 */
+      asrKillWorker();   /* 本轮失败：确保旧 Worker 已 terminate、死亡标记就位，再进下一轮/主线程回退 */
+    }
   }
+  /* 主线程管线单例保活：asrMainLoad 的承诺缓存（asrMainPipeP）只在失败/超时
+     时清掉，成功后整场复用——不许每句重复 import/建管线（历史上能跑通的
+     形态正是这条：Worker 死后全程主线程单例转写）。 */
   const p = await asrMainLoad();
   asrEmitProg(100);
   let r;
@@ -7752,17 +7783,30 @@ function asrVerifySentence(target, out, cb){ asrVerifyScore(target, out, false, 
 /* 跑一次离线转写：progEl 是 ASR_PROG_HTML 的根元素（可为 null）；成功 onText(文字)，失败/空 onFail() */
 function asrRunOffline(out, progEl, onText, onFail){
   let finished = false;
-  const finish = t => { if(finished) return; finished = true; asrBusyCount--; clearTimeout(wd); if(t) onText(t); else onFail(); };
-  asrBusyCount++;   /* v3.14：离线转写进行中也算忙碌（版本自检不许这时把页面跳走） */
-  const wd = setTimeout(() => { asrNoteFail("timeout", "offline transcribe watchdog 25s"); finish(null); }, 25000);   /* 与双验同口径：25s 不回就按失败收尾，绝不卡死；v6.0：落超时注记 */
-  try {
-    asrEngine().transcribe(out.blob, pct => {
-      if(!progEl) return;
+  /* v6.3：转写进度态每秒刷新「已等 N 秒」——主线程转写没有细粒度进度可报，
+     与其干挂「离线识别中…」让她分不清是慢还是死，不如明说已等多久；真卡死
+     由看门狗判死（asrTranscribeTimeoutMs，默认 60s——主线程口径，见其注）。 */
+  const t0 = Date.now();
+  let lastPct = null;
+  const paintWait = () => {
+    if(!progEl) return;
+    try {
       progEl.hidden = false;
       const bar = progEl.querySelector("i"), tx = progEl.querySelector("[data-asrpt]");
-      if(bar) bar.style.width = pct + "%";
-      if(tx) tx.textContent = pct >= 100 ? "下载完成，正在识别…" : "正在下载离线识别模型… " + pct + "%（下完自动打分）";
-    }, finish);
+      const secs = Math.max(0, Math.round((Date.now() - t0) / 1000));
+      if(bar && lastPct !== null) bar.style.width = lastPct + "%";
+      if(tx) tx.textContent = (lastPct !== null && lastPct < 100)
+        ? "离线识别准备中… " + lastPct + "%（已等 " + secs + " 秒）"
+        : "离线识别中…（已等 " + secs + " 秒）";
+    } catch(e){}
+  };
+  const tick = setInterval(paintWait, 1000);
+  const finish = t => { if(finished) return; finished = true; asrBusyCount--; clearTimeout(wd); clearInterval(tick); if(t) onText(t); else onFail(); };
+  asrBusyCount++;   /* v3.14：离线转写进行中也算忙碌（版本自检不许这时把页面跳走） */
+  const wd = setTimeout(() => { asrNoteFail("timeout", "offline transcribe watchdog " + Math.round(asrTranscribeTimeoutMs() / 1000) + "s"); finish(null); }, asrTranscribeTimeoutMs());   /* v6.3：放宽到主线程口径（默认 60s）不回就按失败收尾，绝不卡死；v6.0：落超时注记 */
+  paintWait();
+  try {
+    asrEngine().transcribe(out.blob, pct => { lastPct = pct; paintWait(); }, finish);
   } catch(e){ finish(null); }
 }
 /* ---------- v3.25：零结果兜底统一收口——没装离线组件时打分面当场自装 ----------
